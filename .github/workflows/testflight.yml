@@ -1,0 +1,39 @@
+name: TestFlight release
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: Upload to App Store Connect for TestFlight processing
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: testflight-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    environment: testflight
+    env:
+      IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      IOS_DISTRIBUTION_P12_BASE64: ${{ secrets.IOS_DISTRIBUTION_P12_BASE64 }}
+      IOS_DISTRIBUTION_P12_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
+      IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      UPLOAD_TO_TESTFLIGHT: ${{ inputs.upload }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select supported Xcode
+        run: bash scripts/select-xcode.sh
+      - name: Archive, export and optionally upload
+        run: bash scripts/testflight.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalCamera-IPA-${{ github.run_number }}
+          path: build/export/*.ipa
+          retention-days: 7
