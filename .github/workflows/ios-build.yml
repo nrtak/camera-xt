@@ -1,0 +1,21 @@
+name: iOS build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select supported Xcode
+        run: bash scripts/select-xcode.sh
+      - name: Build for iOS Simulator
+        run: >-
+          xcodebuild -project LocalCamera.xcodeproj -scheme LocalCamera
+          -configuration Debug -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO build
