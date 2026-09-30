@@ -236,6 +236,11 @@ struct CameraView: View {
                     Text("The preview fills the screen and may crop the edges. Saved photos use the camera’s full capture dimensions.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                Section("Design") {
+                    NavigationLink("Design Preview") { CameraDesignGallery() }
+                    Text("Browse the original mockups. Preview screens do not change camera settings.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("Storage") {
                     Text("Photos are saved on this iPhone. No account or cloud processing is used.")
                 }
@@ -250,5 +255,142 @@ struct CameraView: View {
 
     private func openSettings() {
         if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+    }
+}
+
+// The original reference is bundled locally so design review works offline.
+// These images are illustrations, never representations of active camera settings.
+private struct CameraDesignScreen: Identifiable {
+    let id: Int
+    let title: String
+    let note: String
+    let rect: CGRect
+
+    var image: UIImage? {
+        guard let source = UIImage(named: "DesignReference")?.cgImage else { return nil }
+        let scaleX = CGFloat(source.width) / 1448
+        let scaleY = CGFloat(source.height) / 1086
+        let crop = CGRect(x: rect.minX * scaleX, y: rect.minY * scaleY,
+                          width: rect.width * scaleX, height: rect.height * scaleY)
+        guard let result = source.cropping(to: crop) else { return nil }
+        return UIImage(cgImage: result)
+    }
+
+    static let all: [CameraDesignScreen] = [
+        .init(id: 0, title: "Photo", note: "Visual target. The working camera supports basic still capture; the format, resolution and HDR values here are examples.", rect: CGRect(x: 24, y: 5, width: 286, height: 535)),
+        .init(id: 1, title: "Video", note: "Proposed recording screen. Recording, frame rate and codec controls are not implemented.", rect: CGRect(x: 329, y: 5, width: 281, height: 535)),
+        .init(id: 2, title: "Action", note: "Proposed action mode. Subject tracking and enhanced stabilization are not implemented.", rect: CGRect(x: 618, y: 5, width: 278, height: 535)),
+        .init(id: 3, title: "Night", note: "Proposed night mode. Long-exposure processing and RAW controls are not implemented.", rect: CGRect(x: 904, y: 5, width: 274, height: 535)),
+        .init(id: 4, title: "Portrait", note: "Proposed portrait mode. Depth effects and lighting controls are not implemented.", rect: CGRect(x: 1188, y: 5, width: 244, height: 535)),
+        .init(id: 5, title: "Photo Controls", note: "Proposed photo control drawer. This reference includes future controls beyond the current grid toggle.", rect: CGRect(x: 22, y: 573, width: 286, height: 476)),
+        .init(id: 6, title: "Video Controls", note: "Proposed video control drawer. These recording and audio settings are illustrative.", rect: CGRect(x: 327, y: 573, width: 282, height: 476)),
+        .init(id: 7, title: "Capture Info", note: "Proposed expanded capture information. The working Capture Info sheet currently shows mode, lens and photo dimensions.", rect: CGRect(x: 616, y: 573, width: 277, height: 476)),
+        .init(id: 8, title: "Settings", note: "Proposed settings navigation. These categories are design references, not available features.", rect: CGRect(x: 902, y: 573, width: 280, height: 476)),
+        .init(id: 9, title: "Gallery", note: "Proposed gallery and photo details. An in-app gallery and editing tools are not implemented.", rect: CGRect(x: 1184, y: 573, width: 250, height: 476))
+    ]
+}
+
+private struct CameraDesignGallery: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                Text("Original design mockups")
+                    .font(.title2.bold())
+                Text("Review the visual direction alongside the working app. These are static design previews; values and controls shown in the images are illustrative.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 16)], spacing: 20) {
+                    ForEach(CameraDesignScreen.all) { screen in
+                        NavigationLink {
+                            CameraDesignDetail(initialSelection: screen.id)
+                        } label: {
+                            VStack(spacing: 8) {
+                                CameraDesignImage(screen: screen)
+                                    .frame(height: 230)
+                                Text(screen.title).font(.headline)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(10)
+                            .background(.white, in: RoundedRectangle(cornerRadius: 20))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(screen.title) design preview")
+                    }
+                }
+                NavigationLink("View complete reference sheet") {
+                    ScrollView {
+                        Image("DesignReference")
+                            .resizable().scaledToFit()
+                            .accessibilityLabel("Original Camera XT mockup sheet with ten proposed screens")
+                        Text("Design reference only · not a screenshot of the current app")
+                            .font(.footnote).padding()
+                    }
+                    .navigationTitle("Original Mockups")
+                    .navigationBarTitleDisplayMode(.inline)
+                }
+            }
+            .padding()
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .navigationTitle("Design Preview")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct CameraDesignImage: View {
+    let screen: CameraDesignScreen
+    var body: some View {
+        if let image = screen.image {
+            Image(uiImage: image)
+                .resizable().scaledToFit()
+                .accessibilityLabel("\(screen.title) original mockup")
+        } else {
+            ContentUnavailableView("Reference unavailable", systemImage: "photo")
+        }
+    }
+}
+
+private struct CameraDesignDetail: View {
+    @State private var selection: Int
+
+    init(initialSelection: Int) {
+        _selection = State(initialValue: initialSelection)
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Text("DESIGN PREVIEW · NOT LIVE")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(Color.yellow.opacity(0.4), in: Capsule())
+            TabView(selection: $selection) {
+                ForEach(CameraDesignScreen.all) { screen in
+                    ScrollView {
+                        VStack(spacing: 14) {
+                            CameraDesignImage(screen: screen)
+                                .frame(maxHeight: 620)
+                            Text(screen.note)
+                                .font(.subheadline)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.horizontal, 20).padding(.bottom, 35)
+                    }
+                    .tag(screen.id)
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            HStack {
+                Button("Previous") { selection -= 1 }.disabled(selection == 0)
+                Spacer()
+                Text("\(selection + 1) of \(CameraDesignScreen.all.count)")
+                    .font(.caption).monospacedDigit()
+                Spacer()
+                Button("Next") { selection += 1 }.disabled(selection == CameraDesignScreen.all.count - 1)
+            }
+            .padding(.horizontal, 20).padding(.bottom, 12)
+        }
+        .padding(.top, 12)
+        .background(Color(uiColor: .systemGroupedBackground))
+        .navigationTitle(CameraDesignScreen.all[selection].title)
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
