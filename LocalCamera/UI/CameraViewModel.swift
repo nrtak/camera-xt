@@ -15,6 +15,7 @@ final class CameraViewModel: ObservableObject {
     private let saver: PhotoSaving
     private var active = false
     private var requestingPermission = false
+    private var lastRearLensID: String?
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         self.saver = saver
@@ -48,8 +49,12 @@ final class CameraViewModel: ObservableObject {
     }
 
     func flip() {
-        guard let selected = selectedLens,
-              let next = camera.lenses.first(where: { $0.isFront != selected.isFront }) else { return }
+        guard canSwitch, let selected = selectedLens else { return }
+        if !selected.isFront { lastRearLensID = selected.id }
+        let candidates = camera.lenses.filter { $0.isFront != selected.isFront }
+        // Return to the rear lens the user was using before switching to the front.
+        guard let next = candidates.first(where: { $0.id == lastRearLensID })
+                ?? candidates.first else { return }
         select(next)
     }
 
