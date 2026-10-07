@@ -11,6 +11,7 @@
     <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
     <key>LSRequiresIPhoneOS</key><true/>
     <key>ITSAppUsesNonExemptEncryption</key><false/>
+    <key>NSMicrophoneUsageDescription</key><string>Record sound with your videos.</string>
     <key>NSCameraUsageDescription</key><string>Preview the camera and take photos on your iPhone.</string>
     <key>NSPhotoLibraryAddUsageDescription</key><string>Save the photos you take to your Photos library.</string>
     <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
