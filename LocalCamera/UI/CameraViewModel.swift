@@ -61,6 +61,8 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var permission = AVCaptureDevice.authorizationStatus(for: .video)
     @Published private(set) var busy = false
     @Published private(set) var pendingPhoto: CapturedPhoto?
+    @Published private(set) var lastSavedThumbnail: UIImage?
+    @Published private(set) var lastSavedPhotoCount = 0
     private var messageTask: Task<Void, Never>?
     @Published var message: String? {
         didSet {
@@ -464,12 +466,12 @@ final class CameraViewModel: ObservableObject {
         }
     }
 
-    private static func preview(_ data: Data) -> UIImage {
+    private static func preview(_ data: Data, maxSize: Int = 1600) -> UIImage {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: 1600
+                kCGImageSourceThumbnailMaxPixelSize: maxSize
               ] as CFDictionary) else { return UIImage() }
         return UIImage(cgImage: image)
     }
@@ -513,6 +515,8 @@ final class CameraViewModel: ObservableObject {
         defer { busy = false }
         do {
             try await saver.save(photo)
+            lastSavedThumbnail = Self.preview(photo.data, maxSize: 256)
+            lastSavedPhotoCount = 1 + photo.companions.count
             pendingPhoto = nil
             message = photo.warning ?? (photo.companions.isEmpty ? "Saved" : "Saved 2 photos")
         } catch { message = error.localizedDescription }
