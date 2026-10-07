@@ -2,7 +2,7 @@ import AVFoundation
 import Vision
 import CoreImage
 
-struct CameraControls {
+struct CameraControls: Equatable {
     var automaticExposure = true
     var iso: Float = 100
     var shutterSeconds = 1.0 / 250
@@ -60,6 +60,11 @@ final class CaptureSessionManager {
     private var snapshot = CameraSnapshot()
     private lazy var dual = DualPhotoCamera(queue: queue)
     private weak var preview: AVCaptureVideoPreviewLayer?
+    private final class PreviewReference {
+        weak var layer: AVCaptureVideoPreviewLayer?
+        init(_ layer: AVCaptureVideoPreviewLayer) { self.layer = layer }
+    }
+    private var previews: [PreviewReference] = []
     private var activeSession: AVCaptureSession { snapshot.dualEnabled ? dual.session : session }
     private let movie = AVCaptureMovieFileOutput()
     private var movieProcessor: MovieCaptureProcessor?
@@ -335,8 +340,24 @@ final class CaptureSessionManager {
 
     func attachPreview(_ layer: AVCaptureVideoPreviewLayer) {
         queue.async {
+            if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
+            self.preview?.session = nil
+            self.previews.removeAll { $0.layer == nil || $0.layer === layer }
+            self.previews.append(PreviewReference(layer))
             self.preview = layer
             self.connectPreview()
+        }
+    }
+
+    func detachPreview(_ layer: AVCaptureVideoPreviewLayer) {
+        queue.async {
+            self.previews.removeAll { $0.layer == nil || $0.layer === layer }
+            if let connection = layer.connection { layer.session?.removeConnection(connection) }
+            layer.session = nil
+            if self.preview === layer {
+                self.preview = self.previews.last?.layer
+                self.connectPreview()
+            }
         }
     }
 
