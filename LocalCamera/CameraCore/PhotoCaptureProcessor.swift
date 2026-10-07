@@ -40,7 +40,7 @@ enum PhotoRanker {
             let area = face.boundingBox.width * face.boundingBox.height
             if area > largestArea {
                 largestArea = area
-                faceQuality = face.faceCaptureQuality?.doubleValue
+                faceQuality = face.faceCaptureQuality.map { Double($0) }
             }
         }
         if let quality = faceQuality { return quality + min(detail, 0.25) }
