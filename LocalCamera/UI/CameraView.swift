@@ -8,6 +8,7 @@ struct CameraView: View {
     @StateObject private var model = CameraViewModel()
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var confirmDiscard = false
     @AppStorage("camera.showsGrid") private var showsGrid = true
     @State private var toolPath: [CameraToolPage] = []
@@ -34,11 +35,28 @@ struct CameraView: View {
                     Color.clear.allowsHitTesting(false)
                     if model.permission != .authorized || model.camera.message != nil {
                         cameraNotice.padding(.horizontal, 24).frame(maxWidth: .infinity)
-                    } else if model.selectedLens?.isFront == false && !model.camera.dualEnabled {
+                    } else if !showsCaptureInfo && model.selectedLens?.isFront == false && !model.camera.dualEnabled {
                         lensSelector.padding(.trailing, 14)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if showsCaptureInfo || model.reviewingBurst {
+                GeometryReader { geometry in
+                    Group {
+                        if model.reviewingBurst {
+                            BurstReview(model: model)
+                                .background(Color.white.opacity(reduceTransparency ? 1 : 0.72), in: RoundedRectangle(cornerRadius: 24))
+                                .clipShape(RoundedRectangle(cornerRadius: 24))
+                        } else { captureInfo }
+                    }
+                        .frame(height: geometry.size.height * 0.82)
+                        .frame(maxHeight: .infinity, alignment: .bottom)
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls }
@@ -50,8 +68,6 @@ struct CameraView: View {
             if $0 == .background { model.enteredBackground() }
             model.setActive($0 == .active)
         }
-        .sheet(isPresented: $showsCaptureInfo) { captureInfo }
-        .sheet(isPresented: $model.reviewingBurst) { BurstReview(model: model).interactiveDismissDisabled() }
         .confirmationDialog("Discard the unsaved capture?", isPresented: $confirmDiscard, titleVisibility: .visible) {
             Button("Discard capture", role: .destructive, action: model.discard)
         }
@@ -230,7 +246,7 @@ struct CameraView: View {
         .frame(maxWidth: .infinity)
         .background {
             UnevenRoundedRectangle(topLeadingRadius: 28, topTrailingRadius: 28)
-                .fill(Color.white).ignoresSafeArea(edges: .bottom)
+                .fill(Color.white.opacity(reduceTransparency ? 1 : 0.72)).ignoresSafeArea(edges: .bottom)
         }
     }
 
@@ -241,31 +257,42 @@ struct CameraView: View {
     }
 
     private var captureInfo: some View {
-        NavigationStack(path: $toolPath) {
-            CompactToolLayout {
-                toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .rescue, .advanced, .preferences])
-                HStack(spacing: 12) {
-                    quickPreset("Action", icon: "figure.run", detail: "Fast movement", tool: .action)
-                    quickPreset("Night", icon: "moon", detail: "Hold still · Experimental", tool: .night)
+        VStack(spacing: 0) {
+            HStack {
+                if !toolPath.isEmpty {
+                    Button { toolPath.removeLast() } label: {
+                        Image(systemName: "chevron.left").frame(width: 44, height: 44)
+                    }.accessibilityLabel("Back to camera tools")
                 }
-                Button("Back to automatic") { useTool(.automatic) }
-                    .frame(maxWidth: .infinity, minHeight: 44)
+                Text(toolPath.last?.rawValue ?? "Camera Tools").font(.headline)
+                Spacer()
+                Button { showsCaptureInfo = false } label: {
+                    Image(systemName: "xmark").frame(width: 44, height: 44)
+                }.accessibilityLabel("Close camera tools")
+            }.padding(.horizontal, 12)
+            if let page = toolPath.last {
+                toolPage(page)
+            } else {
+                CompactToolLayout {
+                    toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .rescue, .advanced, .preferences])
+                    HStack(spacing: 12) {
+                        quickPreset("Action", icon: "figure.run", detail: "Fast movement", tool: .action)
+                        quickPreset("Night", icon: "moon", detail: "Hold still · Experimental", tool: .night)
+                    }
+                    Button("Back to automatic") { useTool(.automatic) }
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }
             }
-            .navigationTitle("Camera Tools")
-            .navigationDestination(for: CameraToolPage.self) { toolPage($0) }
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showsCaptureInfo = false } } }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if toolPath.last != .rescue && toolPath.last != .gallery { captureControls }
-        }
-        .presentationDetents([.large])
-        .presentationDragIndicator(.visible)
+        .background(Color.white.opacity(reduceTransparency ? 1 : 0.72), in: RoundedRectangle(cornerRadius: 24))
+        .overlay { RoundedRectangle(cornerRadius: 24).strokeBorder(.white.opacity(0.5), lineWidth: 1).allowsHitTesting(false) }
+        .clipShape(RoundedRectangle(cornerRadius: 24))
     }
 
     private func toolGrid(_ pages: [CameraToolPage]) -> some View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
             ForEach(pages, id: \.self) { page in
-                NavigationLink(value: page) {
+                Button { toolPath.append(page) } label: {
                     VStack(alignment: .leading, spacing: 8) {
                         Image(systemName: page.icon).font(.title2)
                         Text(page.rawValue).font(.headline)
@@ -292,8 +319,6 @@ struct CameraView: View {
             switch page {
             case .rescue:
                 PhotoRescueView()
-                    .onAppear { model.setPhotoEditorActive(true) }
-                    .onDisappear { model.setPhotoEditorActive(false) }
             case .gallery: CameraDesignGallery()
             case .advanced:
                 CompactToolLayout {
@@ -301,20 +326,12 @@ struct CameraView: View {
                     Button("Reset to automatic", action: model.resetControls).buttonStyle(.bordered)
                 }
             case .exposure, .color, .manualFocus:
-                VStack(spacing: 0) {
-                    if !model.camera.dualEnabled {
-                        CameraPreview(engine: model.engine, onFocus: model.focus, fillView: true, allowsFocus: false)
-                            .frame(height: 190).background(.black)
-                            .clipShape(RoundedRectangle(cornerRadius: 16)).padding(.horizontal, 18)
-                            .accessibilityLabel("Live adjustment preview")
-                    }
-                    CompactToolLayout {
+                CompactToolLayout {
                     if model.camera.dualEnabled {
                         Text("Manual controls use a single camera.")
                         Button("Switch to single Photo") { model.activate(.automatic) }.buttonStyle(.borderedProminent)
                     } else {
                         ManualCameraControls(model: model, page: page)
-                    }
                     }
                 }
             default:
@@ -370,7 +387,7 @@ struct CameraView: View {
         case .preferences:
             Toggle("Composition grid", isOn: $showsGrid)
             Text("Grid and your chosen rear lens are remembered. Timers and exposure locks reset; photos stay on your iPhone.").font(.callout).foregroundStyle(.secondary)
-            NavigationLink("Design Preview", value: CameraToolPage.gallery).buttonStyle(.bordered)
+            Button("Design Preview") { toolPath.append(.gallery) }.buttonStyle(.bordered)
             Button("Reset capture settings") { model.activate(.automatic); showsCaptureInfo = false }.buttonStyle(.bordered)
         case .details:
             LabeledContent("Mode", value: model.mode.rawValue)
@@ -550,11 +567,16 @@ private struct BurstReview: View {
     @ObservedObject var model: CameraViewModel
     @State private var confirmDiscard = false
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 16) {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Best Shot").font(.headline)
+                Spacer()
+                Button("Discard", role: .destructive) { confirmDiscard = true }.frame(minHeight: 44)
+            }.padding(.horizontal)
+            CompactToolLayout {
                 if model.burstPreviews.indices.contains(model.selectedBurstIndex) {
                     Image(uiImage: model.burstPreviews[model.selectedBurstIndex])
-                        .resizable().scaledToFit().frame(maxHeight: .infinity)
+                        .resizable().scaledToFit().frame(height: 140)
                         .accessibilityLabel("Selected burst frame \(model.selectedBurstIndex + 1)")
                 }
                 HStack {
@@ -579,7 +601,6 @@ private struct BurstReview: View {
             }
             .padding()
             .navigationTitle("Best Shot")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Discard", role: .destructive) { confirmDiscard = true } } }
             .confirmationDialog("Discard all unsaved burst photos?", isPresented: $confirmDiscard) {
                 Button("Discard all", role: .destructive, action: model.discard)
             }
@@ -619,48 +640,43 @@ private struct CameraDesignScreen: Identifiable {
 }
 
 private struct CameraDesignGallery: View {
+    @State private var selectedScreen: Int?
+    @State private var showsCompleteReference = false
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                Text("Original design mockups")
-                    .font(.title2.bold())
-                Text("Review the visual direction alongside the working app. These are static design previews; values and controls shown in the images are illustrative.")
-                    .font(.subheadline).foregroundStyle(.secondary)
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 16)], spacing: 20) {
-                    ForEach(CameraDesignScreen.all) { screen in
-                        NavigationLink {
-                            CameraDesignDetail(initialSelection: screen.id)
-                        } label: {
-                            VStack(spacing: 8) {
-                                CameraDesignImage(screen: screen)
-                                    .frame(height: 230)
-                                Text(screen.title).font(.headline)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(10)
-                            .background(.white, in: RoundedRectangle(cornerRadius: 20))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("\(screen.title) design preview")
-                    }
+        VStack(spacing: 8) {
+            if selectedScreen != nil || showsCompleteReference {
+                Button("Back to design gallery") { selectedScreen = nil; showsCompleteReference = false }
+                    .frame(minHeight: 44)
+            }
+            if let selectedScreen {
+                CameraDesignDetail(initialSelection: selectedScreen)
+            } else if showsCompleteReference {
+                ScrollView {
+                    Image("DesignReference").resizable().scaledToFit()
+                        .accessibilityLabel("Original Camera XT mockup sheet with ten proposed screens")
+                    Text("Design reference only · not a screenshot of the current app").font(.footnote).padding()
                 }
-                NavigationLink("View complete reference sheet") {
-                    ScrollView {
-                        Image("DesignReference")
-                            .resizable().scaledToFit()
-                            .accessibilityLabel("Original Camera XT mockup sheet with ten proposed screens")
-                        Text("Design reference only · not a screenshot of the current app")
-                            .font(.footnote).padding()
-                    }
-                    .navigationTitle("Original Mockups")
-                    .navigationBarTitleDisplayMode(.inline)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("Original design mockups").font(.title2.bold())
+                        Text("Static design references; the controls and values shown are illustrative.")
+                            .font(.subheadline)
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 145))], spacing: 16) {
+                            ForEach(CameraDesignScreen.all) { screen in
+                                Button { selectedScreen = screen.id } label: {
+                                    VStack {
+                                        CameraDesignImage(screen: screen).frame(height: 180)
+                                        Text(screen.title).font(.headline)
+                                    }.frame(maxWidth: .infinity).padding(8)
+                                }.buttonStyle(.plain)
+                            }
+                        }
+                        Button("View complete reference sheet") { showsCompleteReference = true }.frame(minHeight: 44)
+                    }.padding()
                 }
             }
-            .padding()
         }
-        .background(Color(uiColor: .systemGroupedBackground))
-        .navigationTitle("Design Preview")
-        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -717,7 +733,6 @@ private struct CameraDesignDetail: View {
             .padding(.horizontal, 20).padding(.bottom, 12)
         }
         .padding(.top, 12)
-        .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle(CameraDesignScreen.all[selection].title)
         .navigationBarTitleDisplayMode(.inline)
     }
