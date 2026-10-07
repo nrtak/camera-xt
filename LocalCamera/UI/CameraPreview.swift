@@ -7,6 +7,7 @@ struct CameraPreview: UIViewRepresentable {
     var onFocus: (CGPoint, Bool) -> Void
     var fillView = false
     var allowsFocus = true
+    var secondary = false
 
     final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
@@ -46,7 +47,7 @@ struct CameraPreview: UIViewRepresentable {
             view.addGestureRecognizer(UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:))))
             view.addGestureRecognizer(UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.hold(_:))))
         }
-        engine.attachPreview(view.previewLayer)
+        engine.attachPreview(view.previewLayer, secondary: secondary)
         return view
     }
     func updateUIView(_ view: PreviewView, context: Context) { context.coordinator.onFocus = onFocus }
