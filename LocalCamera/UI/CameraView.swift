@@ -13,6 +13,15 @@ struct CameraView: View {
     @AppStorage("camera.showsGrid") private var showsGrid = true
     @State private var toolPath: [CameraToolPage] = []
     @State private var showsCaptureInfo = false
+    @GestureState private var holdingPeek = false
+    @State private var accessiblePeek = false
+    private var isPeeking: Bool { holdingPeek || accessiblePeek }
+    private var hasAdjustments: Bool {
+        model.captureStyle != "Auto" || model.timerSeconds > 0 || model.burstEnabled ||
+        model.camera.dualEnabled || model.camera.depthEnabled || model.camera.eyeFocusEnabled ||
+        model.camera.focusLocked || !model.controls.automaticExposure || !model.controls.automaticFocus ||
+        !model.controls.automaticWhiteBalance || abs(model.exposureBias) > 0.05
+    }
 
     private let ink = Color(red: 0.10, green: 0.14, blue: 0.22)
     private let selection = Color(red: 1, green: 0.94, blue: 0.36)
@@ -24,18 +33,17 @@ struct CameraView: View {
                 CameraPreview(engine: model.engine, onFocus: model.focus)
                     .ignoresSafeArea()
                     .accessibilityLabel("Camera viewfinder")
-                if showsGrid && model.camera.running {
+                if showsGrid && model.camera.running && !isPeeking {
                     compositionGrid.ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true)
                 }
             }
 
             VStack(spacing: 12) {
-                captureHUD
                 ZStack(alignment: .trailing) {
                     Color.clear.allowsHitTesting(false)
                     if model.permission != .authorized || model.camera.message != nil {
                         cameraNotice.padding(.horizontal, 24).frame(maxWidth: .infinity)
-                    } else if !showsCaptureInfo && model.selectedLens?.isFront == false && !model.camera.dualEnabled {
+                    } else if !showsCaptureInfo && !model.reviewingBurst && !isPeeking && model.selectedLens?.isFront == false && !model.camera.dualEnabled {
                         lensSelector.padding(.trailing, 14)
                     }
                 }
@@ -53,18 +61,27 @@ struct CameraView: View {
                         } else { captureInfo }
                     }
                         .frame(height: geometry.size.height * 0.82)
+                        .contentShape(Rectangle())
+                        .background { Rectangle().fill(Color.clear).contentShape(Rectangle()).onTapGesture {} }
+                        .opacity(isPeeking ? 0 : 1)
+                        .disabled(isPeeking)
+                        .accessibilityHidden(isPeeking)
                         .frame(maxHeight: .infinity, alignment: .bottom)
                 }
                 .padding(.horizontal, 10)
                 .padding(.bottom, 8)
             }
         }
+        .safeAreaInset(edge: .top, spacing: 0) { captureHUD.opacity(isPeeking ? 0 : 1).disabled(isPeeking).accessibilityHidden(isPeeking) }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls }
+        .onChange(of: showsCaptureInfo) { _, _ in accessiblePeek = false }
+        .onChange(of: model.reviewingBurst) { _, _ in accessiblePeek = false }
         .foregroundStyle(ink)
         .tint(ink)
         .preferredColorScheme(.light)
         .task { model.setActive(scenePhase == .active) }
         .onChange(of: scenePhase) {
+            if $0 != .active { accessiblePeek = false }
             if $0 == .background { model.enteredBackground() }
             model.setActive($0 == .active)
         }
@@ -119,6 +136,7 @@ struct CameraView: View {
         if model.camera.dualEnabled { indicator("Dual Shot", page: .shoot) }
         if !model.controls.automaticExposure && model.captureStyle == "Auto" { indicator("Manual exposure", page: .exposure) }
         if abs(model.exposureBias) > 0.05 { indicator(String(format: "%+.1f EV", model.exposureBias), page: .exposure) }
+        if !model.controls.automaticFocus { indicator("Manual focus", page: .manualFocus) }
         if !model.controls.automaticWhiteBalance { indicator("Manual color", page: .color) }
         if model.camera.recording { Text("Recording").foregroundStyle(.red).padding(8).background(Color.white.opacity(0.96), in: Capsule()) }
     }
@@ -185,6 +203,12 @@ struct CameraView: View {
 
     private var captureControls: some View {
         VStack(spacing: 12) {
+            if showsCaptureInfo || model.reviewingBurst || hasAdjustments {
+                ViewThatFits(in: .horizontal) {
+                    HStack { overlayActions }
+                    VStack(spacing: 4) { overlayActions }
+                }
+            }
             HStack(spacing: 12) {
                 ForEach(CaptureMode.allCases, id: \.self) { mode in
                     Button { model.selectMode(mode) } label: {
@@ -250,6 +274,24 @@ struct CameraView: View {
         }
     }
 
+    @ViewBuilder private var overlayActions: some View {
+        if showsCaptureInfo || model.reviewingBurst {
+            Label(isPeeking ? "Release to return" : "Peek at scene", systemImage: "eye")
+                .font(.callout.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0).updating($holdingPeek) { _, state, _ in state = true })
+                .accessibilityAddTraits(.isButton)
+                .accessibilityLabel(accessiblePeek ? "Restore tools" : "Peek at scene")
+                .accessibilityHint("Hold to hide the panel. With VoiceOver, double tap to toggle.")
+                .accessibilityAction { accessiblePeek.toggle() }
+        }
+        Button("Reset to Auto") { accessiblePeek = false; useTool(.automatic) }
+            .font(.callout.weight(.semibold))
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .disabled(!model.canConfigure)
+    }
+
     @ViewBuilder private var saveRecovery: some View {
         Button("Retry save") { Task { await model.retrySave() } }
         Button("Settings", action: openSettings)
@@ -279,7 +321,7 @@ struct CameraView: View {
                         quickPreset("Action", icon: "figure.run", detail: "Fast movement", tool: .action)
                         quickPreset("Night", icon: "moon", detail: "Hold still · Experimental", tool: .night)
                     }
-                    Button("Back to automatic") { useTool(.automatic) }
+                    Button("Reset to Auto") { useTool(.automatic) }
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
             }
