@@ -228,10 +228,12 @@ final class CaptureSessionManager {
                 if enabled {
                     try self.dual.configure()
                     self.snapshot.dualEnabled = true
+                    self.snapshot.selectedID = self.dual.inputs.first?.device.uniqueID
                     self.snapshot.resolution = self.dual.resolution
                 } else {
                     self.dual.reset()
                     self.snapshot.dualEnabled = false
+                    self.snapshot.selectedID = self.input?.device.uniqueID
                     self.session.beginConfiguration()
                     if self.session.canSetSessionPreset(.photo) { self.session.sessionPreset = .photo }
                     if let device = self.input?.device { self.configureDimensions(device) }
@@ -247,6 +249,7 @@ final class CaptureSessionManager {
                 self.preview?.setSessionWithNoConnection(nil)
                 self.dual.reset()
                 self.snapshot.dualEnabled = false
+                self.snapshot.selectedID = self.input?.device.uniqueID
                 self.session.beginConfiguration()
                 self.session.sessionPreset = .photo
                 if let device = self.input?.device { self.configureDimensions(device) }
@@ -341,7 +344,14 @@ final class CaptureSessionManager {
                     self.snapshot.videoMode = false
                     self.snapshot.stabilized = false
                 }
-            } catch { failure = error }
+            } catch {
+                failure = error
+                if !self.snapshot.videoMode {
+                    if self.session.outputs.contains(self.movie) { self.session.removeOutput(self.movie) }
+                    self.session.sessionPreset = .photo
+                    self.configureDimensions(device)
+                }
+            }
             self.session.commitConfiguration()
             self.connectPreview()
             if self.wantsRunning { self.session.startRunning() }
