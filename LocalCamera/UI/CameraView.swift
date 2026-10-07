@@ -265,20 +265,41 @@ struct CameraView: View {
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(model.mode == mode ? .isSelected : [])
                 }
+                Button { openTool() } label: {
+                    Label("Tools", systemImage: "slider.horizontal.3")
+                        .font(.caption.weight(.semibold)).frame(minWidth: 70, minHeight: 44)
+                }.buttonStyle(.plain).accessibilityLabel("Camera Tools")
             }
             .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.recording)
 
             HStack {
-                Button { openTool() } label: {
+                Button {
+                    guard let url = URL(string: "photos-redirect://") else { return }
+                    openURL(url) { accepted in
+                        if !accepted { model.message = "Photos could not be opened. Open the Photos app from your Home Screen to view your saved captures." }
+                    }
+                } label: {
                     VStack(spacing: 3) {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.title3)
-                        .frame(width: 48, height: 48)
-                        .background(Color.white.opacity(0.45), in: Circle())
-                    Text("Tools").font(.caption2)
+                        ZStack(alignment: .bottomTrailing) {
+                            Group {
+                                if let thumbnail = model.lastSavedThumbnail {
+                                    Image(uiImage: thumbnail).resizable().scaledToFill()
+                                } else {
+                                    Image(systemName: "photo.on.rectangle").font(.title3)
+                                }
+                            }
+                            .frame(width: 48, height: 48).clipped()
+                            .background(.white.opacity(0.45))
+                            .clipShape(RoundedRectangle(cornerRadius: 9))
+                            if model.lastSavedPhotoCount > 1 {
+                                Text("\(model.lastSavedPhotoCount)").font(.caption2.bold()).padding(3)
+                                    .background(.white, in: Capsule())
+                            }
+                        }
+                        Text("Photos").font(.caption2)
                     }
                 }
-                .accessibilityLabel("Camera Tools")
+                .accessibilityLabel(model.lastSavedThumbnail == nil ? "Open Photos" : "Last saved photo. Open Photos")
                 .disabled(!model.canConfigure)
                 .frame(maxWidth: .infinity)
 
