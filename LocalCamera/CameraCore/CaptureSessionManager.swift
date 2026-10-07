@@ -1,5 +1,18 @@
 import AVFoundation
 
+struct CameraControls {
+    var automaticExposure = true
+    var iso: Float = 100
+    var shutterSeconds = 1.0 / 250
+    var automaticWhiteBalance = true
+    var temperature: Float = 5500
+    var tint: Float = 0
+    var automaticFocus = true
+    var lensPosition: Float = 0.5
+    var facePriority = true
+    var flash: AVCaptureDevice.FlashMode = .off
+}
+
 struct CameraSnapshot {
     var lenses: [CameraLens] = []
     var selectedID: String?
@@ -13,6 +26,16 @@ struct CameraSnapshot {
     var recording = false
     var videoLabel = "1080p · 30 fps"
     var stabilized = false
+    var exposureLabel = ""
+    var focusLabel = "Auto focus"
+    var minISO: Float = 25
+    var maxISO: Float = 1600
+    var customExposureAvailable = false
+    var manualFocusAvailable = false
+    var whiteBalanceAvailable = false
+    var flashAvailable = false
+    var currentISO: Float = 100
+    var currentShutter = 1.0 / 250
 }
 
 /// All session/device mutations and delegate ownership stay on this serial queue.
@@ -20,6 +43,7 @@ struct CameraSnapshot {
 final class CaptureSessionManager {
     let session = AVCaptureSession()
     var onChange: ((CameraSnapshot) -> Void)?
+    var onMeter: ((CameraSnapshot) -> Void)?
     private let queue = DispatchQueue(label: "LocalCamera.capture", qos: .userInitiated)
     private let output = AVCapturePhotoOutput()
     private var devices: [AVCaptureDevice] = []
@@ -36,6 +60,9 @@ final class CaptureSessionManager {
     private var audioInput: AVCaptureDeviceInput?
     private var stopMovieWhenStarted = false
     var onMovie: ((Result<URL, Error>) -> Void)?
+    private var controls = CameraControls()
+    private var meterTimer: DispatchSourceTimer?
+    private var burstRunning = false
 
     init() {
         let center = NotificationCenter.default
@@ -64,7 +91,10 @@ final class CaptureSessionManager {
         })
     }
 
-    deinit { observers.forEach { NotificationCenter.default.removeObserver($0) } }
+    deinit {
+        meterTimer?.cancel()
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
 
     func start() {
         queue.async {
@@ -73,6 +103,7 @@ final class CaptureSessionManager {
                 if self.input == nil { try self.configure() }
                 self.connectPreview()
                 if !self.activeSession.isRunning { self.activeSession.startRunning() }
+                self.startMetering()
                 self.publish(message: self.activeSession.isRunning ? nil : "Camera unavailable. Tap Retry camera.")
             } catch { self.publish(message: error.localizedDescription) }
         }
@@ -81,6 +112,8 @@ final class CaptureSessionManager {
     func stop() {
         queue.async {
             self.wantsRunning = false
+            self.meterTimer?.cancel()
+            self.meterTimer = nil
             if self.movieProcessor != nil { self.stopMovieWhenStarted = true }
             if self.movie.isRecording { self.movie.stopRecording() }
             if self.activeSession.isRunning { self.activeSession.stopRunning() }
@@ -117,11 +150,12 @@ final class CaptureSessionManager {
         snapshot.lenses = devices.map(CameraDeviceCatalog.lens)
         snapshot.selectedID = device.uniqueID
         snapshot.dualAvailable = DualPhotoCamera.isSupported
+        try applyControls(to: device)
     }
 
     func select(_ id: String) {
         queue.async {
-            guard self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, !self.snapshot.dualEnabled, let oldInput = self.input,
+            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, !self.snapshot.dualEnabled, let oldInput = self.input,
                   let device = self.devices.first(where: { $0.uniqueID == id }) else { return }
             do {
                 let newInput = try AVCaptureDeviceInput(device: device)
@@ -133,6 +167,7 @@ final class CaptureSessionManager {
                     self.configureDimensions(device)
                     self.snapshot.selectedID = id
                     self.session.commitConfiguration()
+                    try self.applyControls(to: device)
                     self.connectPreview()
                     self.snapshot.focusLocked = false
                     self.publish()
@@ -163,7 +198,7 @@ final class CaptureSessionManager {
         }
     }
 
-    func capture(completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+    func capture(speed: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         queue.async {
             if self.snapshot.dualEnabled {
                 self.dual.capture(completion: completion)
@@ -176,7 +211,8 @@ final class CaptureSessionManager {
             let codec: AVVideoCodecType = self.output.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
             settings.maxPhotoDimensions = self.output.maxPhotoDimensions
-            settings.photoQualityPrioritization = .quality
+            settings.photoQualityPrioritization = speed || self.input?.device.exposureMode == .custom ? .speed : .quality
+            if self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
             let processor = PhotoCaptureProcessor { [weak self] result in
                 guard let self = self else { return }
                 self.queue.async {
@@ -190,6 +226,7 @@ final class CaptureSessionManager {
     }
 
     private func publish(message: String? = nil) {
+        updateMeter()
         snapshot.running = activeSession.isRunning && !activeSession.isInterrupted
         snapshot.message = message
         onChange?(snapshot)
@@ -220,7 +257,7 @@ final class CaptureSessionManager {
 
     func setDualEnabled(_ enabled: Bool) {
         queue.async {
-            guard self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled else { return }
+            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled else { return }
             self.activeSession.stopRunning()
             if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
             self.preview?.session = nil
@@ -241,6 +278,10 @@ final class CaptureSessionManager {
                 }
                 self.connectPreview()
                 if enabled && self.dual.session.hardwareCost > 1 { throw DualPhotoCamera.Failure.overloaded }
+                if enabled {
+                    // Paired capture uses automatic metering independently for each sensor.
+                    for input in self.dual.inputs { try self.applyControls(to: input.device, automatic: true) }
+                } else if let device = self.input?.device { try self.applyControls(to: device) }
                 if self.wantsRunning { self.activeSession.startRunning() }
                 self.snapshot.focusLocked = false
                 self.publish()
@@ -263,11 +304,15 @@ final class CaptureSessionManager {
 
     func focus(at point: CGPoint, locked: Bool) {
         queue.async {
-            guard self.processor == nil, !self.dual.busy else { return }
+            guard !self.burstRunning, self.processor == nil, !self.dual.busy else { return }
             let devices = self.snapshot.dualEnabled ? self.dual.inputs.map(\.device) : [self.input?.device].compactMap { $0 }
             do {
                 for device in devices {
                     try device.lockForConfiguration()
+                    if device.isFocusModeSupported(.continuousAutoFocus) {
+                        device.automaticallyAdjustsFaceDrivenAutoFocusEnabled = false
+                        device.isFaceDrivenAutoFocusEnabled = false
+                    }
                     if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = point }
                     if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = point }
                     let focus: AVCaptureDevice.FocusMode = locked ? .autoFocus : .continuousAutoFocus
@@ -284,7 +329,7 @@ final class CaptureSessionManager {
 
     func setExposureBias(_ value: Float) {
         queue.async {
-            guard self.processor == nil, !self.dual.busy else { return }
+            guard !self.burstRunning, self.processor == nil, !self.dual.busy else { return }
             let devices = self.snapshot.dualEnabled ? self.dual.inputs.map(\.device) : [self.input?.device].compactMap { $0 }
             do {
                 for device in devices {
@@ -298,7 +343,7 @@ final class CaptureSessionManager {
 
     func setVideoMode(_ enabled: Bool, width: Int32 = 1920, fps: Int32 = 30, stabilized: Bool = true) {
         queue.async {
-            guard self.processor == nil, self.movieProcessor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
+            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
                   let device = self.input?.device else { self.publish(); return }
             self.session.stopRunning()
             self.session.beginConfiguration()
@@ -353,6 +398,7 @@ final class CaptureSessionManager {
                 }
             }
             self.session.commitConfiguration()
+            do { try self.applyControls(to: device) } catch { failure = error }
             self.connectPreview()
             if self.wantsRunning { self.session.startRunning() }
             self.publish(message: failure?.localizedDescription)
@@ -402,6 +448,111 @@ final class CaptureSessionManager {
         queue.async {
             self.stopMovieWhenStarted = true
             if self.movie.isRecording { self.movie.stopRecording() }
+        }
+    }
+
+    func setControls(_ value: CameraControls) {
+        queue.async {
+            guard !self.burstRunning, self.processor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
+                  let device = self.input?.device else { return }
+            do {
+                self.controls = value
+                try self.applyControls(to: device)
+                self.publish()
+            } catch { self.publish(message: error.localizedDescription) }
+        }
+    }
+
+    private func applyControls(to device: AVCaptureDevice, automatic: Bool = false) throws {
+        try device.lockForConfiguration()
+        defer { device.unlockForConfiguration() }
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+            device.automaticallyAdjustsFaceDrivenAutoFocusEnabled = false
+            device.isFaceDrivenAutoFocusEnabled = controls.facePriority
+            if controls.automaticFocus || automatic {
+                device.focusMode = .continuousAutoFocus
+            } else if device.isLockingFocusWithCustomLensPositionSupported {
+                device.setFocusModeLocked(lensPosition: min(1, max(0, controls.lensPosition)), completionHandler: nil)
+            }
+        }
+        if controls.automaticExposure || automatic {
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+        } else if device.isExposureModeSupported(.custom) {
+            var maximum = CMTimeGetSeconds(device.activeFormat.maxExposureDuration)
+            if snapshot.videoMode { maximum = min(maximum, CMTimeGetSeconds(device.activeVideoMaxFrameDuration)) }
+            let seconds = max(CMTimeGetSeconds(device.activeFormat.minExposureDuration), min(maximum, controls.shutterSeconds))
+            device.setExposureModeCustom(duration: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000),
+                                         iso: min(device.activeFormat.maxISO, max(device.activeFormat.minISO, controls.iso)), completionHandler: nil)
+        }
+        if controls.automaticWhiteBalance || automatic {
+            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+        } else if device.isWhiteBalanceModeSupported(.locked) {
+            let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: controls.temperature, tint: controls.tint)
+            var gains = device.deviceWhiteBalanceGains(for: values)
+            gains.redGain = min(device.maxWhiteBalanceGain, max(1, gains.redGain))
+            gains.greenGain = min(device.maxWhiteBalanceGain, max(1, gains.greenGain))
+            gains.blueGain = min(device.maxWhiteBalanceGain, max(1, gains.blueGain))
+            device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+        }
+        snapshot.focusLocked = !controls.automaticFocus && !automatic
+    }
+
+    private func startMetering() {
+        guard meterTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .seconds(1), leeway: .milliseconds(200))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.activeSession.isRunning else { return }
+            self.updateMeter()
+            self.onMeter?(self.snapshot)
+        }
+        meterTimer = timer
+        timer.resume()
+    }
+
+    private func updateMeter() {
+        guard let device = snapshot.dualEnabled ? dual.inputs.first?.device : input?.device else { return }
+        let seconds = CMTimeGetSeconds(device.exposureDuration)
+        let shutter = seconds > 0 && seconds < 1 ? "1/\(Int((1 / seconds).rounded()))" : String(format: "%.1f s", seconds)
+        snapshot.exposureLabel = "\(shutter) · ISO \(Int(device.iso.rounded()))"
+        snapshot.currentISO = device.iso
+        snapshot.currentShutter = seconds
+        snapshot.focusLabel = device.isAdjustingFocus ? "Focusing" : device.focusMode == .locked ? "Focus locked" : controls.facePriority ? "Face-priority AF" : "Auto focus"
+        snapshot.minISO = device.activeFormat.minISO
+        snapshot.maxISO = device.activeFormat.maxISO
+        snapshot.customExposureAvailable = device.isExposureModeSupported(.custom)
+        snapshot.manualFocusAvailable = device.isLockingFocusWithCustomLensPositionSupported
+        snapshot.whiteBalanceAvailable = device.isWhiteBalanceModeSupported(.locked)
+        snapshot.flashAvailable = device.hasFlash && device.isFlashAvailable
+    }
+
+    func captureBurst(completion: @escaping (Result<[CapturedPhoto], Error>) -> Void) {
+        queue.async {
+            guard !self.burstRunning, !self.snapshot.dualEnabled, !self.snapshot.videoMode,
+                  self.processor == nil, self.session.isRunning else { completion(.failure(CameraFailure.unavailable)); return }
+            self.burstRunning = true
+            let flash = self.controls.flash
+            self.controls.flash = .off
+            self.captureBurstFrame(photos: [], remaining: 3) { result in
+                self.controls.flash = flash
+                self.burstRunning = false
+                completion(result)
+            }
+        }
+    }
+
+    private func captureBurstFrame(photos: [CapturedPhoto], remaining: Int,
+                                   completion: @escaping (Result<[CapturedPhoto], Error>) -> Void) {
+        capture(speed: true) { result in
+            switch result {
+            case .success(let photo):
+                let collected = photos + [photo]
+                if remaining > 1 && self.wantsRunning {
+                    self.captureBurstFrame(photos: collected, remaining: remaining - 1, completion: completion)
+                } else { completion(.success(collected)) }
+            case .failure(let error):
+                completion(photos.isEmpty ? .failure(error) : .success(photos))
+            }
         }
     }
 }

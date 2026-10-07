@@ -1,10 +1,45 @@
 import AVFoundation
+import CoreImage
+import Vision
 
 struct CapturedPhoto {
     let data: Data
     let dimensions: CMVideoDimensions
     var companions: [CapturedPhoto] = []
     var warning: String?
+}
+
+/// Compares a small burst on-device. Originals remain available for the user's choice.
+enum PhotoRanker {
+    private static let queue = DispatchQueue(label: "CameraXT.photoRanking", qos: .userInitiated)
+    static func recommend(_ photos: [CapturedPhoto], completion: @escaping (Int) -> Void) {
+        queue.async {
+            let context = CIContext(options: [.cacheIntermediates: false])
+            let scores = photos.map { photo -> Double in
+                autoreleasepool {
+                    guard let original = CIImage(data: photo.data, options: [.applyOrientationProperty: true]) else { return 0 }
+                    let scale = min(1, 512 / max(original.extent.width, original.extent.height))
+                    let image = original.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                    let edges = image.applyingFilter("CIEdges", parameters: [kCIInputIntensityKey: 1])
+                    let average = edges.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: image.extent)])
+                    var pixel = [Float](repeating: 0, count: 4)
+                    pixel.withUnsafeMutableBytes { bytes in
+                        if let address = bytes.baseAddress {
+                            context.render(average, toBitmap: address, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: CGColorSpaceCreateDeviceRGB())
+                        }
+                    }
+                    let detail = Double(max(0, pixel[0]) + max(0, pixel[1]) + max(0, pixel[2])) / 3
+                    let request = VNDetectFaceCaptureQualityRequest()
+                    try? VNImageRequestHandler(ciImage: image).perform([request])
+                    let faces = request.results ?? []
+                    let largest = faces.max { $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height }
+                    let faceQuality = largest?.faceCaptureQuality?.doubleValue
+                    return faceQuality.map { $0 + min(detail, 0.25) } ?? detail
+                }
+            }
+            completion(scores.indices.max(by: { scores[$0] < scores[$1] }) ?? 0)
+        }
+    }
 }
 
 enum CameraFailure: LocalizedError {
