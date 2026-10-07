@@ -178,6 +178,11 @@ final class CameraViewModel: ObservableObject {
         engine.focus(at: point, locked: locked)
     }
 
+    func focusDual(at point: CGPoint, index: Int) {
+        guard camera.dualEnabled, camera.running, !busy, !configuring, !hasPendingCapture else { return }
+        engine.focus(at: point, locked: false, dualIndex: index)
+    }
+
     func applyControls() {
         guard !busy, !configuring, !hasPendingCapture, !camera.dualEnabled else { return }
         captureStyle = "Auto"
