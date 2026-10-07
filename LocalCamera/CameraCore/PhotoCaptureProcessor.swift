@@ -15,30 +15,50 @@ enum PhotoRanker {
     static func recommend(_ photos: [CapturedPhoto], completion: @escaping (Int) -> Void) {
         queue.async {
             let context = CIContext(options: [.cacheIntermediates: false])
-            let scores = photos.map { photo -> Double in
-                autoreleasepool {
-                    guard let original = CIImage(data: photo.data, options: [.applyOrientationProperty: true]) else { return 0 }
-                    let scale = min(1, 512 / max(original.extent.width, original.extent.height))
-                    let image = original.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-                    let edges = image.applyingFilter("CIEdges", parameters: [kCIInputIntensityKey: 1])
-                    let average = edges.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: image.extent)])
-                    var pixel = [Float](repeating: 0, count: 4)
-                    pixel.withUnsafeMutableBytes { bytes in
-                        if let address = bytes.baseAddress {
-                            context.render(average, toBitmap: address, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: CGColorSpaceCreateDeviceRGB())
-                        }
-                    }
-                    let detail = Double(max(0, pixel[0]) + max(0, pixel[1]) + max(0, pixel[2])) / 3
-                    let request = VNDetectFaceCaptureQualityRequest()
-                    try? VNImageRequestHandler(ciImage: image).perform([request])
-                    let faces = request.results ?? []
-                    let largest = faces.max { $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height }
-                    let faceQuality = largest?.faceCaptureQuality?.doubleValue
-                    return faceQuality.map { $0 + min(detail, 0.25) } ?? detail
-                }
+            var bestIndex = 0
+            var bestScore = -Double.infinity
+            for (index, photo) in photos.enumerated() {
+                let value: Double = autoreleasepool { score(photo, context: context) }
+                if value > bestScore { bestScore = value; bestIndex = index }
             }
-            completion(scores.indices.max(by: { scores[$0] < scores[$1] }) ?? 0)
+            completion(bestIndex)
         }
+    }
+    private static func score(_ photo: CapturedPhoto, context: CIContext) -> Double {
+        guard let original = CIImage(data: photo.data, options: [.applyOrientationProperty: true]) else { return 0 }
+        let longest: CGFloat = max(original.extent.width, original.extent.height)
+        guard longest > 0 else { return 0 }
+        let scale: CGFloat = min(1, 512 / longest)
+        let image = original.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let detail = detailScore(image, context: context)
+        let request = VNDetectFaceCaptureQualityRequest()
+        let handler = VNImageRequestHandler(ciImage: image, options: [:])
+        try? handler.perform([request])
+        var largestArea: CGFloat = 0
+        var faceQuality: Double?
+        for face in request.results ?? [] {
+            let area = face.boundingBox.width * face.boundingBox.height
+            if area > largestArea {
+                largestArea = area
+                faceQuality = face.faceCaptureQuality?.doubleValue
+            }
+        }
+        if let quality = faceQuality { return quality + min(detail, 0.25) }
+        return detail
+    }
+    private static func detailScore(_ image: CIImage, context: CIContext) -> Double {
+        let edges = image.applyingFilter("CIEdges", parameters: [kCIInputIntensityKey: 1])
+        let extent = CIVector(cgRect: image.extent)
+        let average = edges.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: extent])
+        var pixel = [Float](repeating: 0, count: 4)
+        pixel.withUnsafeMutableBytes { bytes in
+            guard let address = bytes.baseAddress else { return }
+            context.render(average, toBitmap: address, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: CGColorSpaceCreateDeviceRGB())
+        }
+        let red = max(0.0, Double(pixel[0]))
+        let green = max(0.0, Double(pixel[1]))
+        let blue = max(0.0, Double(pixel[2]))
+        return (red + green + blue) / 3.0
     }
 }
 

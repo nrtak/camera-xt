@@ -169,7 +169,6 @@ final class CaptureSessionManager {
                     self.session.commitConfiguration()
                     try self.applyControls(to: device)
                     self.connectPreview()
-                    self.snapshot.focusLocked = false
                     self.publish()
                 } else {
                     self.session.addInput(oldInput)
@@ -212,7 +211,7 @@ final class CaptureSessionManager {
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
             settings.maxPhotoDimensions = self.output.maxPhotoDimensions
             settings.photoQualityPrioritization = speed || self.input?.device.exposureMode == .custom ? .speed : .quality
-            if self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
+            if self.input?.device.isFlashAvailable == true && self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
             let processor = PhotoCaptureProcessor { [weak self] result in
                 guard let self = self else { return }
                 self.queue.async {
@@ -283,7 +282,7 @@ final class CaptureSessionManager {
                     for input in self.dual.inputs { try self.applyControls(to: input.device, automatic: true) }
                 } else if let device = self.input?.device { try self.applyControls(to: device) }
                 if self.wantsRunning { self.activeSession.startRunning() }
-                self.snapshot.focusLocked = false
+                self.snapshot.focusLocked = !enabled && !self.controls.automaticFocus
                 self.publish()
             } catch {
                 if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
