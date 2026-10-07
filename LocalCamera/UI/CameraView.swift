@@ -1,5 +1,8 @@
 import SwiftUI
 import AVFoundation
+import PhotosUI
+import CoreImage
+import ImageIO
 
 struct CameraView: View {
     @StateObject private var model = CameraViewModel()
@@ -53,7 +56,7 @@ struct CameraView: View {
     private var captureHUD: some View {
         Button { showsCaptureInfo = true } label: {
             VStack(spacing: 7) {
-                Image(systemName: "chevron.down")
+                Label("Tools", systemImage: "slider.horizontal.3")
                     .font(.caption.weight(.semibold))
                     .padding(.horizontal, 12).padding(.vertical, 5)
                     .background(.regularMaterial, in: Capsule())
@@ -76,9 +79,9 @@ struct CameraView: View {
             .padding(.horizontal, 14).padding(.top, 6)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Capture information")
+        .accessibilityLabel("Camera Tools and capture information")
         .accessibilityValue("\(model.mode.rawValue), \(model.selectedLens?.name ?? "Camera"), \(model.mode == .photo ? model.camera.resolution : model.camera.videoLabel)")
-        .accessibilityHint("Opens current capture details")
+        .accessibilityHint("Opens camera features, controls, and current capture details")
         .disabled(model.busy || model.hasPendingCapture)
     }
 
@@ -244,6 +247,34 @@ struct CameraView: View {
     private var captureInfo: some View {
         NavigationStack {
             Form {
+                Section("Camera Tools") {
+                    NavigationLink {
+                        PhotoRescueView()
+                            .onAppear { model.setPhotoEditorActive(true) }
+                            .onDisappear { model.setPhotoEditorActive(false) }
+                    } label: {
+                        Label("Photo Rescue", systemImage: "wand.and.stars")
+                    }
+                    .disabled(model.busy || model.configuring || model.camera.recording || model.hasPendingCapture)
+                    Button(action: model.nightPreset) {
+                        Label("Night · steady scene", systemImage: "moon.stars")
+                    }
+                    .disabled(model.mode != .photo || !model.camera.customExposureAvailable || model.camera.dualEnabled || model.busy || model.configuring || model.hasPendingCapture)
+                    Text("Night uses a 3-second timer and three separate 1/4-second exposures. Support the phone and review the originals. This experimental preset does not merge frames; moving subjects may blur.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button(action: model.actionPreset) {
+                        Label("Action · 3-shot burst", systemImage: "figure.run")
+                    }
+                    .disabled(model.mode != .photo || !model.camera.customExposureAvailable || model.camera.dualEnabled || model.busy || model.configuring || model.hasPendingCapture)
+                    Toggle("Embed depth in photos", isOn: Binding(get: { model.camera.depthEnabled }, set: model.engine.setDepthEnabled))
+                        .disabled(!model.camera.depthAvailable || model.busy || model.configuring || model.hasPendingCapture)
+                    Text(model.camera.depthAvailable ? "Saves a depth map alongside the photo when the camera provides one. No artificial blur is applied." : "Select the Depth rear camera or Front Depth camera in Photo mode to capture depth where supported. Unavailable with Dual Shot or video.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Toggle("Eye-priority focus · experimental", isOn: Binding(get: { model.camera.eyeFocusEnabled }, set: model.setEyeFocus))
+                        .disabled(!model.camera.eyeFocusAvailable || model.busy || model.configuring || model.hasPendingCapture)
+                    Text("In rear Photo mode, focuses near an eye of the largest visible face. Tap focus, manual focus, or changing cameras turns it off. Processing pauses when the phone gets hot.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("Current capture") {
                     LabeledContent("Mode", value: model.mode.rawValue)
                     LabeledContent("Lens", value: model.selectedLens?.name ?? "Unavailable")
@@ -303,7 +334,7 @@ struct CameraView: View {
                     Text("Photos are saved on this iPhone. No account or cloud processing is used.")
                 }
             }
-            .navigationTitle("Capture Info")
+            .navigationTitle("Camera Tools")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showsCaptureInfo = false } } }
         }
@@ -318,6 +349,51 @@ struct CameraView: View {
 
 // The original reference is bundled locally so design review works offline.
 // These images are illustrations, never representations of active camera settings.
+private struct PhotoRescueView: View {
+    @StateObject private var model = PhotoRescueModel()
+    @State private var selection: PhotosPickerItem?
+    @State private var showsOriginal = false
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                Text("Improve light, color, and noise on this iPhone. Preview the change before saving a separate copy.")
+                PhotosPicker(selection: $selection, matching: .images) {
+                    Label("Choose a photo", systemImage: "photo")
+                }
+                .buttonStyle(.borderedProminent).disabled(model.busy)
+                if let result = model.result {
+                    Image(uiImage: showsOriginal ? result.before : result.after)
+                        .resizable().scaledToFit().frame(maxHeight: 400)
+                        .accessibilityLabel(showsOriginal ? "Original photo" : "Adjusted preview")
+                    Toggle("Show original", isOn: $showsOriginal)
+                    HStack {
+                        Text("Strength")
+                        Slider(value: $model.strength, in: 0...1, step: 0.1)
+                            .accessibilityLabel("Adjustment strength")
+                    }
+                    .disabled(model.busy)
+                    Button("Apply strength") { Task { await model.apply() } }
+                        .disabled(model.busy)
+                    Button(model.saved ? "Copy saved" : "Save preview as a copy") { Task { await model.save() } }
+                        .buttonStyle(.borderedProminent).disabled(model.busy || model.saved)
+                    Text("\(result.photo.dimensions.width) × \(result.photo.dimensions.height) · JPEG")
+                        .font(.caption)
+                }
+                if model.busy { ProgressView() }
+                if let message = model.message { Text(message).font(.callout) }
+                Text("Exports a standard-color JPEG up to 12 MP without location metadata. Original RAW, HDR, Live Photo, and depth data stay in the original. This tool makes tonal adjustments; it cannot reconstruct missed focus or motion detail.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }.padding()
+        }
+        .navigationTitle("Photo Rescue")
+        .onChange(of: selection) { _, item in
+            guard let item else { return }
+            showsOriginal = false
+            Task { await model.load(item) }
+        }
+    }
+}
+
 private struct ManualCameraControls: View {
     @ObservedObject var model: CameraViewModel
     private let shutters = [8000, 4000, 2000, 1000, 500, 250, 125, 60, 30, 15, 8, 4, 2, 1]
