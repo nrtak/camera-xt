@@ -15,6 +15,7 @@ struct CameraView: View {
     @State private var showsCaptureInfo = false
     @GestureState private var holdingPeek = false
     @State private var accessiblePeek = false
+    @State private var enlargedDualIndex: Int?
     private var isPeeking: Bool { holdingPeek || accessiblePeek }
     private var hasAdjustments: Bool {
         model.captureStyle != "Auto" || model.timerSeconds > 0 || model.burstEnabled ||
@@ -31,9 +32,22 @@ struct CameraView: View {
             Color.black.ignoresSafeArea()
             if model.permission == .authorized {
                 if model.camera.dualEnabled {
-                    VStack(spacing: 4) {
-                        dualViewfinder("Main · 1×", index: 0)
-                        dualViewfinder("Ultra Wide · 0.5×", index: 1)
+                    GeometryReader { geometry in
+                        ZStack(alignment: .topLeading) {
+                            ForEach(0..<2, id: \.self) { index in
+                                let inset = enlargedDualIndex != nil && enlargedDualIndex != index
+                                let width = inset ? geometry.size.width * 0.38 : geometry.size.width
+                                let height = enlargedDualIndex == nil ? (geometry.size.height - 4) / 2 :
+                                    inset ? geometry.size.height * 0.32 : geometry.size.height
+                                dualViewfinder(index == 0 ? "Main · 1×" : "Ultra Wide · 0.5×", index: index)
+                                    .frame(width: width, height: height)
+                                    .clipShape(RoundedRectangle(cornerRadius: inset ? 12 : 0))
+                                    .overlay { RoundedRectangle(cornerRadius: inset ? 12 : 0).strokeBorder(.white.opacity(inset ? 0.8 : 0), lineWidth: 2).allowsHitTesting(false) }
+                                    .offset(x: inset ? geometry.size.width - width - 8 : 0,
+                                            y: enlargedDualIndex == nil ? CGFloat(index) * (height + 4) : inset ? geometry.size.height - height - 8 : 0)
+                                    .zIndex(inset ? 1 : 0)
+                            }
+                        }
                     }
                 } else {
                     CameraPreview(engine: model.engine, onFocus: model.focus)
@@ -100,13 +114,23 @@ struct CameraView: View {
     private func dualViewfinder(_ title: String, index: Int) -> some View {
         CameraPreview(engine: model.engine, onFocus: { point, _ in
             model.focusDual(at: point, index: index)
-        }, secondary: index == 1)
+        }, secondary: index == 1, showsFocusFeedback: model.canConfigure &&
+            model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index])
         .background(.black)
         .overlay(alignment: .topLeading) {
-            Text("\(title) · Tap to focus")
-                .font(.caption.weight(.semibold)).padding(8)
-                .background(.white.opacity(0.85), in: Capsule()).padding(8)
-                .allowsHitTesting(false)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.caption.weight(.semibold))
+                Text(model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index] ? "Tap to focus" : "Tap focus unavailable")
+                    .font(.caption2)
+                Button {
+                    enlargedDualIndex = enlargedDualIndex == index ? nil : index
+                } label: {
+                    Image(systemName: enlargedDualIndex == index ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+                .accessibilityLabel(enlargedDualIndex == index ? "Show both cameras equally" : "Enlarge \(title)")
+            }
+            .padding(6).background(.white.opacity(0.85), in: RoundedRectangle(cornerRadius: 12)).padding(6)
         }
         .accessibilityLabel("\(title) live viewfinder. Tap to focus this camera.")
     }
