@@ -69,6 +69,7 @@ struct CameraView: View {
                     .font(.subheadline.weight(.semibold)).padding(12)
                     .background(.regularMaterial, in: Capsule())
             }
+            .disabled(!model.canConfigure)
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) { activeIndicators }
                 VStack(spacing: 6) { activeIndicators }
@@ -82,7 +83,10 @@ struct CameraView: View {
                     .padding(10).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
             if model.hasPendingCapture && !model.busy {
-                HStack { saveRecovery }.font(.callout).padding(10)
+                ViewThatFits(in: .horizontal) {
+                    HStack { saveRecovery }
+                    VStack { saveRecovery }
+                }.font(.callout).padding(10)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
         }
@@ -98,6 +102,8 @@ struct CameraView: View {
         if model.burstEnabled && model.captureStyle == "Auto" { indicator("3-shot burst", page: .shoot) }
         if model.camera.dualEnabled { indicator("Dual Shot", page: .shoot) }
         if !model.controls.automaticExposure && model.captureStyle == "Auto" { indicator("Manual exposure", page: .exposure) }
+        if abs(model.exposureBias) > 0.05 { indicator(String(format: "%+.1f EV", model.exposureBias), page: .exposure) }
+        if !model.controls.automaticWhiteBalance { indicator("Manual color", page: .color) }
         if model.camera.recording { Text("Recording").foregroundStyle(.red).padding(8).background(.regularMaterial, in: Capsule()) }
     }
 
