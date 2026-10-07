@@ -223,7 +223,7 @@ final class CaptureSessionManager {
             guard self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled else { return }
             self.activeSession.stopRunning()
             if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
-            self.preview?.setSessionWithNoConnection(nil)
+            self.preview?.session = nil
             do {
                 if enabled {
                     try self.dual.configure()
@@ -246,7 +246,7 @@ final class CaptureSessionManager {
                 self.publish()
             } catch {
                 if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
-                self.preview?.setSessionWithNoConnection(nil)
+                self.preview?.session = nil
                 self.dual.reset()
                 self.snapshot.dualEnabled = false
                 self.snapshot.selectedID = self.input?.device.uniqueID
