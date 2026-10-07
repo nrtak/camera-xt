@@ -23,6 +23,7 @@ struct CameraSnapshot {
     var message: String?
     var dualAvailable = false
     var dualEnabled = false
+    var dualFocusSupported = [false, false]
     var focusLocked = false
     var videoMode = false
     var recording = false
@@ -262,6 +263,9 @@ final class CaptureSessionManager {
         updateMeter()
         snapshot.depthAvailable = !snapshot.dualEnabled && !snapshot.videoMode && output.isDepthDataDeliveryEnabled
         if !snapshot.depthAvailable { snapshot.depthEnabled = false }
+        snapshot.dualFocusSupported = snapshot.dualEnabled ? dual.inputs.map {
+            $0.device.isFocusPointOfInterestSupported && $0.device.isFocusModeSupported(.continuousAutoFocus)
+        } : [false, false]
         snapshot.running = activeSession.isRunning && !activeSession.isInterrupted
         snapshot.message = message
         onChange?(snapshot)
@@ -898,13 +902,16 @@ private final class DualPhotoCamera {
                     self.results[index] = result
                     self.processors[index] = nil
                     guard self.results.count == 2 else { return }
-                    var photos = (0..<2).compactMap { try? self.results[$0]?.get() }
-                    guard var first = photos.first else {
+                    let successful = (0..<2).compactMap { index -> (Int, CapturedPhoto)? in
+                        guard let photo = try? self.results[index]?.get() else { return nil }
+                        return (index, photo)
+                    }
+                    guard var first = successful.first?.1 else {
                         completion(.failure(CameraFailure.noPhoto)); self.results.removeAll(); return
                     }
-                    photos.removeFirst()
-                    first.companions = photos
-                    if photos.isEmpty { first.warning = "Only one lens captured successfully. The available photo was kept." }
+                    first.companions = successful.dropFirst().map { $0.1 }
+                    first.warning = successful.count == 2 ? "Both photos saved" :
+                        "Only \(successful[0].0 == 0 ? "Main" : "Ultra Wide") photo saved. The other camera did not capture a photo."
                     self.results.removeAll()
                     completion(.success(first))
                 }
