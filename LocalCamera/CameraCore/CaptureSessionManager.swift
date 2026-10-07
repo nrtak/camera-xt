@@ -1,4 +1,6 @@
 import AVFoundation
+import Vision
+import CoreImage
 
 struct CameraControls {
     var automaticExposure = true
@@ -36,6 +38,10 @@ struct CameraSnapshot {
     var flashAvailable = false
     var currentISO: Float = 100
     var currentShutter = 1.0 / 250
+    var depthAvailable = false
+    var depthEnabled = false
+    var eyeFocusEnabled = false
+    var eyeFocusAvailable = false
 }
 
 /// All session/device mutations and delegate ownership stay on this serial queue.
@@ -63,6 +69,11 @@ final class CaptureSessionManager {
     private var controls = CameraControls()
     private var meterTimer: DispatchSourceTimer?
     private var burstRunning = false
+    private let eyeOutput = AVCaptureVideoDataOutput()
+    private var eyeTracker: EyeFocusTracker?
+    private var eyeGeneration = UUID()
+    private var lastEyePoint: CGPoint?
+    private var eyeStatus = "Eye AF · searching"
 
     init() {
         let center = NotificationCenter.default
@@ -130,6 +141,13 @@ final class CaptureSessionManager {
 
     private func configure() throws {
         devices = CameraDeviceCatalog.discover()
+        if let frontDepth = AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front) {
+            devices.removeAll { $0.position == .front }
+            devices.append(frontDepth)
+        }
+        if let rearDepth = AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back) {
+            devices.append(rearDepth)
+        }
         guard let device = devices.first(where: {
             $0.position == .back && $0.deviceType == .builtInWideAngleCamera
         }) ?? devices.first else { throw CameraFailure.unavailable }
@@ -147,7 +165,11 @@ final class CaptureSessionManager {
         input = newInput
         output.maxPhotoQualityPrioritization = .quality
         configureDimensions(device)
-        snapshot.lenses = devices.map(CameraDeviceCatalog.lens)
+        snapshot.lenses = devices.map { device in
+            if device.deviceType == .builtInDualCamera { return CameraLens(id: device.uniqueID, name: "Depth", isFront: false) }
+            if device.deviceType == .builtInTrueDepthCamera { return CameraLens(id: device.uniqueID, name: "Front Depth", isFront: true) }
+            return CameraDeviceCatalog.lens(for: device)
+        }
         snapshot.selectedID = device.uniqueID
         snapshot.dualAvailable = DualPhotoCamera.isSupported
         try applyControls(to: device)
@@ -157,6 +179,7 @@ final class CaptureSessionManager {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, !self.snapshot.dualEnabled, let oldInput = self.input,
                   let device = self.devices.first(where: { $0.uniqueID == id }) else { return }
+            self.disableEyeFocus()
             do {
                 let newInput = try AVCaptureDeviceInput(device: device)
                 self.session.beginConfiguration()
@@ -180,6 +203,9 @@ final class CaptureSessionManager {
     }
 
     private func configureDimensions(_ device: AVCaptureDevice) {
+        output.isDepthDataDeliveryEnabled = output.isDepthDataDeliverySupported
+        snapshot.depthAvailable = output.isDepthDataDeliverySupported
+        if !snapshot.depthAvailable { snapshot.depthEnabled = false }
         // A modest native photo size keeps this first build responsive.
         let sizes = device.activeFormat.supportedMaxPhotoDimensions.sorted {
             Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height)
@@ -211,8 +237,10 @@ final class CaptureSessionManager {
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
             settings.maxPhotoDimensions = self.output.maxPhotoDimensions
             settings.photoQualityPrioritization = speed || self.input?.device.exposureMode == .custom ? .speed : .quality
+            settings.isDepthDataDeliveryEnabled = self.snapshot.depthEnabled && self.output.isDepthDataDeliveryEnabled
+            settings.embedsDepthDataInPhoto = settings.isDepthDataDeliveryEnabled
             if self.input?.device.isFlashAvailable == true && self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
-            let processor = PhotoCaptureProcessor { [weak self] result in
+            let processor = PhotoCaptureProcessor(expectsDepth: settings.isDepthDataDeliveryEnabled) { [weak self] result in
                 guard let self = self else { return }
                 self.queue.async {
                     self.processor = nil
@@ -226,9 +254,83 @@ final class CaptureSessionManager {
 
     private func publish(message: String? = nil) {
         updateMeter()
+        snapshot.depthAvailable = !snapshot.dualEnabled && !snapshot.videoMode && output.isDepthDataDeliveryEnabled
+        if !snapshot.depthAvailable { snapshot.depthEnabled = false }
         snapshot.running = activeSession.isRunning && !activeSession.isInterrupted
         snapshot.message = message
         onChange?(snapshot)
+    }
+
+    func setDepthEnabled(_ enabled: Bool) {
+        queue.async {
+            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil,
+                  self.snapshot.depthAvailable else { return }
+            self.snapshot.depthEnabled = enabled
+            self.publish()
+        }
+    }
+
+    func setEyeFocus(_ enabled: Bool) {
+        queue.async {
+            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil else { return }
+            self.disableEyeFocus()
+            guard enabled, self.snapshot.eyeFocusAvailable, let device = self.input?.device else { self.publish(); return }
+            self.session.beginConfiguration()
+            guard self.session.canAddOutput(self.eyeOutput) else {
+                self.session.commitConfiguration()
+                self.publish(message: "Eye focus is unavailable with this camera configuration.")
+                return
+            }
+            self.eyeOutput.alwaysDiscardsLateVideoFrames = true
+            self.eyeOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
+            self.session.addOutput(self.eyeOutput)
+            if let connection = self.eyeOutput.connection(with: .video) {
+                if connection.isVideoOrientationSupported { connection.videoOrientation = .landscapeRight }
+                if connection.isVideoMirroringSupported {
+                    connection.automaticallyAdjustsVideoMirroring = false
+                    connection.isVideoMirrored = false
+                }
+            }
+            let generation = self.eyeGeneration
+            let tracker = EyeFocusTracker { [weak self] point, paused in
+                self?.queue.async { [weak self] in
+                    guard let self, self.eyeGeneration == generation, self.snapshot.eyeFocusEnabled,
+                          self.session.isRunning, !self.burstRunning, self.processor == nil else { return }
+                    self.eyeStatus = paused ? "Eye AF · cooling" : point == nil ? "Eye AF · searching" : "Eye-priority AF"
+                    guard !paused else { return }
+                    let target = point ?? CGPoint(x: 0.5, y: 0.5)
+                    if let previous = self.lastEyePoint, hypot(target.x - previous.x, target.y - previous.y) < 0.035 { return }
+                    do {
+                        try device.lockForConfiguration()
+                        device.focusPointOfInterest = target
+                        device.focusMode = .continuousAutoFocus
+                        device.unlockForConfiguration()
+                        self.lastEyePoint = target
+                    } catch { self.eyeStatus = "Eye AF · unavailable" }
+                }
+            }
+            self.eyeTracker = tracker
+            self.eyeOutput.setSampleBufferDelegate(tracker, queue: tracker.queue)
+            self.session.commitConfiguration()
+            self.snapshot.eyeFocusEnabled = true
+            self.controls.automaticFocus = true
+            do { try self.applyControls(to: device); self.publish() }
+            catch { self.disableEyeFocus(); self.publish(message: error.localizedDescription) }
+        }
+    }
+
+    private func disableEyeFocus() {
+        eyeGeneration = UUID()
+        eyeOutput.setSampleBufferDelegate(nil, queue: nil)
+        if session.outputs.contains(eyeOutput) {
+            session.beginConfiguration()
+            session.removeOutput(eyeOutput)
+            session.commitConfiguration()
+        }
+        eyeTracker = nil
+        lastEyePoint = nil
+        snapshot.eyeFocusEnabled = false
+        if let device = input?.device { try? applyControls(to: device) }
     }
 
     func attachPreview(_ layer: AVCaptureVideoPreviewLayer) {
@@ -257,6 +359,7 @@ final class CaptureSessionManager {
     func setDualEnabled(_ enabled: Bool) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled else { return }
+            self.disableEyeFocus()
             self.activeSession.stopRunning()
             if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
             self.preview?.session = nil
@@ -304,6 +407,7 @@ final class CaptureSessionManager {
     func focus(at point: CGPoint, locked: Bool) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, !self.dual.busy else { return }
+            self.disableEyeFocus()
             let devices = self.snapshot.dualEnabled ? self.dual.inputs.map(\.device) : [self.input?.device].compactMap { $0 }
             do {
                 for device in devices {
@@ -344,6 +448,7 @@ final class CaptureSessionManager {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
                   let device = self.input?.device else { self.publish(); return }
+            self.disableEyeFocus()
             self.session.stopRunning()
             self.session.beginConfiguration()
             var failure: Error?
@@ -456,6 +561,7 @@ final class CaptureSessionManager {
                   let device = self.input?.device else { return }
             do {
                 self.controls = value
+                if !value.automaticFocus { self.disableEyeFocus() }
                 try self.applyControls(to: device)
                 self.publish()
             } catch { self.publish(message: error.localizedDescription) }
@@ -467,14 +573,14 @@ final class CaptureSessionManager {
         defer { device.unlockForConfiguration() }
         if device.isFocusModeSupported(.continuousAutoFocus) {
             device.automaticallyAdjustsFaceDrivenAutoFocusEnabled = false
-            device.isFaceDrivenAutoFocusEnabled = controls.facePriority
-            if controls.automaticFocus || automatic {
+            device.isFaceDrivenAutoFocusEnabled = controls.facePriority && !snapshot.eyeFocusEnabled
+            if controls.automaticFocus || automatic || !device.isLockingFocusWithCustomLensPositionSupported {
                 device.focusMode = .continuousAutoFocus
             } else if device.isLockingFocusWithCustomLensPositionSupported {
                 device.setFocusModeLocked(lensPosition: min(1, max(0, controls.lensPosition)), completionHandler: nil)
             }
         }
-        if controls.automaticExposure || automatic {
+        if controls.automaticExposure || automatic || !device.isExposureModeSupported(.custom) {
             if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
         } else if device.isExposureModeSupported(.custom) {
             var maximum = CMTimeGetSeconds(device.activeFormat.maxExposureDuration)
@@ -483,7 +589,7 @@ final class CaptureSessionManager {
             device.setExposureModeCustom(duration: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000),
                                          iso: min(device.activeFormat.maxISO, max(device.activeFormat.minISO, controls.iso)), completionHandler: nil)
         }
-        if controls.automaticWhiteBalance || automatic {
+        if controls.automaticWhiteBalance || automatic || !device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
             if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
         } else if device.isWhiteBalanceModeSupported(.locked) {
             let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: controls.temperature, tint: controls.tint)
@@ -493,7 +599,7 @@ final class CaptureSessionManager {
             gains.blueGain = min(device.maxWhiteBalanceGain, max(1, gains.blueGain))
             device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
         }
-        snapshot.focusLocked = !controls.automaticFocus && !automatic
+        snapshot.focusLocked = !controls.automaticFocus && !automatic && device.isLockingFocusWithCustomLensPositionSupported
     }
 
     private func startMetering() {
@@ -517,11 +623,13 @@ final class CaptureSessionManager {
         snapshot.currentISO = device.iso
         snapshot.currentShutter = seconds
         snapshot.focusLabel = device.isAdjustingFocus ? "Focusing" : device.focusMode == .locked ? "Focus locked" : controls.facePriority ? "Face-priority AF" : "Auto focus"
+        if snapshot.eyeFocusEnabled { snapshot.focusLabel = eyeStatus }
+        snapshot.eyeFocusAvailable = !snapshot.dualEnabled && !snapshot.videoMode && device.position == .back && device.isFocusPointOfInterestSupported && device.isFocusModeSupported(.continuousAutoFocus)
         snapshot.minISO = device.activeFormat.minISO
         snapshot.maxISO = device.activeFormat.maxISO
         snapshot.customExposureAvailable = device.isExposureModeSupported(.custom)
         snapshot.manualFocusAvailable = device.isLockingFocusWithCustomLensPositionSupported
-        snapshot.whiteBalanceAvailable = device.isWhiteBalanceModeSupported(.locked)
+        snapshot.whiteBalanceAvailable = device.isLockingWhiteBalanceWithCustomDeviceGainsSupported
         snapshot.flashAvailable = device.hasFlash && device.isFlashAvailable
     }
 
@@ -553,6 +661,50 @@ final class CaptureSessionManager {
                 completion(photos.isEmpty ? .failure(error) : .success(photos))
             }
         }
+    }
+}
+
+/// Low-rate, local landmark detection. Coordinates return to the unmirrored sensor space.
+private final class EyeFocusTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    let queue = DispatchQueue(label: "CameraXT.eyeFocus", qos: .utility)
+    private let report: (CGPoint?, Bool) -> Void
+    private var lastTime = -Double.infinity
+    private var misses = 0
+    init(report: @escaping (CGPoint?, Bool) -> Void) { self.report = report }
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        guard time.isFinite, time - lastTime >= 0.4 else { return }
+        lastTime = time
+        let thermal = ProcessInfo.processInfo.thermalState
+        guard thermal != .serious && thermal != .critical else { report(nil, true); return }
+        guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        autoreleasepool {
+            let raw = CIImage(cvPixelBuffer: buffer)
+            let scale = min(1, 640 / max(raw.extent.width, raw.extent.height))
+            let image = raw.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            let request = VNDetectFaceLandmarksRequest()
+            do {
+                try VNImageRequestHandler(ciImage: image, orientation: .right, options: [:]).perform([request])
+                guard let face = request.results?.filter({ $0.confidence >= 0.6 }).max(by: {
+                    $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
+                }), let eye = face.landmarks?.leftEye ?? face.landmarks?.rightEye,
+                      !eye.normalizedPoints.isEmpty else { missed(); return }
+                let points = eye.normalizedPoints
+                let x = points.reduce(CGFloat(0)) { $0 + $1.x } / CGFloat(points.count)
+                let y = points.reduce(CGFloat(0)) { $0 + $1.y } / CGFloat(points.count)
+                let uprightX = face.boundingBox.minX + x * face.boundingBox.width
+                let uprightY = face.boundingBox.minY + y * face.boundingBox.height
+                // Undo Vision's clockwise portrait orientation and bottom-left origin.
+                let point = CGPoint(x: 1 - uprightY, y: 1 - uprightX)
+                guard (0...1).contains(point.x), (0...1).contains(point.y) else { missed(); return }
+                misses = 0
+                report(point, false)
+            } catch { missed() }
+        }
+    }
+    private func missed() {
+        misses += 1
+        if misses >= 3 { report(nil, false) }
     }
 }
 
