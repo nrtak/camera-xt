@@ -30,10 +30,17 @@ struct CameraView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             if model.permission == .authorized {
-                CameraPreview(engine: model.engine, onFocus: model.focus)
-                    .ignoresSafeArea()
-                    .accessibilityLabel("Camera viewfinder")
-                if showsGrid && model.camera.running && !isPeeking {
+                if model.camera.dualEnabled {
+                    VStack(spacing: 4) {
+                        dualViewfinder("Main · 1×", index: 0)
+                        dualViewfinder("Ultra Wide · 0.5×", index: 1)
+                    }
+                } else {
+                    CameraPreview(engine: model.engine, onFocus: model.focus)
+                        .ignoresSafeArea()
+                        .accessibilityLabel("Camera viewfinder")
+                }
+                if showsGrid && model.camera.running && !isPeeking && !model.camera.dualEnabled {
                     compositionGrid.ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true)
                 }
             }
@@ -88,6 +95,20 @@ struct CameraView: View {
         .confirmationDialog("Discard the unsaved capture?", isPresented: $confirmDiscard, titleVisibility: .visible) {
             Button("Discard capture", role: .destructive, action: model.discard)
         }
+    }
+
+    private func dualViewfinder(_ title: String, index: Int) -> some View {
+        CameraPreview(engine: model.engine, onFocus: { point, _ in
+            model.focusDual(at: point, index: index)
+        }, secondary: index == 1)
+        .background(.black)
+        .overlay(alignment: .topLeading) {
+            Text("\(title) · Tap to focus")
+                .font(.caption.weight(.semibold)).padding(8)
+                .background(.white.opacity(0.85), in: Capsule()).padding(8)
+                .allowsHitTesting(false)
+        }
+        .accessibilityLabel("\(title) live viewfinder. Tap to focus this camera.")
     }
 
     private func openTool(_ page: CameraToolPage? = nil) {
@@ -316,7 +337,7 @@ struct CameraView: View {
                 toolPage(page)
             } else {
                 CompactToolLayout {
-                    toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .rescue, .advanced, .preferences])
+                    toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .exposure, .color, .manualFocus, .details, .rescue, .preferences, .gallery])
                     HStack(spacing: 12) {
                         quickPreset("Action", icon: "figure.run", detail: "Fast movement", tool: .action)
                         quickPreset("Night", icon: "moon", detail: "Hold still · Experimental", tool: .night)
@@ -332,12 +353,12 @@ struct CameraView: View {
     }
 
     private func toolGrid(_ pages: [CameraToolPage]) -> some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
             ForEach(pages, id: \.self) { page in
                 Button { toolPath.append(page) } label: {
                     VStack(alignment: .leading, spacing: 8) {
                         Image(systemName: page.icon).font(.title2)
-                        Text(page.rawValue).font(.headline)
+                        Text(page.rawValue).font(.caption.weight(.semibold))
                     }
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).padding(10)
                     .background(Color.gray.opacity(0.09), in: RoundedRectangle(cornerRadius: 18))
