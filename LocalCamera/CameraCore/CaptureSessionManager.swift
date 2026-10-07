@@ -60,6 +60,7 @@ final class CaptureSessionManager {
     private var snapshot = CameraSnapshot()
     private lazy var dual = DualPhotoCamera(queue: queue)
     private weak var preview: AVCaptureVideoPreviewLayer?
+    private weak var secondaryPreview: AVCaptureVideoPreviewLayer?
     private final class PreviewReference {
         weak var layer: AVCaptureVideoPreviewLayer?
         init(_ layer: AVCaptureVideoPreviewLayer) { self.layer = layer }
@@ -338,8 +339,17 @@ final class CaptureSessionManager {
         if let device = input?.device { try? applyControls(to: device) }
     }
 
-    func attachPreview(_ layer: AVCaptureVideoPreviewLayer) {
+    func attachPreview(_ layer: AVCaptureVideoPreviewLayer, secondary: Bool = false) {
         queue.async {
+            if secondary {
+                if let old = self.secondaryPreview {
+                    if let connection = old.connection { old.session?.removeConnection(connection) }
+                    old.session = nil
+                }
+                self.secondaryPreview = layer
+                self.connectPreview()
+                return
+            }
             if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
             self.preview?.session = nil
             self.previews.removeAll { $0.layer == nil || $0.layer === layer }
@@ -351,6 +361,7 @@ final class CaptureSessionManager {
 
     func detachPreview(_ layer: AVCaptureVideoPreviewLayer) {
         queue.async {
+            if self.secondaryPreview === layer { self.secondaryPreview = nil }
             self.previews.removeAll { $0.layer == nil || $0.layer === layer }
             if let connection = layer.connection { layer.session?.removeConnection(connection) }
             layer.session = nil
@@ -361,19 +372,31 @@ final class CaptureSessionManager {
         }
     }
 
+    private func disconnectPreviews() {
+        for layer in [preview, secondaryPreview].compactMap({ $0 }) {
+            if let connection = layer.connection { layer.session?.removeConnection(connection) }
+            layer.session = nil
+        }
+    }
+
     private func connectPreview() {
-        guard let preview else { return }
-        if let connection = preview.connection { preview.session?.removeConnection(connection) }
-        preview.setSessionWithNoConnection(activeSession)
-        let source = snapshot.dualEnabled ? dual.inputs.first : input
-        guard let port = source?.ports.first(where: { $0.mediaType == .video }) else { return }
-        let connection = AVCaptureConnection(inputPort: port, videoPreviewLayer: preview)
-        guard activeSession.canAddConnection(connection) else { return }
-        activeSession.addConnection(connection)
-        if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
-        if connection.isVideoMirroringSupported {
-            connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = source?.device.position == .front
+        disconnectPreviews()
+        let sources: [(AVCaptureVideoPreviewLayer?, AVCaptureDeviceInput?)] = [
+            (preview, snapshot.dualEnabled ? dual.inputs.first : input),
+            (secondaryPreview, snapshot.dualEnabled && dual.inputs.count > 1 ? dual.inputs[1] : nil)
+        ]
+        for (layer, source) in sources {
+            guard let layer, let source,
+                  let port = source.ports.first(where: { $0.mediaType == .video }) else { continue }
+            layer.setSessionWithNoConnection(activeSession)
+            let connection = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
+            guard activeSession.canAddConnection(connection) else { continue }
+            activeSession.addConnection(connection)
+            if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+            if connection.isVideoMirroringSupported {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = source.device.position == .front
+            }
         }
     }
 
@@ -382,8 +405,7 @@ final class CaptureSessionManager {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled else { return }
             self.disableEyeFocus()
             self.activeSession.stopRunning()
-            if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
-            self.preview?.session = nil
+            self.disconnectPreviews()
             do {
                 if enabled {
                     try self.dual.configure()
@@ -409,8 +431,7 @@ final class CaptureSessionManager {
                 self.snapshot.focusLocked = !enabled && !self.controls.automaticFocus
                 self.publish()
             } catch {
-                if let connection = self.preview?.connection { self.preview?.session?.removeConnection(connection) }
-                self.preview?.session = nil
+                self.disconnectPreviews()
                 self.dual.reset()
                 self.snapshot.dualEnabled = false
                 self.snapshot.selectedID = self.input?.device.uniqueID
@@ -425,11 +446,15 @@ final class CaptureSessionManager {
         }
     }
 
-    func focus(at point: CGPoint, locked: Bool) {
+    func focus(at point: CGPoint, locked: Bool, dualIndex: Int? = nil) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, !self.dual.busy else { return }
             self.disableEyeFocus()
-            let devices = self.snapshot.dualEnabled ? self.dual.inputs.map(\.device) : [self.input?.device].compactMap { $0 }
+            let devices: [AVCaptureDevice]
+            if self.snapshot.dualEnabled {
+                guard let index = dualIndex, self.dual.inputs.indices.contains(index) else { return }
+                devices = [self.dual.inputs[index].device]
+            } else { devices = [self.input?.device].compactMap { $0 } }
             do {
                 for device in devices {
                     try device.lockForConfiguration()
