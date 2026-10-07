@@ -3,6 +3,8 @@ import AVFoundation
 struct CapturedPhoto {
     let data: Data
     let dimensions: CMVideoDimensions
+    var companions: [CapturedPhoto] = []
+    var warning: String?
 }
 
 enum CameraFailure: LocalizedError {
