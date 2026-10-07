@@ -290,14 +290,14 @@ struct CameraView: View {
     }
 
     private func toolGrid(_ pages: [CameraToolPage]) -> some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
             ForEach(pages, id: \.self) { page in
                 Button { toolPath.append(page) } label: {
                     VStack(alignment: .leading, spacing: 8) {
                         Image(systemName: page.icon).font(.title2)
                         Text(page.rawValue).font(.headline)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 60, alignment: .leading).padding(12)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).padding(10)
                     .background(Color.gray.opacity(0.09), in: RoundedRectangle(cornerRadius: 18))
                 }.buttonStyle(.plain)
             }
@@ -309,7 +309,7 @@ struct CameraView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Label(title, systemImage: icon).font(.headline)
                 Text(detail).font(.caption)
-            }.frame(maxWidth: .infinity, minHeight: 52, alignment: .leading).padding(12)
+            }.frame(maxWidth: .infinity, minHeight: 40, alignment: .leading).padding(10)
                 .background(selection, in: RoundedRectangle(cornerRadius: 18))
         }.buttonStyle(.plain).disabled(!model.canConfigure || !model.camera.running)
     }
@@ -445,13 +445,13 @@ private struct CompactToolLayout<Content: View>: View {
     @ViewBuilder let content: () -> Content
     var body: some View {
         ViewThatFits(in: .vertical) {
-            VStack(alignment: .leading, spacing: 16, content: content)
+            VStack(alignment: .leading, spacing: 12, content: content)
                 .frame(maxWidth: .infinity, alignment: .leading).fixedSize(horizontal: false, vertical: true)
             ScrollView {
-                VStack(alignment: .leading, spacing: 16, content: content)
+                VStack(alignment: .leading, spacing: 12, content: content)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-        }.padding(18).frame(maxHeight: .infinity, alignment: .top)
+        }.padding(12).frame(maxHeight: .infinity, alignment: .top)
             .controlSize(.large)
     }
 }
