@@ -1,5 +1,6 @@
 import AVFoundation
-import SwiftUIimport UIKit
+import SwiftUI
+import UIKit
 import ImageIO
 import PhotosUI
 
@@ -385,7 +386,7 @@ final class CameraViewModel: ObservableObject {
             timerTask?.cancel(); timerTask = nil; countdown = 0; busy = false
         }
         permission = AVCaptureDevice.authorizationStatus(for: .video)
-        if active && permission == .authorized && burstPhotos.isEmpty && !editingPhoto { engine.start() } else { engine.stop() }
+        if active && permission == .authorized && !editingPhoto { engine.start() } else { engine.stop() }
     }
 
     func requestCamera() async {
@@ -436,7 +437,6 @@ final class CameraViewModel: ObservableObject {
                             self.busy = false
                             self.message = "Choose your favorite"
                             self.reviewingBurst = true
-                            self.engine.stop()
                         }
                     }
                 }
@@ -524,4 +524,4 @@ final class CameraViewModel: ObservableObject {
         message = "Unsaved capture discarded."
         if active { engine.start() }
     }
-}
+}
