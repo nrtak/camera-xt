@@ -9,7 +9,8 @@ struct CameraView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
     @State private var confirmDiscard = false
-    @State private var showsGrid = true
+    @AppStorage("camera.showsGrid") private var showsGrid = true
+    @State private var toolPath: [CameraToolPage] = []
     @State private var showsCaptureInfo = false
 
     private let ink = Color(red: 0.10, green: 0.14, blue: 0.22)
@@ -45,7 +46,10 @@ struct CameraView: View {
         .tint(ink)
         .preferredColorScheme(.light)
         .task { model.setActive(scenePhase == .active) }
-        .onChange(of: scenePhase) { model.setActive($0 == .active) }
+        .onChange(of: scenePhase) {
+            if $0 == .background { model.enteredBackground() }
+            model.setActive($0 == .active)
+        }
         .sheet(isPresented: $showsCaptureInfo) { captureInfo }
         .sheet(isPresented: $model.reviewingBurst) { BurstReview(model: model).interactiveDismissDisabled() }
         .confirmationDialog("Discard the unsaved capture?", isPresented: $confirmDiscard, titleVisibility: .visible) {
@@ -53,60 +57,70 @@ struct CameraView: View {
         }
     }
 
+    private func openTool(_ page: CameraToolPage? = nil) {
+        toolPath = page.map { [$0] } ?? []
+        showsCaptureInfo = true
+    }
+
     private var captureHUD: some View {
-        Button { showsCaptureInfo = true } label: {
-            VStack(spacing: 7) {
-                Label("Tools", systemImage: "slider.horizontal.3")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 12).padding(.vertical, 5)
-                    .background(.regularMaterial, in: Capsule())
-                HStack(spacing: 10) {
-                    Text(model.mode.rawValue.uppercased()).fontWeight(.semibold)
-                    Divider().frame(height: 16)
-                    Text(model.camera.dualEnabled ? "Main + Ultra Wide" : model.selectedLens?.name ?? "Camera")
-                    Divider().frame(height: 16)
-                    Text(model.mode == .photo ? model.camera.resolution : model.camera.videoLabel)
-                        .frame(maxWidth: .infinity)
-                }
-                .font(.caption)
-                .padding(.horizontal, 14).padding(.vertical, 13)
-                .background(.regularMaterial, in: Capsule())
-                Text([model.camera.exposureLabel, model.camera.focusLabel].filter { !$0.isEmpty }.joined(separator: " · "))
-                    .font(.caption2.monospacedDigit())
-                    .padding(.horizontal, 12).padding(.vertical, 5)
+        VStack(spacing: 8) {
+            Button { openTool(.details) } label: {
+                Text("\(model.mode.rawValue) | \(model.camera.dualEnabled ? "Dual Shot" : model.selectedLens?.name ?? "Camera")")
+                    .font(.subheadline.weight(.semibold)).padding(12)
                     .background(.regularMaterial, in: Capsule())
             }
-            .padding(.horizontal, 14).padding(.top, 6)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { activeIndicators }
+                VStack(spacing: 6) { activeIndicators }
+            }
+            if model.countdown > 0 {
+                Text("\(model.countdown)").font(.system(size: 64, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white).accessibilityLabel("Shutter in \(model.countdown) seconds")
+            }
+            if let message = model.message {
+                Text(message).font(.caption).multilineTextAlignment(.center)
+                    .padding(10).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            }
+            if model.hasPendingCapture && !model.busy {
+                HStack { saveRecovery }.font(.callout).padding(10)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Camera Tools and capture information")
-        .accessibilityValue("\(model.mode.rawValue), \(model.selectedLens?.name ?? "Camera"), \(model.mode == .photo ? model.camera.resolution : model.camera.videoLabel)")
-        .accessibilityHint("Opens camera features, controls, and current capture details")
-        .disabled(model.busy || model.hasPendingCapture)
+        .buttonStyle(.plain).padding(.horizontal, 14).padding(.top, 6)
+    }
+
+    @ViewBuilder private var activeIndicators: some View {
+        if model.captureStyle != "Auto" { indicator(model.captureStyle, page: .shoot) }
+        if model.timerSeconds > 0 { indicator("Timer \(model.timerSeconds)s", page: .timer) }
+        if model.camera.focusLocked { indicator("Focus locked", page: .focus) }
+        else if model.camera.eyeFocusEnabled { indicator("Eye focus", page: .focus) }
+        if model.camera.depthEnabled { indicator("Depth", page: .focus) }
+        if model.burstEnabled && model.captureStyle == "Auto" { indicator("3-shot burst", page: .shoot) }
+        if model.camera.dualEnabled { indicator("Dual Shot", page: .shoot) }
+        if !model.controls.automaticExposure && model.captureStyle == "Auto" { indicator("Manual exposure", page: .exposure) }
+        if model.camera.recording { Text("Recording").foregroundStyle(.red).padding(8).background(.regularMaterial, in: Capsule()) }
+    }
+
+    private func indicator(_ title: String, page: CameraToolPage) -> some View {
+        Button(title) { openTool(page) }.font(.caption.weight(.semibold))
+            .padding(10).background(selection, in: Capsule())
+            .disabled(!model.canConfigure)
     }
 
     private var lensSelector: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: 4) {
-                ForEach(model.camera.lenses.filter { !$0.isFront }) { lens in
-                    Button { model.select(lens) } label: {
-                        Text(lens.name)
-                            .font(.caption.weight(.semibold))
-                            .multilineTextAlignment(.center)
-                            .frame(width: 64).frame(minHeight: 44)
-                            .background(lens.id == model.camera.selectedID ? selection : .clear, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("\(lens.name) camera")
-                    .accessibilityAddTraits(lens.id == model.camera.selectedID ? .isSelected : [])
+        VStack(spacing: 4) {
+            ForEach(model.camera.lenses.filter { !$0.isFront && $0.name != "Depth" }) { lens in
+                Button { model.select(lens) } label: {
+                    Text(lens.name).font(.caption.weight(.semibold))
+                        .frame(width: 68, height: 44)
+                        .background(lens.id == model.camera.selectedID ? selection : .clear, in: Capsule())
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(lens.name) camera")
+                .accessibilityAddTraits(lens.id == model.camera.selectedID ? .isSelected : [])
             }
-            .padding(5)
         }
-        .frame(width: 74)
-        .frame(maxHeight: 170)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 37))
-        .disabled(!model.canSwitch)
+        .padding(5).background(.regularMaterial, in: Capsule()).disabled(!model.canSwitch)
     }
 
     private var compositionGrid: some View {
@@ -161,50 +175,23 @@ struct CameraView: View {
                     .accessibilityAddTraits(model.mode == mode ? .isSelected : [])
                 }
             }
-            .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.dualEnabled || model.camera.recording)
+            .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.recording)
 
-            if model.mode == .photo && model.camera.dualAvailable {
-                Toggle("Dual Shot · Main + Ultra Wide", isOn: Binding(get: { model.camera.dualEnabled }, set: model.setDualEnabled))
-                    .font(.caption).tint(.orange)
-                    .disabled(model.busy || model.configuring || model.hasPendingCapture)
-            }
-            if model.camera.focusLocked {
-                Button("AE/AF locked · Tap to reset") { model.focus(at: CGPoint(x: 0.5, y: 0.5), locked: false) }
-                    .font(.caption)
-            }
-            if model.mode == .photo && !model.camera.dualEnabled {
-                Toggle("3-shot burst · Best Shot review", isOn: $model.burstEnabled)
-                    .font(.caption).tint(.orange)
-                    .disabled(model.busy || model.configuring || model.hasPendingCapture)
-            }
-            if model.mode == .video {
-                Text(model.camera.recording ? "● Recording" : model.camera.videoLabel)
-                    .font(.caption).multilineTextAlignment(.center)
-            }
-            if model.countdown > 0 { Text("\(model.countdown)").font(.largeTitle.monospacedDigit()) }
-            if let message = model.message {
-                Text(message).font(.caption).multilineTextAlignment(.center)
-
-            }
-            if model.hasPendingCapture && !model.busy {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 16) { saveRecovery }
-                    VStack(spacing: 12) { saveRecovery }
-                }
-                .font(.callout)
-            }
             HStack {
-                Button { showsGrid.toggle() } label: {
-                    Image(systemName: "grid")
+                Button { openTool() } label: {
+                    VStack(spacing: 3) {
+                    Image(systemName: "slider.horizontal.3")
                         .font(.title3)
                         .frame(width: 48, height: 48)
-                        .background(showsGrid ? selection.opacity(0.7) : Color.white.opacity(0.45), in: Circle())
+                        .background(Color.white.opacity(0.45), in: Circle())
+                    Text("Tools").font(.caption2)
+                    }
                 }
-                .accessibilityLabel("Composition grid")
-                .accessibilityValue(showsGrid ? "On" : "Off")
+                .accessibilityLabel("Camera Tools")
+                .disabled(!model.canConfigure)
                 .frame(maxWidth: .infinity)
 
-                Button(action: model.shutter) {
+                Button { showsCaptureInfo = false; model.shutter() } label: {
                     ZStack {
                         Circle().fill(model.mode == .video ? Color.red : Color.white)
                         Circle().strokeBorder(ink.opacity(0.65), lineWidth: 2).padding(5)
@@ -219,10 +206,13 @@ struct CameraView: View {
                 .opacity(model.canShutter ? 1 : 0.4)
 
                 Button(action: model.flip) {
+                    VStack(spacing: 3) {
                     Image(systemName: "arrow.triangle.2.circlepath.camera")
                         .font(.title3)
                         .frame(width: 48, height: 48)
                         .background(.white.opacity(0.45), in: Circle())
+                    Text("Flip").font(.caption2)
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .accessibilityLabel("Switch front and rear camera")
@@ -245,105 +235,178 @@ struct CameraView: View {
     }
 
     private var captureInfo: some View {
-        NavigationStack {
-            Form {
-                Section("Camera Tools") {
-                    NavigationLink {
-                        PhotoRescueView()
-                            .onAppear { model.setPhotoEditorActive(true) }
-                            .onDisappear { model.setPhotoEditorActive(false) }
-                    } label: {
-                        Label("Photo Rescue", systemImage: "wand.and.stars")
-                    }
-                    .disabled(model.busy || model.configuring || model.camera.recording || model.hasPendingCapture)
-                    Button(action: model.nightPreset) {
-                        Label("Night · steady scene", systemImage: "moon.stars")
-                    }
-                    .disabled(model.mode != .photo || !model.camera.customExposureAvailable || model.camera.dualEnabled || model.busy || model.configuring || model.hasPendingCapture)
-                    Text("Night uses a 3-second timer and three separate 1/4-second exposures. Support the phone and review the originals. This experimental preset does not merge frames; moving subjects may blur.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Button(action: model.actionPreset) {
-                        Label("Action · 3-shot burst", systemImage: "figure.run")
-                    }
-                    .disabled(model.mode != .photo || !model.camera.customExposureAvailable || model.camera.dualEnabled || model.busy || model.configuring || model.hasPendingCapture)
-                    Toggle("Embed depth in photos", isOn: Binding(get: { model.camera.depthEnabled }, set: model.engine.setDepthEnabled))
-                        .disabled(!model.camera.depthAvailable || model.busy || model.configuring || model.hasPendingCapture)
-                    Text(model.camera.depthAvailable ? "Saves a depth map alongside the photo when the camera provides one. No artificial blur is applied." : "Select the Depth rear camera or Front Depth camera in Photo mode to capture depth where supported. Unavailable with Dual Shot or video.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Toggle("Eye-priority focus · experimental", isOn: Binding(get: { model.camera.eyeFocusEnabled }, set: model.setEyeFocus))
-                        .disabled(!model.camera.eyeFocusAvailable || model.busy || model.configuring || model.hasPendingCapture)
-                    Text("In rear Photo mode, focuses near an eye of the largest visible face. Tap focus, manual focus, or changing cameras turns it off. Processing pauses when the phone gets hot.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                Section("Current capture") {
-                    LabeledContent("Mode", value: model.mode.rawValue)
-                    LabeledContent("Lens", value: model.selectedLens?.name ?? "Unavailable")
-                    if model.mode == .photo {
-                        LabeledContent("Photo dimensions", value: model.camera.resolution)
-                    } else {
-                        LabeledContent("Video format", value: model.camera.videoLabel)
-                        LabeledContent("Stabilization", value: model.camera.stabilized ? "Auto" : "Off")
-                    }
-                }
-                Section("Capture settings") {
-                    if model.mode == .photo {
-                        Picker("Timer", selection: $model.timerSeconds) {
-                            Text("Off").tag(0); Text("3 seconds").tag(3); Text("10 seconds").tag(10)
-                        }
-                    } else {
-                        Picker("Resolution", selection: $model.videoWidth) {
-                            Text("1080p").tag(Int32(1920)); Text("4K").tag(Int32(3840))
-                        }
-                        Picker("Frame rate", selection: $model.videoFPS) {
-                            Text("24 fps").tag(Int32(24)); Text("30 fps").tag(Int32(30)); Text("60 fps").tag(Int32(60))
-                        }
-                        Toggle("Video stabilization", isOn: $model.stabilization)
-                        Button("Apply video settings", action: model.applyVideoSettings)
-                    }
-                }
-                .disabled(model.busy || model.configuring || model.camera.recording || model.hasPendingCapture)
-                ManualCameraControls(model: model)
-                    .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.dualEnabled || model.camera.recording)
-                Section("Focus and exposure") {
-                    Text("Tap the viewfinder to focus and meter. Hold to lock focus and exposure after adjustment.")
-                    HStack {
-                        Text("Exposure")
-                        Slider(value: $model.exposureBias, in: -2...2, step: 0.1)
-                            .accessibilityLabel("Exposure compensation")
-                        Text(String(format: "%+.1f EV", model.exposureBias)).monospacedDigit()
-                    }
-                    .disabled(model.busy || model.configuring)
-                    Button("Reset camera controls", action: model.resetControls)
-                }
-                if model.camera.dualAvailable {
-                    Section("Dual Shot") {
-                        Text("One shutter press saves separate main and ultra-wide photos. Both cameras stay active while enabled. Resolution and processing can differ from a single-camera photo; exposure timing can differ between lenses.")
-                    }
-                }
-                Section("Viewfinder") {
-                    Toggle("Composition grid", isOn: $showsGrid)
-                    Text("The viewfinder preserves the camera aspect ratio. Saved photos use the camera’s full capture dimensions.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                Section("Design") {
-                    NavigationLink("Design Preview") { CameraDesignGallery() }
-                    Text("Browse the original mockups. Preview screens do not change camera settings.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                Section("Storage") {
-                    Text("Photos are saved on this iPhone. No account or cloud processing is used.")
-                }
+        NavigationStack(path: $toolPath) {
+            CompactToolLayout {
+                toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .rescue, .advanced, .preferences])
+                Text("Choose a tool. Automatic settings handle the rest.")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
             .navigationTitle("Camera Tools")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: CameraToolPage.self) { toolPage($0) }
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showsCaptureInfo = false } } }
         }
-        .presentationDetents([.medium, .large])
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if toolPath.last != .rescue && toolPath.last != .gallery { captureControls }
+        }
+        .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+    }
+
+    private func toolGrid(_ pages: [CameraToolPage]) -> some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+            ForEach(pages, id: \.self) { page in
+                NavigationLink(value: page) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Image(systemName: page.icon).font(.title2)
+                        Text(page.rawValue).font(.headline)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 82, alignment: .leading).padding(12)
+                    .background(Color.gray.opacity(0.09), in: RoundedRectangle(cornerRadius: 18))
+                }.buttonStyle(.plain)
+            }
+        }
+    }
+
+    @ViewBuilder private func toolPage(_ page: CameraToolPage) -> some View {
+        Group {
+            switch page {
+            case .rescue:
+                PhotoRescueView()
+                    .onAppear { model.setPhotoEditorActive(true) }
+                    .onDisappear { model.setPhotoEditorActive(false) }
+            case .gallery: CameraDesignGallery()
+            case .advanced:
+                CompactToolLayout {
+                    toolGrid([.exposure, .color, .manualFocus, .details])
+                    Button("Reset to automatic", action: model.resetControls).buttonStyle(.bordered)
+                }
+            case .exposure, .color, .manualFocus:
+                CompactToolLayout {
+                    if model.camera.dualEnabled {
+                        Text("Manual controls use a single camera.")
+                        Button("Switch to single Photo") { model.activate(.automatic) }.buttonStyle(.borderedProminent)
+                    } else {
+                        ManualCameraControls(model: model, page: page)
+                    }
+                }
+            default:
+                CompactToolLayout { simpleToolPage(page) }
+            }
+        }
+        .navigationTitle(page.rawValue).navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func useTool(_ tool: QuickCaptureTool) {
+        model.activate(tool)
+        showsCaptureInfo = false
+    }
+
+    @ViewBuilder private func simpleToolPage(_ page: CameraToolPage) -> some View {
+        switch page {
+        case .shoot:
+            Text("Choose what you want to capture.").foregroundStyle(.secondary)
+            if model.camera.dualEnabled || model.mode == .video {
+                Text("Selecting a style switches to its compatible Photo setup.").font(.footnote)
+            }
+            featureButton("Automatic", icon: "camera", detail: "Everyday photos with automatic settings") { useTool(.automatic) }
+            featureButton("Action", icon: "figure.run", detail: "Fast shutter and 3 photos. Needs good light.") { useTool(.action) }
+            featureButton("Night", icon: "moon", detail: "Experimental. Hold still; timer and 3 slow exposures.") { useTool(.night) }
+            featureButton("Best Shot", icon: "square.stack", detail: "Take 3 photos, then choose your favorite") { useTool(.burst) }
+            if model.camera.dualAvailable {
+                featureButton("Dual Shot", icon: "camera.on.rectangle", detail: "Main and ultra-wide photos from one press") { useTool(.dual) }
+            }
+        case .focus:
+            Text("Tap to focus. Hold to lock. No setup needed.").foregroundStyle(.secondary)
+            Button("Reset focus and exposure") { model.focus(at: CGPoint(x: 0.5, y: 0.5), locked: false) }.buttonStyle(.bordered)
+            featureButton(model.camera.eyeFocusEnabled ? "Turn off eye focus" : "Eye focus", icon: "eye", detail: "Experimental. Follows an eye on the largest face in rear Photo mode.") {
+                if model.camera.eyeFocusEnabled { model.setEyeFocus(false) } else { useTool(.eye) }
+            }
+            if model.camera.lenses.contains(where: { $0.name == "Depth" || $0.name == "Front Depth" }) {
+                featureButton(model.camera.depthEnabled ? "Turn off depth" : "Depth capture", icon: "square.3.layers.3d", detail: "Switches to a depth-capable camera. Saves depth without adding blur.") {
+                    if model.camera.depthEnabled { model.engine.setDepthEnabled(false) } else { useTool(.depth) }
+                }
+            }
+        case .timer:
+            Text("Give yourself time to get in the photo.").foregroundStyle(.secondary)
+            Picker("Shutter delay", selection: $model.timerSeconds) {
+                Text("Off").tag(0); Text("3 sec").tag(3); Text("10 sec").tag(10)
+            }.pickerStyle(.segmented)
+            Text("The timer turns off after use or when you return from the background.").font(.footnote)
+            Button("Ready") { showsCaptureInfo = false }.buttonStyle(.borderedProminent)
+        case .video:
+            Picker("Resolution", selection: $model.videoWidth) { Text("1080p").tag(Int32(1920)); Text("4K").tag(Int32(3840)) }.pickerStyle(.segmented)
+            Picker("Frame rate", selection: $model.videoFPS) { Text("24 fps").tag(Int32(24)); Text("30 fps").tag(Int32(30)); Text("60 fps").tag(Int32(60)) }.pickerStyle(.segmented)
+            Toggle("Steadier video", isOn: $model.stabilization)
+            Text("The selected lens determines which formats are available.").font(.footnote)
+            Button("Apply video settings") { model.applyVideoSettings(); showsCaptureInfo = false }.buttonStyle(.borderedProminent)
+        case .preferences:
+            Toggle("Composition grid", isOn: $showsGrid)
+            Text("Grid and your chosen rear lens are remembered. Timers and exposure locks reset; photos stay on your iPhone.").font(.callout).foregroundStyle(.secondary)
+            NavigationLink("Design Preview", value: CameraToolPage.gallery).buttonStyle(.bordered)
+            Button("Reset capture settings") { model.activate(.automatic); showsCaptureInfo = false }.buttonStyle(.bordered)
+        case .details:
+            LabeledContent("Mode", value: model.mode.rawValue)
+            LabeledContent("Lens", value: model.selectedLens?.name ?? "Unavailable")
+            LabeledContent("Resolution", value: model.mode == .photo ? model.camera.resolution : model.camera.videoLabel)
+            LabeledContent("Exposure", value: model.camera.exposureLabel)
+            LabeledContent("Focus", value: model.camera.focusLabel)
+        default: EmptyView()
+        }
+    }
+
+    private func featureButton(_ title: String, icon: String, detail: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                Image(systemName: icon).font(.title2).frame(width: 30)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.headline)
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right").font(.caption)
+            }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.gray.opacity(0.09), in: RoundedRectangle(cornerRadius: 16))
+        }.buttonStyle(.plain).disabled(!model.canConfigure)
     }
 
     private func openSettings() {
         if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+    }
+}
+
+private enum CameraToolPage: String, Hashable {
+    case shoot = "Capture style", focus = "Focus & depth", timer = "Timer", video = "Video quality"
+    case rescue = "Photo Rescue", advanced = "Advanced", preferences = "Preferences"
+    case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Capture details", gallery = "Design Preview"
+    var icon: String {
+        switch self {
+        case .shoot: return "camera"
+        case .focus, .manualFocus: return "viewfinder"
+        case .timer: return "timer"
+        case .video: return "video"
+        case .rescue: return "wand.and.stars"
+        case .advanced: return "slider.horizontal.3"
+        case .preferences: return "gearshape"
+        case .exposure: return "sun.max"
+        case .color: return "paintpalette"
+        case .details: return "info.circle"
+        case .gallery: return "photo.on.rectangle"
+        }
+    }
+}
+
+/// Fits normally; preserves every control on small displays and at accessibility text sizes.
+private struct CompactToolLayout<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    var body: some View {
+        ViewThatFits(in: .vertical) {
+            VStack(alignment: .leading, spacing: 16, content: content)
+                .frame(maxWidth: .infinity, alignment: .leading).fixedSize(horizontal: false, vertical: true)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16, content: content)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }.padding(18).frame(maxHeight: .infinity, alignment: .top)
     }
 }
 
@@ -354,36 +417,34 @@ private struct PhotoRescueView: View {
     @State private var selection: PhotosPickerItem?
     @State private var showsOriginal = false
     var body: some View {
-        ScrollView {
-            VStack(spacing: 18) {
-                Text("Improve light, color, and noise on this iPhone. Preview the change before saving a separate copy.")
-                PhotosPicker(selection: $selection, matching: .images) {
-                    Label("Choose a photo", systemImage: "photo")
+        CompactToolLayout {
+            if let result = model.result {
+                Image(uiImage: showsOriginal ? result.before : result.after)
+                    .resizable().scaledToFit().frame(maxWidth: .infinity).frame(height: 240)
+                    .accessibilityLabel(showsOriginal ? "Original photo" : "Adjusted preview")
+                Toggle("Show original", isOn: $showsOriginal)
+                HStack {
+                    Text("Strength")
+                    Slider(value: $model.strength, in: 0...1, step: 0.1, onEditingChanged: { editing in
+                        if !editing { Task { await model.apply() } }
+                    }).accessibilityLabel("Adjustment strength").disabled(model.busy)
                 }
-                .buttonStyle(.borderedProminent).disabled(model.busy)
-                if let result = model.result {
-                    Image(uiImage: showsOriginal ? result.before : result.after)
-                        .resizable().scaledToFit().frame(maxHeight: 400)
-                        .accessibilityLabel(showsOriginal ? "Original photo" : "Adjusted preview")
-                    Toggle("Show original", isOn: $showsOriginal)
-                    HStack {
-                        Text("Strength")
-                        Slider(value: $model.strength, in: 0...1, step: 0.1)
-                            .accessibilityLabel("Adjustment strength")
-                    }
-                    .disabled(model.busy)
-                    Button("Apply strength") { Task { await model.apply() } }
-                        .disabled(model.busy)
-                    Button(model.saved ? "Copy saved" : "Save preview as a copy") { Task { await model.save() } }
-                        .buttonStyle(.borderedProminent).disabled(model.busy || model.saved)
-                    Text("\(result.photo.dimensions.width) × \(result.photo.dimensions.height) · JPEG")
-                        .font(.caption)
-                }
-                if model.busy { ProgressView() }
-                if let message = model.message { Text(message).font(.callout) }
-                Text("Exports a standard-color JPEG up to 12 MP without location metadata. Original RAW, HDR, Live Photo, and depth data stay in the original. This tool makes tonal adjustments; it cannot reconstruct missed focus or motion detail.")
+                Button(model.saved ? "Copy saved" : "Save a copy") { Task { await model.save() } }
+                    .buttonStyle(.borderedProminent).disabled(model.busy || model.saved)
+                    .frame(maxWidth: .infinity)
+                Text("Your original stays unchanged.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("Improve light, color, and noise on this iPhone.").font(.headline)
+            }
+            PhotosPicker(selection: $selection, matching: .images) {
+                Label(model.result == nil ? "Choose a photo" : "Choose another photo", systemImage: "photo")
+            }.buttonStyle(.bordered).disabled(model.busy)
+            if model.busy { ProgressView("Working on this iPhone") }
+            if let message = model.message { Text(message).font(.caption) }
+            DisclosureGroup("About these adjustments") {
+                Text("Saves a standard-color JPEG up to 12 MP without location metadata. RAW, HDR, Live Photo, and depth data remain in your original. Cannot recover missed focus or motion detail.")
                     .font(.footnote).foregroundStyle(.secondary)
-            }.padding()
+            }
         }
         .navigationTitle("Photo Rescue")
         .onChange(of: selection) { _, item in
@@ -396,58 +457,62 @@ private struct PhotoRescueView: View {
 
 private struct ManualCameraControls: View {
     @ObservedObject var model: CameraViewModel
+    let page: CameraToolPage
     private let shutters = [8000, 4000, 2000, 1000, 500, 250, 125, 60, 30, 15, 8, 4, 2, 1]
     var body: some View {
-        Section("Manual controls") {
-            Toggle("Automatic exposure", isOn: $model.controls.automaticExposure)
-                .disabled(!model.camera.customExposureAvailable)
-            if !model.controls.automaticExposure {
-                LabeledContent("ISO", value: "\(Int(model.controls.iso))")
-                Slider(value: $model.controls.iso, in: model.camera.minISO...max(model.camera.minISO + 1, model.camera.maxISO), step: 1)
-                    .accessibilityLabel("ISO")
-                Picker("Shutter", selection: $model.controls.shutterSeconds) {
-                    ForEach(shutters, id: \.self) { denominator in
-                        Text(denominator == 1 ? "1 second" : "1/\(denominator) s").tag(1.0 / Double(denominator))
+        VStack(alignment: .leading, spacing: 18) {
+            if page == .exposure {
+                Toggle("Automatic exposure", isOn: $model.controls.automaticExposure)
+                    .disabled(!model.camera.customExposureAvailable)
+                if !model.controls.automaticExposure && model.camera.customExposureAvailable {
+                    LabeledContent("ISO", value: "\(Int(model.controls.iso))")
+                    Slider(value: $model.controls.iso, in: model.camera.minISO...max(model.camera.minISO + 1, model.camera.maxISO), step: 1).accessibilityLabel("ISO")
+                    Picker("Shutter", selection: $model.controls.shutterSeconds) {
+                        ForEach(shutters, id: \.self) { denominator in
+                            Text(denominator == 1 ? "1 second" : "1/\(denominator) s").tag(1.0 / Double(denominator))
+                        }
                     }
                 }
-                Text("The live HUD shows the actual exposure. Each lens and video frame rate limits the available shutter duration.")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
-            Toggle("Automatic white balance", isOn: $model.controls.automaticWhiteBalance)
-                .disabled(!model.camera.whiteBalanceAvailable)
-            if !model.controls.automaticWhiteBalance {
-                LabeledContent("Temperature", value: "\(Int(model.controls.temperature)) K")
-                Slider(value: $model.controls.temperature, in: 2500...10000, step: 100)
-                    .accessibilityLabel("White balance temperature")
-                LabeledContent("Tint", value: "\(Int(model.controls.tint))")
-                Slider(value: $model.controls.tint, in: -100...100, step: 1).accessibilityLabel("White balance tint")
-            }
-            Toggle("Automatic focus", isOn: $model.controls.automaticFocus)
-                .disabled(!model.camera.manualFocusAvailable)
-            if model.controls.automaticFocus {
-                Toggle("Prefer faces", isOn: $model.controls.facePriority)
+                LabeledContent("Actual exposure", value: model.camera.exposureLabel)
+                Text("Available shutter speeds depend on your lens and video frame rate.").font(.footnote)
+                if model.controls.automaticExposure {
+                    HStack {
+                        Text("Brightness")
+                        Slider(value: $model.exposureBias, in: -2...2, step: 0.1).accessibilityLabel("Exposure compensation")
+                    }
+                }
+                if model.mode == .photo && model.camera.flashAvailable {
+                    Picker("Flash", selection: $model.controls.flash) {
+                        Text("Off").tag(AVCaptureDevice.FlashMode.off); Text("Auto").tag(AVCaptureDevice.FlashMode.auto); Text("On").tag(AVCaptureDevice.FlashMode.on)
+                    }.pickerStyle(.segmented)
+                }
+            } else if page == .color {
+                Toggle("Automatic color", isOn: $model.controls.automaticWhiteBalance)
+                    .disabled(!model.camera.whiteBalanceAvailable)
+                if !model.controls.automaticWhiteBalance && model.camera.whiteBalanceAvailable {
+                    LabeledContent("Temperature", value: "\(Int(model.controls.temperature)) K")
+                    Slider(value: $model.controls.temperature, in: 2500...10000, step: 100).accessibilityLabel("White balance temperature")
+                    LabeledContent("Tint", value: "\(Int(model.controls.tint))")
+                    Slider(value: $model.controls.tint, in: -100...100, step: 1).accessibilityLabel("White balance tint")
+                }
+                Text("Automatic color adjusts to the light around you.").font(.footnote)
             } else {
-                HStack {
-                    Text("Near")
-                    Slider(value: $model.controls.lensPosition, in: 0...1).accessibilityLabel("Focus distance")
-                    Text("Far")
+                Toggle("Automatic focus", isOn: $model.controls.automaticFocus)
+                    .disabled(!model.camera.manualFocusAvailable)
+                if model.controls.automaticFocus {
+                    Toggle("Prefer faces", isOn: $model.controls.facePriority)
+                } else if model.camera.manualFocusAvailable {
+                    HStack {
+                        Text("Near")
+                        Slider(value: $model.controls.lensPosition, in: 0...1).accessibilityLabel("Focus distance")
+                        Text("Far")
+                    }
                 }
+                Text("For quick control, tap the viewfinder to focus or hold to lock.").font(.footnote)
             }
-            if model.mode == .photo && model.camera.flashAvailable {
-                Picker("Flash", selection: $model.controls.flash) {
-                    Text("Off").tag(AVCaptureDevice.FlashMode.off)
-                    Text("Auto").tag(AVCaptureDevice.FlashMode.auto)
-                    Text("On").tag(AVCaptureDevice.FlashMode.on)
-                }
-            }
-            Button("Apply manual controls", action: model.applyControls)
-            Button("Reset to automatic", action: model.resetControls)
-            if model.mode == .photo && model.camera.customExposureAvailable {
-                Button("Action preset · 1/500 s burst", action: model.actionPreset)
-                Text("Freezes faster motion with a short shutter and three separate frames. Needs adequate light; ISO is estimated once from the current exposure.")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
-        }
+            Button("Apply") { model.applyControls() }.buttonStyle(.borderedProminent)
+            Button("Reset to automatic", action: model.resetControls).buttonStyle(.bordered)
+        }.disabled(!model.canConfigure)
     }
 }
 
@@ -626,4 +691,4 @@ private struct CameraDesignDetail: View {
         .navigationTitle(CameraDesignScreen.all[selection].title)
         .navigationBarTitleDisplayMode(.inline)
     }
-}
+}

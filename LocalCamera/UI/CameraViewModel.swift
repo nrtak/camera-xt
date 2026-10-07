@@ -52,6 +52,7 @@ final class PhotoRescueModel: ObservableObject {
 }
 
 enum CaptureMode: String, CaseIterable { case photo = "Photo", video = "Video" }
+enum QuickCaptureTool: Equatable { case action, night, dual, depth, eye, burst, automatic }
 
 @MainActor
 final class CameraViewModel: ObservableObject {
@@ -78,10 +79,16 @@ final class CameraViewModel: ObservableObject {
     @Published var selectedBurstIndex = 0
     @Published private(set) var recommendedBurstIndex = 0
     var hasPendingCapture: Bool { pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
-    var canShutter: Bool { camera.recording || (camera.running && !busy && !configuring && !hasPendingCapture) }
+    var canShutter: Bool { camera.recording || (camera.running && !busy && !configuring && !hasPendingCapture && !resetOnReturn) }
 
     func selectMode(_ selected: CaptureMode) {
-        guard !busy, !configuring, !hasPendingCapture, !camera.recording, !camera.dualEnabled else { return }
+        guard !busy, !configuring, !hasPendingCapture, !camera.recording else { return }
+        if camera.dualEnabled {
+            modeAfterDual = selected
+            setDualEnabled(false)
+            return
+        }
+        if selected != mode { resetTemporarySettings() }
         configuring = true
         engine.setVideoMode(selected == .video, width: videoWidth, fps: videoFPS, stabilized: stabilization)
     }
@@ -109,6 +116,7 @@ final class CameraViewModel: ObservableObject {
             guard canCapture else { return }
             busy = true
             countdown = timerSeconds
+            timerSeconds = 0
             timerTask = Task { [weak self] in
                 guard let self else { return }
                 while self.countdown > 0 {
@@ -129,6 +137,11 @@ final class CameraViewModel: ObservableObject {
     private var editingPhoto = false
     private var requestingPermission = false
     private var lastRearLensID: String?
+    private var restoredLens = false
+    private var resetOnReturn = false
+    private var pendingTool: QuickCaptureTool?
+    private var modeAfterDual: CaptureMode?
+    @Published private(set) var captureStyle = "Auto"
     @Published private(set) var configuring = false
     @Published var exposureBias: Float = 0 {
         didSet { engine.setExposureBias(exposureBias) }
@@ -150,9 +163,11 @@ final class CameraViewModel: ObservableObject {
 
     func applyControls() {
         guard !busy, !configuring, !hasPendingCapture, !camera.dualEnabled else { return }
+        captureStyle = "Auto"
         engine.setControls(controls)
     }
     func resetControls() {
+        captureStyle = "Auto"
         engine.setEyeFocus(false)
         controls = CameraControls()
         exposureBias = 0
@@ -167,7 +182,9 @@ final class CameraViewModel: ObservableObject {
         controls.facePriority = true
         controls.flash = .off
         burstEnabled = true
+        timerSeconds = 0
         applyControls()
+        captureStyle = "Action"
         message = "Action preset · 1/500 s · 3-shot burst"
     }
 
@@ -183,8 +200,74 @@ final class CameraViewModel: ObservableObject {
         timerSeconds = 3
         burstEnabled = true
         applyControls()
+        captureStyle = "Night"
         message = "Night preset · Hold still · 1/4 s · Review 3 originals"
     }
+
+    var canConfigure: Bool { !busy && !configuring && !hasPendingCapture && !camera.recording }
+
+    func activate(_ tool: QuickCaptureTool) {
+        guard canConfigure else { return }
+        pendingTool = tool
+        continueTool()
+    }
+
+    private func continueTool() {
+        guard let tool = pendingTool, !configuring else { return }
+        if camera.videoMode {
+            configuring = true
+            engine.setVideoMode(false)
+            return
+        }
+        if camera.dualEnabled {
+            configuring = true
+            engine.setDualEnabled(false)
+            return
+        }
+        var requiredLens: CameraLens?
+        if tool == .depth && !camera.depthAvailable {
+            requiredLens = camera.lenses.first { $0.name == "Depth" } ?? camera.lenses.first { $0.name == "Front Depth" }
+        } else if (tool == .action || tool == .night) && !camera.customExposureAvailable || tool == .eye && !camera.eyeFocusAvailable {
+            requiredLens = camera.lenses.first { !$0.isFront && $0.name == "Wide" }
+        }
+        if let lens = requiredLens, lens.id != camera.selectedID {
+            configuring = true
+            engine.select(lens.id)
+            return
+        }
+        pendingTool = nil
+        if tool != .eye && tool != .depth { resetTemporarySettings() }
+        else if tool == .depth && captureStyle != "Auto" { resetTemporarySettings() }
+        switch tool {
+        case .action:
+            if camera.customExposureAvailable { actionPreset() }
+            else { message = "Action needs a camera with manual exposure support." }
+        case .night:
+            if camera.customExposureAvailable { nightPreset() }
+            else { message = "Night needs a camera with manual exposure support." }
+        case .dual:
+            if camera.dualAvailable { setDualEnabled(true) }
+            else { message = "Dual Shot is unavailable on this device." }
+        case .depth:
+            if camera.depthAvailable { engine.setDepthEnabled(true); message = "Depth capture ready" }
+            else { message = "Depth is unavailable with this camera format." }
+        case .eye:
+            if camera.eyeFocusAvailable { setEyeFocus(true); message = "Eye focus ready" }
+            else { message = "Eye focus is unavailable with this camera." }
+        case .burst: burstEnabled = true; message = "Three photos, then choose your favorite."
+        case .automatic: message = "Ready to aim and shoot"
+        }
+    }
+
+    func resetTemporarySettings() {
+        timerSeconds = 0
+        burstEnabled = false
+        captureStyle = "Auto"
+        resetControls()
+        engine.setDepthEnabled(false)
+    }
+
+    func enteredBackground() { resetOnReturn = true }
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         self.saver = saver
@@ -194,6 +277,10 @@ final class CameraViewModel: ObservableObject {
                 self?.camera.focusLabel = meter.focusLabel
                 self?.camera.currentISO = meter.currentISO
                 self?.camera.currentShutter = meter.currentShutter
+                if let self, self.resetOnReturn, self.active, self.canConfigure {
+                    self.resetOnReturn = false
+                    self.resetTemporarySettings()
+                }
             }
         }
         engine.onMovie = { [weak self] result in
@@ -212,6 +299,30 @@ final class CameraViewModel: ObservableObject {
                 self?.camera = snapshot
                 self?.configuring = false
                 self?.mode = snapshot.videoMode ? .video : .photo
+                if let self {
+                    if let failure = snapshot.message, self.modeAfterDual != nil {
+                        self.modeAfterDual = nil
+                        self.message = failure
+                    }
+                    if let selected = self.modeAfterDual, !snapshot.dualEnabled {
+                        self.modeAfterDual = nil
+                        self.selectMode(selected)
+                        return
+                    }
+                    if !self.restoredLens && !snapshot.lenses.isEmpty {
+                        self.restoredLens = true
+                        if let id = UserDefaults.standard.string(forKey: "camera.preferredRearLens"),
+                           snapshot.lenses.contains(where: { $0.id == id && !$0.isFront }), id != snapshot.selectedID {
+                            self.configuring = true
+                            self.engine.select(id)
+                            return
+                        }
+                    }
+                    if let failure = snapshot.message, self.pendingTool != nil {
+                        self.pendingTool = nil
+                        self.message = failure
+                    } else { self.continueTool() }
+                }
                 if snapshot.recording && self?.recordingRequested == true {
                     self?.busy = false
                     self?.recordingRequested = false
@@ -241,6 +352,10 @@ final class CameraViewModel: ObservableObject {
 
     func setActive(_ value: Bool) {
         active = value
+        if value && resetOnReturn && canConfigure {
+            resetOnReturn = false
+            resetTemporarySettings()
+        }
         if !value && countdown > 0 {
             timerTask?.cancel(); timerTask = nil; countdown = 0; busy = false
         }
@@ -259,6 +374,10 @@ final class CameraViewModel: ObservableObject {
 
     func select(_ lens: CameraLens) {
         guard canSwitch else { return }
+        if !lens.isFront {
+            lastRearLensID = lens.id
+            UserDefaults.standard.set(lens.id, forKey: "camera.preferredRearLens")
+        }
         engine.select(lens.id)
     }
 
