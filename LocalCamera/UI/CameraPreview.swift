@@ -8,6 +8,7 @@ struct CameraPreview: UIViewRepresentable {
     var fillView = false
     var allowsFocus = true
     var secondary = false
+    var showsFocusFeedback = true
 
     final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
@@ -15,6 +16,7 @@ struct CameraPreview: UIViewRepresentable {
     }
     final class Coordinator: NSObject {
         let engine: CaptureSessionManager
+        var showsFocusFeedback = true
         var onFocus: (CGPoint, Bool) -> Void
         init(engine: CaptureSessionManager, onFocus: @escaping (CGPoint, Bool) -> Void) { self.engine = engine; self.onFocus = onFocus }
         @objc func tap(_ gesture: UITapGestureRecognizer) { focus(gesture, locked: false) }
@@ -26,6 +28,7 @@ struct CameraPreview: UIViewRepresentable {
             let point = gesture.location(in: view)
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
             guard (0...1).contains(devicePoint.x), (0...1).contains(devicePoint.y) else { return }
+            guard showsFocusFeedback else { return }
             onFocus(devicePoint, locked)
             let marker = UIView(frame: CGRect(x: point.x - 28, y: point.y - 28, width: 56, height: 56))
             marker.isUserInteractionEnabled = false
@@ -50,5 +53,8 @@ struct CameraPreview: UIViewRepresentable {
         engine.attachPreview(view.previewLayer, secondary: secondary)
         return view
     }
-    func updateUIView(_ view: PreviewView, context: Context) { context.coordinator.onFocus = onFocus }
+    func updateUIView(_ view: PreviewView, context: Context) {
+        context.coordinator.onFocus = onFocus
+        context.coordinator.showsFocusFeedback = showsFocusFeedback
+    }
 }
