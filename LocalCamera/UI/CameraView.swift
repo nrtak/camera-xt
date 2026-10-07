@@ -67,7 +67,7 @@ struct CameraView: View {
             Button { openTool(.details) } label: {
                 Text("\(model.mode.rawValue) | \(model.camera.dualEnabled ? "Dual Shot" : model.selectedLens?.name ?? "Camera")")
                     .font(.subheadline.weight(.semibold)).padding(12)
-                    .background(.regularMaterial, in: Capsule())
+                    .background(Color.white.opacity(0.96), in: Capsule())
             }
             .disabled(!model.canConfigure)
             ViewThatFits(in: .horizontal) {
@@ -80,14 +80,14 @@ struct CameraView: View {
             }
             if let message = model.message {
                 Text(message).font(.caption).multilineTextAlignment(.center)
-                    .padding(10).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .padding(10).background(Color.white.opacity(0.96), in: RoundedRectangle(cornerRadius: 12))
             }
             if model.hasPendingCapture && !model.busy {
                 ViewThatFits(in: .horizontal) {
                     HStack { saveRecovery }
                     VStack { saveRecovery }
                 }.font(.callout).padding(10)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .background(Color.white.opacity(0.96), in: RoundedRectangle(cornerRadius: 12))
             }
         }
         .buttonStyle(.plain).padding(.horizontal, 14).padding(.top, 6)
@@ -104,7 +104,7 @@ struct CameraView: View {
         if !model.controls.automaticExposure && model.captureStyle == "Auto" { indicator("Manual exposure", page: .exposure) }
         if abs(model.exposureBias) > 0.05 { indicator(String(format: "%+.1f EV", model.exposureBias), page: .exposure) }
         if !model.controls.automaticWhiteBalance { indicator("Manual color", page: .color) }
-        if model.camera.recording { Text("Recording").foregroundStyle(.red).padding(8).background(.regularMaterial, in: Capsule()) }
+        if model.camera.recording { Text("Recording").foregroundStyle(.red).padding(8).background(Color.white.opacity(0.96), in: Capsule()) }
     }
 
     private func indicator(_ title: String, page: CameraToolPage) -> some View {
@@ -126,7 +126,7 @@ struct CameraView: View {
                 .accessibilityAddTraits(lens.id == model.camera.selectedID ? .isSelected : [])
             }
         }
-        .padding(5).background(.regularMaterial, in: Capsule()).disabled(!model.canSwitch)
+        .padding(5).background(Color.white.opacity(0.96), in: Capsule()).disabled(!model.canSwitch)
     }
 
     private var compositionGrid: some View {
@@ -230,7 +230,7 @@ struct CameraView: View {
         .frame(maxWidth: .infinity)
         .background {
             UnevenRoundedRectangle(topLeadingRadius: 28, topTrailingRadius: 28)
-                .fill(.regularMaterial).ignoresSafeArea(edges: .bottom)
+                .fill(Color.white).ignoresSafeArea(edges: .bottom)
         }
     }
 
@@ -244,8 +244,12 @@ struct CameraView: View {
         NavigationStack(path: $toolPath) {
             CompactToolLayout {
                 toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .rescue, .advanced, .preferences])
-                Text("Choose a tool. Automatic settings handle the rest.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    quickPreset("Action", icon: "figure.run", detail: "Fast movement", tool: .action)
+                    quickPreset("Night", icon: "moon", detail: "Hold still · Experimental", tool: .night)
+                }
+                Button("Back to automatic") { useTool(.automatic) }
+                    .frame(maxWidth: .infinity, minHeight: 44)
             }
             .navigationTitle("Camera Tools")
             .navigationDestination(for: CameraToolPage.self) { toolPage($0) }
@@ -266,11 +270,21 @@ struct CameraView: View {
                         Image(systemName: page.icon).font(.title2)
                         Text(page.rawValue).font(.headline)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 82, alignment: .leading).padding(12)
+                    .frame(maxWidth: .infinity, minHeight: 60, alignment: .leading).padding(12)
                     .background(Color.gray.opacity(0.09), in: RoundedRectangle(cornerRadius: 18))
                 }.buttonStyle(.plain)
             }
         }
+    }
+
+    private func quickPreset(_ title: String, icon: String, detail: String, tool: QuickCaptureTool) -> some View {
+        Button { useTool(tool) } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                Label(title, systemImage: icon).font(.headline)
+                Text(detail).font(.caption)
+            }.frame(maxWidth: .infinity, minHeight: 52, alignment: .leading).padding(12)
+                .background(selection, in: RoundedRectangle(cornerRadius: 18))
+        }.buttonStyle(.plain).disabled(!model.canConfigure || !model.camera.running)
     }
 
     @ViewBuilder private func toolPage(_ page: CameraToolPage) -> some View {
@@ -287,12 +301,20 @@ struct CameraView: View {
                     Button("Reset to automatic", action: model.resetControls).buttonStyle(.bordered)
                 }
             case .exposure, .color, .manualFocus:
-                CompactToolLayout {
+                VStack(spacing: 0) {
+                    if !model.camera.dualEnabled {
+                        CameraPreview(engine: model.engine, onFocus: model.focus, fillView: true, allowsFocus: false)
+                            .frame(height: 190).background(.black)
+                            .clipShape(RoundedRectangle(cornerRadius: 16)).padding(.horizontal, 18)
+                            .accessibilityLabel("Live adjustment preview")
+                    }
+                    CompactToolLayout {
                     if model.camera.dualEnabled {
                         Text("Manual controls use a single camera.")
                         Button("Switch to single Photo") { model.activate(.automatic) }.buttonStyle(.borderedProminent)
                     } else {
                         ManualCameraControls(model: model, page: page)
+                    }
                     }
                 }
             default:
@@ -413,6 +435,7 @@ private struct CompactToolLayout<Content: View>: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }.padding(18).frame(maxHeight: .infinity, alignment: .top)
+            .controlSize(.large)
     }
 }
 
@@ -514,11 +537,12 @@ private struct ManualCameraControls: View {
                         Text("Far")
                     }
                 }
-                Text("For quick control, tap the viewfinder to focus or hold to lock.").font(.footnote)
+                Text("Automatic focus follows your scene. For manual control, use the Near–Far slider and watch the preview.").font(.footnote)
             }
-            Button("Apply") { model.applyControls() }.buttonStyle(.borderedProminent)
+            Text("Changes appear in the preview.").font(.caption).foregroundStyle(.secondary)
             Button("Reset to automatic", action: model.resetControls).buttonStyle(.bordered)
         }.disabled(!model.canConfigure)
+            .onChange(of: model.controls) { _, _ in model.scheduleControls() }
     }
 }
 

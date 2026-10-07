@@ -60,7 +60,17 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var permission = AVCaptureDevice.authorizationStatus(for: .video)
     @Published private(set) var busy = false
     @Published private(set) var pendingPhoto: CapturedPhoto?
-    @Published var message: String?
+    private var messageTask: Task<Void, Never>?
+    @Published var message: String? {
+        didSet {
+            messageTask?.cancel()
+            guard let message, message.hasPrefix("Saved") || message == "Video saved" else { return }
+            messageTask = Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 2_500_000_000) } catch { return }
+                self?.message = nil
+            }
+        }
+    }
     @Published private(set) var mode: CaptureMode = .photo
     @Published private(set) var pendingVideo: URL?
     @Published var videoWidth: Int32 = 1920
@@ -69,6 +79,7 @@ final class CameraViewModel: ObservableObject {
     @Published var timerSeconds = 0
     @Published private(set) var countdown = 0
     private var timerTask: Task<Void, Never>?
+    private var controlsTask: Task<Void, Never>?
     private var recordingRequested = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     @Published var controls = CameraControls()
@@ -94,6 +105,11 @@ final class CameraViewModel: ObservableObject {
     }
     func applyVideoSettings() { selectMode(.video) }
     func shutter() {
+        if controlsTask != nil {
+            controlsTask?.cancel()
+            controlsTask = nil
+            applyControls()
+        }
         if camera.recording {
             busy = true
             engine.stopRecording()
@@ -166,6 +182,15 @@ final class CameraViewModel: ObservableObject {
         captureStyle = "Auto"
         engine.setControls(controls)
     }
+
+    func scheduleControls() {
+        controlsTask?.cancel()
+        controlsTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 120_000_000) } catch { return }
+            self?.applyControls()
+            self?.controlsTask = nil
+        }
+    }
     func resetControls() {
         captureStyle = "Auto"
         engine.setEyeFocus(false)
@@ -185,7 +210,7 @@ final class CameraViewModel: ObservableObject {
         timerSeconds = 0
         applyControls()
         captureStyle = "Action"
-        message = "Action preset · 1/500 s · 3-shot burst"
+        message = "Action ready"
     }
 
     func nightPreset() {
@@ -201,7 +226,7 @@ final class CameraViewModel: ObservableObject {
         burstEnabled = true
         applyControls()
         captureStyle = "Night"
-        message = "Night preset · Hold still · 1/4 s · Review 3 originals"
+        message = "Hold still"
     }
 
     var canConfigure: Bool { !busy && !configuring && !hasPendingCapture && !camera.recording }
@@ -409,7 +434,7 @@ final class CameraViewModel: ObservableObject {
                             self.selectedBurstIndex = index
                             self.recommendedBurstIndex = index
                             self.busy = false
-                            self.message = "Choose the frame you want to keep."
+                            self.message = "Choose your favorite"
                             self.reviewingBurst = true
                             self.engine.stop()
                         }
@@ -484,7 +509,7 @@ final class CameraViewModel: ObservableObject {
         do {
             try await saver.save(photo)
             pendingPhoto = nil
-            message = photo.warning ?? (photo.companions.isEmpty ? "Saved · \(photo.dimensions.width) × \(photo.dimensions.height)" : "Saved 2 photos · Main + Ultra Wide")
+            message = photo.warning ?? (photo.companions.isEmpty ? "Saved" : "Saved 2 photos")
         } catch { message = error.localizedDescription }
     }
 
