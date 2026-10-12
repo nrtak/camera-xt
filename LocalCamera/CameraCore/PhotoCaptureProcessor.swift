@@ -83,7 +83,7 @@ enum PhotoRanker {
     private static let queue = DispatchQueue(label: "CameraXT.photoRanking", qos: .userInitiated)
     static func recommend(_ photos: [CapturedPhoto], completion: @escaping (Int) -> Void) {
         queue.async {
-            if ProcessInfo.processInfo.thermalState == .serious || ProcessInfo.processInfo.thermalState == .critical { completion(0); return }
+            if ProcessInfo.processInfo.thermalState == .serious || ProcessInfo.processInfo.thermalState == .critical { completion(-1); return }
             let context = CIContext(options: [.cacheIntermediates: false])
             var bestIndex = 0
             var bestScore = -Double.infinity
