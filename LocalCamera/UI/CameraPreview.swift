@@ -50,6 +50,8 @@ struct CameraPreview: UIViewRepresentable {
         private func focus(_ gesture: UIGestureRecognizer, locked: Bool) {
             guard let view = gesture.view as? PreviewView else { return }
             let point = gesture.location(in: view)
+            let videoRect = view.previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            guard videoRect.contains(point) else { return }
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
             guard (0...1).contains(devicePoint.x), (0...1).contains(devicePoint.y) else { return }
             guard showsFocusFeedback else { return }
@@ -78,8 +80,10 @@ struct CameraPreview: UIViewRepresentable {
         let view = PreviewView()
         view.previewLayer.videoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if allowsFocus {
-            view.addGestureRecognizer(UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:))))
-            view.addGestureRecognizer(UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.hold(_:))))
+            let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:)))
+            let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.hold(_:)))
+            tap.require(toFail: hold)
+            view.addGestureRecognizer(tap); view.addGestureRecognizer(hold)
         }
         engine.attachPreview(view.previewLayer, secondary: secondary)
         return view
