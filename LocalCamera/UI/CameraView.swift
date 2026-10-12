@@ -767,7 +767,7 @@ private struct BurstReview: View {
                         .accessibilityLabel("Frame \(index + 1)\(index == model.recommendedBurstIndex ? ", suggested" : "")")
                     }
                 }
-                Text("The suggestion uses face quality and image detail on this iPhone. Compare the frames and choose your favorite.")
+                Text(model.recommendedBurstIndex < 0 ? "Automatic ranking paused while your iPhone cools. Compare the frames and choose your favorite." : "The suggestion uses face quality and image detail on this iPhone. Compare the frames and choose your favorite.")
                     .font(.footnote).foregroundStyle(.secondary)
                 HStack {
                     Button("Save selected") { Task { await model.saveBurst(all: false) } }
