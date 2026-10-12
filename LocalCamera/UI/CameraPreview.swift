@@ -22,12 +22,15 @@ struct CameraPreview: UIViewRepresentable {
         private var gridFrame = CGRect.null
         override func layoutSubviews() {
             super.layoutSubviews()
+            updateOverlays()
+        }
+        func updateOverlays() {
             if grid.superlayer == nil { layer.addSublayer(grid) }
             if guide.superview == nil { guide.isUserInteractionEnabled = false; guide.contentMode = .scaleAspectFit; addSubview(guide) }
             let frame = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-            guide.frame = frame
-            guard gridFrame != frame else { return }
+            guard !frame.isEmpty, !frame.isInfinite, !frame.isNull, gridFrame != frame else { return }
             gridFrame = frame
+            guide.frame = frame
             let path = UIBezierPath()
             for fraction in [CGFloat(1.0 / 3), CGFloat(2.0 / 3)] {
                 let x = frame.minX + frame.width * fraction, y = frame.minY + frame.height * fraction
@@ -98,5 +101,6 @@ struct CameraPreview: UIViewRepresentable {
         else if focusState == "Auto focus", context.coordinator.marker?.text == "Focus locked" { context.coordinator.marker?.removeFromSuperview() }
         if view.guide.image !== guideImage { view.guide.image = guideImage }
         view.grid.isHidden = !showsGrid
+        view.updateOverlays()
     }
 }
