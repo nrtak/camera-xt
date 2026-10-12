@@ -328,6 +328,7 @@ final class CameraViewModel: ObservableObject {
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         self.saver = saver
+        engine.onWarning = { [weak self] warning in Task { @MainActor [weak self] in self?.message = warning } }
         engine.onAnalysis = { [weak self] image, bins in
             Task { @MainActor [weak self] in self?.guideImage = image; self?.histogram = bins }
         }
@@ -499,10 +500,10 @@ final class CameraViewModel: ObservableObject {
                             guard let self else { return }
                             self.burstPhotos = photos
                             self.burstPreviews = photos.map { Self.preview($0.data) }
-                            self.selectedBurstIndex = index
+                            self.selectedBurstIndex = max(0, index)
                             self.recommendedBurstIndex = index
                             self.busy = false
-                            self.message = "Choose your favorite"
+                            self.message = self.recoveryProtected ? "Choose your favorite" : "Keep Camera XT open: these frames could not be protected on disk. Free storage, then save."
                             self.reviewingBurst = true
                         }
                         }
@@ -615,7 +616,7 @@ final class CameraViewModel: ObservableObject {
                 if record.saved { try await store.discard() }
                 else {
                     pendingPhoto = record.captured
-                    if record.isVideo { pendingVideo = await store.videoURL() }
+                    if record.isVideo { pendingVideo = try await store.videoURL() }
                     recoveryProtected = true
                     message = "Recovered an unfinished save. Check Photos before retrying to avoid a duplicate."
                 }
