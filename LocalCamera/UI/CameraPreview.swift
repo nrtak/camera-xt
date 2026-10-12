@@ -28,7 +28,7 @@ struct CameraPreview: UIViewRepresentable {
             if grid.superlayer == nil { layer.addSublayer(grid) }
             if guide.superview == nil { guide.isUserInteractionEnabled = false; guide.contentMode = .scaleAspectFit; addSubview(guide) }
             let frame = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-            guard !frame.isEmpty, !frame.isInfinite, !frame.isNull, gridFrame != frame else { return }
+            guard PreviewGeometry.isValid(frame), gridFrame != frame else { return }
             gridFrame = frame
             guide.frame = frame
             let path = UIBezierPath()
@@ -56,7 +56,7 @@ struct CameraPreview: UIViewRepresentable {
             guard let view = gesture.view as? PreviewView else { return }
             let point = gesture.location(in: view)
             let videoRect = view.previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-            guard videoRect.contains(point) else { return }
+            guard PreviewGeometry.isValid(videoRect), point.x.isFinite, point.y.isFinite, videoRect.contains(point) else { return }
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
             guard (0...1).contains(devicePoint.x), (0...1).contains(devicePoint.y) else { return }
             guard showsFocusFeedback else { return }
@@ -102,5 +102,13 @@ struct CameraPreview: UIViewRepresentable {
         if view.guide.image !== guideImage { view.guide.image = guideImage }
         view.grid.isHidden = !showsGrid
         view.updateOverlays()
+    }
+}
+
+/// Reject transient invalid camera geometry before assigning CALayer/UIView frames.
+enum PreviewGeometry {
+    static func isValid(_ rect: CGRect) -> Bool {
+        rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite &&
+        rect.width > 0 && rect.height > 0
     }
 }
