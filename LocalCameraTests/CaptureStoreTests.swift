@@ -157,4 +157,26 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertEqual(window.update(adjusting: true, now: 6), .timedOut)
     }
 
+    func testLocalPhotoDetailsSurviveRecoveryAndLegacyFilesStillDecode() async throws {
+        var original = photo()
+        original.details = CaptureDetails(iso: 125, exposureSeconds: 0.008, timestamp: 10.5)
+        try await CaptureStore(root: root).stage(original)
+        let restored = try await CaptureStore(root: root).load("pending.plist")
+        XCTAssertEqual(restored?.captured?.details, original.details)
+        let encoded = try PropertyListEncoder().encode(CaptureStore.Photo(original, index: 0))
+        var legacy = try XCTUnwrap(PropertyListSerialization.propertyList(from: encoded, format: nil) as? [String: Any])
+        legacy.removeValue(forKey: "details")
+        let data = try PropertyListSerialization.data(fromPropertyList: legacy, format: .binary, options: 0)
+        let decoded = try PropertyListDecoder().decode(CaptureStore.Photo.self, from: data)
+        XCTAssertNil(decoded.details)
+        XCTAssertEqual(decoded.data, original.data)
+    }
+    func testPairTimingUsesCaptureTimestampsAndHandlesMissingData() {
+        let first = CaptureDetails(iso: nil, exposureSeconds: nil, timestamp: 10)
+        let second = CaptureDetails(iso: nil, exposureSeconds: nil, timestamp: 10.25)
+        XCTAssertEqual(CaptureDetails.gap(first, second), 0.25)
+        XCTAssertEqual(CaptureDetails.gap(second, first), 0.25)
+        XCTAssertNil(CaptureDetails.gap(first, nil))
+    }
+
 }
