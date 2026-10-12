@@ -10,6 +10,7 @@ final class PhotoRescueModel: ObservableObject {
     @Published private(set) var busy = false
     @Published private(set) var saved = false
     @Published var strength = 0.5
+    @Published var look: PhotoLook = .natural
     @Published var message: String?
     private var source: Data?
 
@@ -24,7 +25,7 @@ final class PhotoRescueModel: ObservableObject {
             guard let data = try await item.loadTransferable(type: Data.self) else { throw CameraFailure.noPhoto }
             source = data
             message = "Adjusting on this iPhone…"
-            result = try await PhotoRescueProcessor.process(data, strength: strength)
+            result = try await PhotoRescueProcessor.process(data, strength: strength, look: look)
             message = nil
         } catch { message = "Could not prepare this photo. \(error.localizedDescription)" }
         busy = false
@@ -34,7 +35,7 @@ final class PhotoRescueModel: ObservableObject {
         busy = true
         message = "Adjusting on this iPhone…"
         do {
-            result = try await PhotoRescueProcessor.process(source, strength: strength)
+            result = try await PhotoRescueProcessor.process(source, strength: strength, look: look)
             saved = false
             message = nil
         } catch { message = error.localizedDescription }
@@ -60,6 +61,23 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var camera = CameraSnapshot()
     @Published private(set) var permission = AVCaptureDevice.authorizationStatus(for: .video)
     @Published private(set) var busy = false
+    @Published private(set) var restoring = true
+    @Published private(set) var recent: CaptureStore.Record?
+    @Published private(set) var recordingStarted: Date?
+    @Published private(set) var readyMilliseconds: Int?
+    @Published private(set) var lowStorage = false
+    @Published private(set) var recoveryProtected = false
+    @Published var haptics = UserDefaults.standard.bool(forKey: "camera.haptics") {
+        didSet { UserDefaults.standard.set(haptics, forKey: "camera.haptics") }
+    }
+    @Published private(set) var guideImage: UIImage?
+    @Published private(set) var histogram: [Double] = []
+    @Published var exposurePointOnly = false
+    @Published var dualBrightness: [Float] = [0, 0]
+    private let store = CaptureStore()
+    private var recoveryReadFailed = false
+    private var launchTime = Date()
+    private var storageTask: Task<Void, Never>?
     @Published private(set) var pendingPhoto: CapturedPhoto?
     @Published private(set) var lastSavedThumbnail: UIImage?
     @Published private(set) var lastSavedPhotoCount = 0
@@ -67,7 +85,7 @@ final class CameraViewModel: ObservableObject {
     @Published var message: String? {
         didSet {
             messageTask?.cancel()
-            guard let message, message.hasPrefix("Saved") || message == "Video saved" else { return }
+            guard let message, message.hasPrefix("Saved") || message == "Video saved" || message == "Both photos saved" else { return }
             messageTask = Task { [weak self] in
                 do { try await Task.sleep(nanoseconds: 2_500_000_000) } catch { return }
                 self?.message = nil
@@ -92,7 +110,7 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var burstPreviews: [UIImage] = []
     @Published var selectedBurstIndex = 0
     @Published private(set) var recommendedBurstIndex = 0
-    var hasPendingCapture: Bool { pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
+    var hasPendingCapture: Bool { restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
     var canShutter: Bool { camera.recording || (camera.running && !busy && !configuring && !hasPendingCapture && !resetOnReturn) }
 
     func selectMode(_ selected: CaptureMode) {
@@ -108,6 +126,8 @@ final class CameraViewModel: ObservableObject {
     }
     func applyVideoSettings() { selectMode(.video) }
     func shutter() {
+        guard canShutter else { return }
+        if haptics { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
         if controlsTask != nil {
             controlsTask?.cancel()
             controlsTask = nil
@@ -173,16 +193,14 @@ final class CameraViewModel: ObservableObject {
     }
     func focus(at point: CGPoint, locked: Bool) {
         guard camera.running, !busy, !configuring else { return }
-        controls.automaticFocus = true
-        controls.automaticExposure = true
-        controls.facePriority = false
-        if !camera.dualEnabled { engine.setControls(controls) }
-        engine.focus(at: point, locked: locked)
+        if !exposurePointOnly { controls.automaticFocus = true; controls.facePriority = false }
+        else { controls.automaticExposure = true }
+        engine.focus(at: point, locked: locked, exposureOnly: exposurePointOnly)
     }
 
-    func focusDual(at point: CGPoint, index: Int) {
+    func focusDual(at point: CGPoint, index: Int, locked: Bool = false) {
         guard camera.dualEnabled, camera.running, !busy, !configuring, !hasPendingCapture else { return }
-        engine.focus(at: point, locked: false, dualIndex: index)
+        engine.focus(at: point, locked: locked, dualIndex: index, exposureOnly: exposurePointOnly)
     }
 
     func applyControls() {
@@ -201,9 +219,15 @@ final class CameraViewModel: ObservableObject {
     }
     func resetControls() {
         captureStyle = "Auto"
+        engine.setAnalysis("Off")
         engine.setEyeFocus(false)
         controls = CameraControls()
         exposureBias = 0
+        dualBrightness = [0, 0]
+        exposurePointOnly = false
+        if camera.dualEnabled {
+            for index in 0..<2 { engine.focus(at: CGPoint(x: 0.5, y: 0.5), locked: false, dualIndex: index) }
+        }
         applyControls()
     }
     func actionPreset() {
@@ -218,7 +242,7 @@ final class CameraViewModel: ObservableObject {
         timerSeconds = 0
         applyControls()
         captureStyle = "Action"
-        message = "Action ready"
+        message = "Action · 3 shots at 1/500 s. Dim light may look noisy or dark."
     }
 
     func nightPreset() {
@@ -234,7 +258,7 @@ final class CameraViewModel: ObservableObject {
         burstEnabled = true
         applyControls()
         captureStyle = "Night"
-        message = "Hold still"
+        message = "Night · 3-second timer, then 3 exposures of about ¼ second. Hold still."
     }
 
     var canConfigure: Bool { !busy && !configuring && !hasPendingCapture && !camera.recording }
@@ -304,12 +328,19 @@ final class CameraViewModel: ObservableObject {
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         self.saver = saver
+        engine.onAnalysis = { [weak self] image, bins in
+            Task { @MainActor [weak self] in self?.guideImage = image; self?.histogram = bins }
+        }
+        Task { await restoreCaptures() }
         engine.onMeter = { [weak self] meter in
             Task { @MainActor [weak self] in
                 self?.camera.exposureLabel = meter.exposureLabel
                 self?.camera.focusLabel = meter.focusLabel
                 self?.camera.currentISO = meter.currentISO
                 self?.camera.currentShutter = meter.currentShutter
+                self?.camera.focusLocked = meter.focusLocked
+                self?.camera.focusStates = meter.focusStates
+                self?.camera.cooling = meter.cooling
                 if let self, self.resetOnReturn, self.active, self.canConfigure {
                     self.resetOnReturn = false
                     self.resetTemporarySettings()
@@ -329,6 +360,13 @@ final class CameraViewModel: ObservableObject {
         }
         engine.onChange = { [weak self] snapshot in
             Task { @MainActor [weak self] in
+                if let self {
+                    if snapshot.running && self.readyMilliseconds == nil {
+                        self.readyMilliseconds = Int(Date().timeIntervalSince(self.launchTime) * 1000)
+                    }
+                    if snapshot.recording && self.recordingStarted == nil { self.recordingStarted = Date() }
+                    if !snapshot.recording { self.recordingStarted = nil }
+                }
                 self?.camera = snapshot
                 self?.configuring = false
                 self?.mode = snapshot.videoMode ? .video : .photo
@@ -385,6 +423,21 @@ final class CameraViewModel: ObservableObject {
 
     func setActive(_ value: Bool) {
         active = value
+        storageTask?.cancel()
+        if value {
+            storageTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    guard let self else { return }
+                    let bytes = await self.store.availableBytes()
+                    self.lowStorage = bytes.map { $0 < 500_000_000 } ?? false
+                    if self.lowStorage && self.camera.recording && (bytes ?? .max) < 150_000_000 {
+                        self.engine.stopRecording()
+                        self.message = "Recording stopped to protect the remaining storage."
+                    }
+                    do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+                }
+            }
+        }
         if value && resetOnReturn && canConfigure {
             resetOnReturn = false
             resetTemporarySettings()
@@ -411,6 +464,7 @@ final class CameraViewModel: ObservableObject {
             lastRearLensID = lens.id
             UserDefaults.standard.set(lens.id, forKey: "camera.preferredRearLens")
         }
+        configuring = true
         engine.select(lens.id)
     }
 
@@ -434,7 +488,13 @@ final class CameraViewModel: ObservableObject {
                 case .failure(let error):
                     Task { @MainActor [weak self] in self?.busy = false; self?.message = error.localizedDescription }
                 case .success(let photos):
-                    PhotoRanker.recommend(photos) { index in
+                    Task { @MainActor [weak self] in
+                        guard let self, var recovery = photos.first else { return }
+                        recovery.companions = Array(photos.dropFirst())
+                        recovery.warning = "Recovered burst: saving keeps every frame."
+                        do { try await self.store.stage(recovery); self.recoveryProtected = true }
+                        catch { self.recoveryProtected = false }
+                        PhotoRanker.recommend(photos) { index in
                         Task { @MainActor [weak self] in
                             guard let self else { return }
                             self.burstPhotos = photos
@@ -444,6 +504,7 @@ final class CameraViewModel: ObservableObject {
                             self.busy = false
                             self.message = "Choose your favorite"
                             self.reviewingBurst = true
+                        }
                         }
                     }
                 }
@@ -493,44 +554,108 @@ final class CameraViewModel: ObservableObject {
 
     func retrySave() async {
         guard !busy else { return }
+        if recoveryReadFailed { restoring = true; await restoreCaptures(); return }
         await savePending()
     }
 
     private func savePending() async {
-        if let video = pendingVideo {
-            busy = true
-            message = "Saving video…"
-            defer { busy = false }
-            do {
-                try await saver.saveVideo(video)
-                pendingVideo = nil
-                try? FileManager.default.removeItem(at: video)
-                message = "Video saved"
-            } catch { message = error.localizedDescription }
-            return
-        }
-        guard let photo = pendingPhoto else { return }
+        guard pendingVideo != nil || pendingPhoto != nil else { return }
         busy = true
-        message = "Saving…"
+        message = "Protecting capture…"
         defer { busy = false }
         do {
-            try await saver.save(photo)
-            lastSavedThumbnail = Self.preview(photo.data, maxSize: 256)
-            lastSavedPhotoCount = 1 + photo.companions.count
-            pendingPhoto = nil
-            message = photo.warning ?? (photo.companions.isEmpty ? "Saved" : "Saved 2 photos")
-        } catch { message = error.localizedDescription }
+            if let video = pendingVideo {
+                let protected = try await store.stageVideo(video)
+                pendingVideo = protected
+                if video != protected { try? FileManager.default.removeItem(at: video) }
+            } else if let photo = pendingPhoto { try await store.stage(photo) }
+            recoveryProtected = true
+        } catch {
+            recoveryProtected = false
+            message = "Could not protect this capture on disk. Keep Camera XT open, free storage, then retry. \(error.localizedDescription)"
+            return
+        }
+        message = "Saving to Photos…"
+        do {
+            let thumbnail: Data?
+            let savedMessage: String
+            if let video = pendingVideo {
+                thumbnail = await CaptureStore.videoThumbnail(video)
+                try await saver.saveVideo(video)
+                savedMessage = "Video saved"
+            } else if let photo = pendingPhoto {
+                thumbnail = Self.preview(photo.data, maxSize: 256).jpegData(compressionQuality: 0.85)
+                try await saver.save(photo)
+                savedMessage = photo.warning ?? (photo.companions.isEmpty ? "Saved" : "Saved \(1 + photo.companions.count) photos")
+            } else { return }
+            // Photos has committed. Cache failures must never offer an automatic duplicate save.
+            pendingPhoto = nil; pendingVideo = nil
+            do {
+                recent = try await store.finish(thumbnail: thumbnail)
+                updateRecentThumbnail()
+                message = savedMessage
+            } catch {
+                message = "Saved to Photos, but local history could not be updated."
+            }
+            recoveryProtected = false
+            if haptics { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+        } catch {
+            message = "Not saved to Photos. A recovery copy is on this iPhone. \(error.localizedDescription)"
+            if haptics { UINotificationFeedbackGenerator().notificationOccurred(.error) }
+        }
+    }
+
+    private func restoreCaptures() async {
+        defer { restoring = false }
+        recent = try? await store.load("recent.plist")
+        updateRecentThumbnail()
+        do {
+            recoveryReadFailed = false
+            if let record = try await store.load("pending.plist") {
+                if record.saved { try await store.discard() }
+                else {
+                    pendingPhoto = record.captured
+                    if record.isVideo { pendingVideo = await store.videoURL() }
+                    recoveryProtected = true
+                    message = "Recovered an unfinished save. Check Photos before retrying to avoid a duplicate."
+                }
+            }
+        } catch { recoveryReadFailed = true; message = "Capture recovery could not be read. Keep this app installed and free storage before trying again." }
+    }
+
+    private func updateRecentThumbnail() {
+        lastSavedThumbnail = recent?.thumbnail.flatMap { UIImage(data: $0) }
+        if lastSavedThumbnail == nil, let data = recent?.photos.first?.data {
+            lastSavedThumbnail = Self.preview(data, maxSize: 256)
+        }
+        lastSavedPhotoCount = recent?.photos.count ?? 0
+    }
+
+    func clearRecent() async {
+        do {
+            try await store.clearRecent()
+            recent = nil; lastSavedThumbnail = nil; lastSavedPhotoCount = 0
+        } catch { message = "Could not clear the local recent preview." }
+    }
+
+    func setDualBrightness(_ value: Float, index: Int) {
+        guard canConfigure, dualBrightness.indices.contains(index) else { return }
+        dualBrightness[index] = value
+        engine.setExposureBias(value, dualIndex: index)
     }
 
     func discard() {
         guard !busy else { return }
-        pendingPhoto = nil
-        burstPhotos = []
-        burstPreviews = []
-        reviewingBurst = false
-        if let video = pendingVideo { try? FileManager.default.removeItem(at: video) }
-        pendingVideo = nil
-        message = "Unsaved capture discarded."
-        if active { engine.start() }
+        busy = true
+        Task {
+            do {
+                try await store.discard()
+                pendingPhoto = nil; burstPhotos = []; burstPreviews = []; reviewingBurst = false
+                pendingVideo = nil; recoveryProtected = false; recoveryReadFailed = false
+                message = "Unsaved capture discarded."
+            } catch { message = "Could not discard the recovery copy. Try again." }
+            busy = false
+            if active { engine.start() }
+        }
     }
 }
