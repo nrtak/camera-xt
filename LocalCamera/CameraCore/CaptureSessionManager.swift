@@ -1,6 +1,7 @@
 import AVFoundation
 import Vision
 import CoreImage
+import UIKit
 
 struct CameraControls: Equatable {
     var automaticExposure = true
@@ -24,6 +25,10 @@ struct CameraSnapshot {
     var dualAvailable = false
     var dualEnabled = false
     var dualFocusSupported = [false, false]
+    var focusStates = ["Auto focus", "Auto focus"]
+    var cooling = false
+    var analysisMode = "Off"
+    var audioRecording = false
     var focusLocked = false
     var videoMode = false
     var recording = false
@@ -76,9 +81,13 @@ final class CaptureSessionManager {
     private var controls = CameraControls()
     private var meterTimer: DispatchSourceTimer?
     private var burstRunning = false
+    var onAnalysis: ((UIImage?, [Double]) -> Void)?
+    private let analysisOutput = AVCaptureVideoDataOutput()
+    private var analyzer: ViewfinderAnalyzer?
     private let eyeOutput = AVCaptureVideoDataOutput()
     private var eyeTracker: EyeFocusTracker?
     private var eyeGeneration = UUID()
+    private var focusRequests: [String: UUID] = [:]
     private var lastEyePoint: CGPoint?
     private var eyeStatus = "Eye AF · searching"
 
@@ -186,6 +195,7 @@ final class CaptureSessionManager {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, !self.snapshot.dualEnabled, let oldInput = self.input,
                   let device = self.devices.first(where: { $0.uniqueID == id }) else { return }
+            self.disableAnalysis()
             self.disableEyeFocus()
             do {
                 let newInput = try AVCaptureDeviceInput(device: device)
@@ -280,9 +290,54 @@ final class CaptureSessionManager {
         }
     }
 
+    func setAnalysis(_ mode: String) {
+        queue.async {
+            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil else { return }
+            self.disableAnalysis()
+            guard mode != "Off", ["Peaking", "Highlights", "Histogram"].contains(mode),
+                  !self.snapshot.dualEnabled, !self.snapshot.videoMode else { self.publish(); return }
+            self.disableEyeFocus()
+            self.session.beginConfiguration()
+            guard self.session.canAddOutput(self.analysisOutput) else {
+                self.session.commitConfiguration()
+                self.publish(message: "This viewfinder guide is unavailable with the current camera.")
+                return
+            }
+            self.analysisOutput.alwaysDiscardsLateVideoFrames = true
+            self.analysisOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            self.session.addOutput(self.analysisOutput)
+            if let connection = self.analysisOutput.connection(with: .video) {
+                if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+                if connection.isVideoMirroringSupported {
+                    connection.automaticallyAdjustsVideoMirroring = false; connection.isVideoMirrored = false
+                }
+            }
+            let analyzer = ViewfinderAnalyzer(mode: mode) { [weak self] image, bins in
+                self?.queue.async { [weak self] in
+                    guard let self, self.snapshot.analysisMode == mode else { return }
+                    self.onAnalysis?(image, bins)
+                }
+            }
+            self.analyzer = analyzer
+            self.analysisOutput.setSampleBufferDelegate(analyzer, queue: analyzer.queue)
+            self.session.commitConfiguration()
+            self.snapshot.analysisMode = mode
+            self.publish()
+        }
+    }
+
+    private func disableAnalysis() {
+        analysisOutput.setSampleBufferDelegate(nil, queue: nil)
+        if session.outputs.contains(analysisOutput) {
+            session.beginConfiguration(); session.removeOutput(analysisOutput); session.commitConfiguration()
+        }
+        analyzer = nil; snapshot.analysisMode = "Off"; onAnalysis?(nil, [])
+    }
+
     func setEyeFocus(_ enabled: Bool) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil else { return }
+            self.disableAnalysis()
             self.disableEyeFocus()
             guard enabled, self.snapshot.eyeFocusAvailable, let device = self.input?.device else { self.publish(); return }
             self.session.beginConfiguration()
@@ -399,14 +454,15 @@ final class CaptureSessionManager {
             if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
             if connection.isVideoMirroringSupported {
                 connection.automaticallyAdjustsVideoMirroring = false
-                connection.isVideoMirrored = source.device.position == .front
+                connection.isVideoMirrored = false
             }
         }
     }
 
-    func setDualEnabled(_ enabled: Bool) {
+    func setDualEnabled(_ enabled: Bool, reason: String? = nil) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled else { return }
+            self.disableAnalysis()
             self.disableEyeFocus()
             self.activeSession.stopRunning()
             self.disconnectPreviews()
@@ -433,7 +489,7 @@ final class CaptureSessionManager {
                 } else if let device = self.input?.device { try self.applyControls(to: device) }
                 if self.wantsRunning { self.activeSession.startRunning() }
                 self.snapshot.focusLocked = !enabled && !self.controls.automaticFocus
-                self.publish()
+                self.publish(message: reason)
             } catch {
                 self.disconnectPreviews()
                 self.dual.reset()
@@ -450,10 +506,13 @@ final class CaptureSessionManager {
         }
     }
 
-    func focus(at point: CGPoint, locked: Bool, dualIndex: Int? = nil) {
+    func focus(at point: CGPoint, locked: Bool, dualIndex: Int? = nil, exposureOnly: Bool = false) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, !self.dual.busy else { return }
-            self.disableEyeFocus()
+            if !exposureOnly {
+                if self.snapshot.eyeFocusEnabled { self.disableEyeFocus() }
+                self.controls.automaticFocus = true; self.controls.facePriority = false
+            } else { self.controls.automaticExposure = true }
             let devices: [AVCaptureDevice]
             if self.snapshot.dualEnabled {
                 guard let index = dualIndex, self.dual.inputs.indices.contains(index) else { return }
@@ -466,24 +525,52 @@ final class CaptureSessionManager {
                         device.automaticallyAdjustsFaceDrivenAutoFocusEnabled = false
                         device.isFaceDrivenAutoFocusEnabled = false
                     }
-                    if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = point }
-                    if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = point }
-                    let focus: AVCaptureDevice.FocusMode = locked ? .autoFocus : .continuousAutoFocus
-                    let exposure: AVCaptureDevice.ExposureMode = locked ? .autoExpose : .continuousAutoExposure
-                    if device.isFocusModeSupported(focus) { device.focusMode = focus }
-                    if device.isExposureModeSupported(exposure) { device.exposureMode = exposure }
+                    if exposureOnly {
+                        if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = point }
+                        if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+                    } else {
+                        if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = point }
+                        let focus: AVCaptureDevice.FocusMode = locked ? .autoFocus : .continuousAutoFocus
+                        if device.isFocusModeSupported(focus) { device.focusMode = focus }
+                    }
                     device.unlockForConfiguration()
+                    if !exposureOnly {
+                        let request = UUID()
+                        self.focusRequests[device.uniqueID] = request
+                        if locked { self.finishFocusLock(device, request: request, attempts: 0) }
+                    }
                 }
-                self.snapshot.focusLocked = locked
                 self.publish()
             } catch { self.publish(message: error.localizedDescription) }
         }
     }
 
-    func setExposureBias(_ value: Float) {
+    private func finishFocusLock(_ device: AVCaptureDevice, request: UUID, attempts: Int) {
+        queue.asyncAfter(deadline: .now() + 0.15) {
+            guard self.focusRequests[device.uniqueID] == request, self.wantsRunning,
+                  (self.snapshot.dualEnabled ? self.dual.inputs.map(\.device) : [self.input?.device].compactMap { $0 }).contains(device) else { return }
+            if attempts < 3 || device.isAdjustingFocus {
+                if attempts < 25 { self.finishFocusLock(device, request: request, attempts: attempts + 1) }
+                else { self.publish(message: "Focus did not settle. Tap again or use manual focus.") }
+                return
+            }
+            do {
+                try device.lockForConfiguration()
+                if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+                device.unlockForConfiguration()
+                self.publish()
+            } catch { self.publish(message: error.localizedDescription) }
+        }
+    }
+
+    func setExposureBias(_ value: Float, dualIndex: Int? = nil) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, !self.dual.busy else { return }
-            let devices = self.snapshot.dualEnabled ? self.dual.inputs.map(\.device) : [self.input?.device].compactMap { $0 }
+            var devices = self.snapshot.dualEnabled ? self.dual.inputs.map(\.device) : [self.input?.device].compactMap { $0 }
+            if let index = dualIndex {
+                guard self.snapshot.dualEnabled, devices.indices.contains(index) else { return }
+                devices = [devices[index]]
+            }
             do {
                 for device in devices {
                     try device.lockForConfiguration()
@@ -498,6 +585,7 @@ final class CaptureSessionManager {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
                   let device = self.input?.device else { self.publish(); return }
+            self.disableAnalysis()
             self.disableEyeFocus()
             self.session.stopRunning()
             self.session.beginConfiguration()
@@ -579,6 +667,7 @@ final class CaptureSessionManager {
             let processor = MovieCaptureProcessor(started: { [weak self] in
                 guard let self else { return }
                 self.queue.async {
+                    self.snapshot.audioRecording = self.movie.connection(with: .audio)?.isEnabled == true
                     self.snapshot.recording = true
                     if self.stopMovieWhenStarted || !self.wantsRunning { self.movie.stopRecording() }
                     self.publish()
@@ -619,6 +708,7 @@ final class CaptureSessionManager {
     }
 
     private func applyControls(to device: AVCaptureDevice, automatic: Bool = false) throws {
+        focusRequests[device.uniqueID] = nil
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
         if device.isFocusModeSupported(.continuousAutoFocus) {
@@ -659,6 +749,10 @@ final class CaptureSessionManager {
         timer.setEventHandler { [weak self] in
             guard let self, self.activeSession.isRunning else { return }
             self.updateMeter()
+            if self.snapshot.dualEnabled, !self.dual.busy,
+               self.snapshot.cooling || self.dual.inputs.contains(where: { [.serious, .critical, .shutdown].contains($0.device.systemPressureState.level) }) {
+                self.setDualEnabled(false, reason: "Dual Shot paused to cool the camera. Single-camera Photo is ready.")
+            }
             self.onMeter?(self.snapshot)
         }
         meterTimer = timer
@@ -666,6 +760,11 @@ final class CaptureSessionManager {
     }
 
     private func updateMeter() {
+        let thermal = ProcessInfo.processInfo.thermalState
+        snapshot.cooling = thermal == .serious || thermal == .critical
+        let activeDevices = snapshot.dualEnabled ? dual.inputs.map(\.device) : [input?.device].compactMap { $0 }
+        snapshot.focusStates = activeDevices.map { $0.isAdjustingFocus ? "Focusing…" : $0.focusMode == .locked ? "Focus locked" : "Auto focus" }
+        snapshot.focusLocked = activeDevices.contains { $0.focusMode == .locked }
         guard let device = snapshot.dualEnabled ? dual.inputs.first?.device : input?.device else { return }
         let seconds = CMTimeGetSeconds(device.exposureDuration)
         let shutter = seconds > 0 && seconds < 1 ? "1/\(Int((1 / seconds).rounded()))" : String(format: "%.1f s", seconds)
@@ -903,7 +1002,8 @@ private final class DualPhotoCamera {
                     self.processors[index] = nil
                     guard self.results.count == 2 else { return }
                     let successful = (0..<2).compactMap { index -> (Int, CapturedPhoto)? in
-                        guard let photo = try? self.results[index]?.get() else { return nil }
+                        guard var photo = try? self.results[index]?.get() else { return nil }
+                        photo.lensLabel = index == 0 ? "Main · 1×" : "Ultra Wide · 0.5×"
                         return (index, photo)
                     }
                     guard var first = successful.first?.1 else {
@@ -918,6 +1018,68 @@ private final class DualPhotoCamera {
             }
             processors[index] = processor
             output.capturePhoto(with: settings, delegate: processor)
+        }
+    }
+}
+
+
+/// Optional, low-resolution guides. These never modify a captured photo.
+private final class ViewfinderAnalyzer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    let queue = DispatchQueue(label: "CameraXT.viewfinderGuides", qos: .utility)
+    let mode: String
+    let report: (UIImage?, [Double]) -> Void
+    private let context = CIContext(options: [.cacheIntermediates: false])
+    private var lastTime = -Double.infinity
+    init(mode: String, report: @escaping (UIImage?, [Double]) -> Void) { self.mode = mode; self.report = report }
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        guard time.isFinite, time - lastTime >= 0.2 else { return }
+        lastTime = time
+        guard ProcessInfo.processInfo.thermalState != .serious, ProcessInfo.processInfo.thermalState != .critical,
+              let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { report(nil, []); return }
+        autoreleasepool {
+            let source = CIImage(cvPixelBuffer: buffer)
+            let scale = 180 / max(source.extent.width, source.extent.height)
+            let image = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            let width = max(1, Int(image.extent.width)), height = max(1, Int(image.extent.height))
+            var pixels = [UInt8](repeating: 0, count: width * height * 4)
+            pixels.withUnsafeMutableBytes { bytes in
+                context.render(image, toBitmap: bytes.baseAddress!, rowBytes: width * 4,
+                               bounds: CGRect(x: 0, y: 0, width: width, height: height), format: .RGBA8,
+                               colorSpace: CGColorSpaceCreateDeviceRGB())
+            }
+            var luma = [Int](repeating: 0, count: width * height)
+            var bins = [Double](repeating: 0, count: 32)
+            for index in luma.indices {
+                let p = index * 4
+                luma[index] = (Int(pixels[p]) * 54 + Int(pixels[p + 1]) * 183 + Int(pixels[p + 2]) * 19) / 256
+                bins[min(31, luma[index] / 8)] += 1
+            }
+            if mode == "Histogram" {
+                let peak = max(1, bins.max() ?? 1)
+                report(nil, bins.map { $0 / peak }); return
+            }
+            var overlay = [UInt8](repeating: 0, count: pixels.count)
+            guard width > 2, height > 2 else { return }
+            for y in 1..<(height - 1) {
+                for x in 1..<(width - 1) {
+                    let index = y * width + x, p = index * 4
+                    let edge = abs(luma[index + 1] - luma[index - 1]) + abs(luma[index + width] - luma[index - width])
+                    let show = mode == "Highlights" ? luma[index] >= 245 && (x + y) % 6 < 3 : edge > 95
+                    if show {
+                        overlay[p] = mode == "Highlights" ? 255 : 0
+                        overlay[p + 1] = mode == "Highlights" ? 60 : 255
+                        overlay[p + 2] = mode == "Highlights" ? 60 : 255
+                        overlay[p + 3] = 255
+                    }
+                }
+            }
+            guard let provider = CGDataProvider(data: Data(overlay) as CFData),
+                  let cg = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                                   bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                   provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { return }
+            report(UIImage(cgImage: cg), [])
         }
     }
 }
