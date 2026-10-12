@@ -440,14 +440,20 @@ final class CaptureSessionManager {
     }
 
     private func connectPreview() {
-        disconnectPreviews()
         let sources: [(AVCaptureVideoPreviewLayer?, AVCaptureDeviceInput?)] = [
             (preview, snapshot.dualEnabled ? dual.inputs.first : input),
             (secondaryPreview, snapshot.dualEnabled && dual.inputs.count > 1 ? dual.inputs[1] : nil)
         ]
         for (layer, source) in sources {
-            guard let layer, let source,
-                  let port = source.ports.first(where: { $0.mediaType == .video }) else { continue }
+            guard let layer else { continue }
+            let port = source?.ports.first(where: { $0.mediaType == .video })
+            if let port, layer.session === activeSession,
+               let connection = layer.connection, connection.inputPorts.contains(where: { $0 === port }) {
+                continue
+            }
+            if let connection = layer.connection { layer.session?.removeConnection(connection) }
+            layer.session = nil
+            guard let port else { continue }
             layer.setSessionWithNoConnection(activeSession)
             let connection = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
             guard activeSession.canAddConnection(connection) else { continue }
