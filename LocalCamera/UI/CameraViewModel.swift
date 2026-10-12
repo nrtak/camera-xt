@@ -229,6 +229,11 @@ final class CameraViewModel: ObservableObject {
         if enabled { burstEnabled = false }
         engine.setDualEnabled(enabled)
     }
+    func setDualMode(_ mode: DualShotMode) {
+        guard canConfigure, camera.dualEnabled, mode != camera.dualMode else { return }
+        configuring = true
+        engine.setDualEnabled(true, mode: mode)
+    }
     func focus(at point: CGPoint, locked: Bool) {
         guard camera.running, !busy, !configuring else { return }
         if !exposurePointOnly { controls.automaticFocus = true; controls.facePriority = false }
