@@ -217,6 +217,7 @@ final class CameraViewModel: ObservableObject {
     private var restoredLens = false
     private var resetOnReturn = false
     private var pendingTool: QuickCaptureTool?
+    private var expectingCaptureProgress = false
     private var modeAfterDual: CaptureMode?
     @Published private(set) var captureStyle = "Auto"
     @Published private(set) var configuring = false
@@ -308,6 +309,11 @@ final class CameraViewModel: ObservableObject {
 
     func activate(_ tool: QuickCaptureTool) {
         guard canConfigure else { return }
+        if camera.dualEnabled && tool != .dual { message = "Switching from Dual Shot to single-camera Photo for this feature." }
+        else if camera.videoMode { message = "Switching from Video to Photo for this feature." }
+        else if tool == .dual && (burstEnabled || camera.eyeFocusEnabled || camera.analysisMode != "Off") {
+            message = "Dual Shot turns off burst, eye tracking, and viewfinder guides."
+        }
         pendingTool = tool
         continueTool()
     }
@@ -371,6 +377,12 @@ final class CameraViewModel: ObservableObject {
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         self.saver = saver
+        engine.onCaptureProgress = { [weak self] progress in
+            Task { @MainActor [weak self] in
+                guard let self, self.expectingCaptureProgress else { return }
+                self.message = progress
+            }
+        }
         engine.onWarning = { [weak self] warning in Task { @MainActor [weak self] in self?.message = warning } }
         engine.onAnalysis = { [weak self] image, bins in
             Task { @MainActor [weak self] in self?.guides.image = image; self?.guides.histogram = bins }
@@ -567,14 +579,17 @@ final class CameraViewModel: ObservableObject {
             return
         }
         message = "Capturing…"
+        expectingCaptureProgress = true
         engine.capture { [weak self] result in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 switch result {
                 case .success(let photo):
+                    self.expectingCaptureProgress = false
                     self.pendingPhoto = photo
                     await self.savePending()
                 case .failure(let error):
+                    self.expectingCaptureProgress = false
                     self.message = error.localizedDescription
                     self.busy = false
                 }
@@ -606,7 +621,7 @@ final class CameraViewModel: ObservableObject {
     private func savePending() async {
         guard pendingVideo != nil || pendingPhoto != nil else { return }
         busy = true
-        message = "Protecting capture…"
+        message = "Saving · protecting a local recovery copy…"
         defer { busy = false }
         do {
             if let video = pendingVideo {
