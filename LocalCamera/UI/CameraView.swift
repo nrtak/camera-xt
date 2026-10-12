@@ -10,6 +10,14 @@ struct CameraView: View {
     @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.dynamicTypeSize) private var textSize
+    @AppStorage("camera.quickAccess") private var quickAccess = false
+    @AppStorage("camera.pin1") private var pin1 = "Exposure"
+    @AppStorage("camera.pin2") private var pin2 = "Timer"
+    @AppStorage("camera.pin3") private var pin3 = "Shot styles"
+    @AppStorage("camera.captureDetails") private var showCaptureDetails = false
+    @State private var checkIndex = 0
+    @State private var passedChecks: Set<Int> = []
     @State private var confirmDiscard = false
     @AppStorage("camera.showsGrid") private var showsGrid = true
     @State private var toolPath: [CameraToolPage] = []
@@ -134,9 +142,11 @@ struct CameraView: View {
         .overlay(alignment: .topLeading) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.caption.weight(.semibold))
+                let sizes = model.camera.resolution.components(separatedBy: " + ")
+                if sizes.indices.contains(index) { Text(sizes[index]).font(.caption2).monospacedDigit() }
                 Button("Brightness") { selectedDualIndex = index; openTool(.exposure) }
                     .font(.caption2).frame(minHeight: 44).disabled(!model.canConfigure)
-                Text(model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Tap focus unavailable")
+                Text(model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index] && model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Fixed focus")
                     .font(.caption2)
                 Button {
                     enlargedDualIndex = enlargedDualIndex == index ? nil : index
@@ -170,6 +180,19 @@ struct CameraView: View {
                 HStack(spacing: 8) { activeIndicators }
                 VStack(spacing: 6) { activeIndicators }
             }
+            if quickAccess && !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
+                HStack(spacing: 8) {
+                    ForEach(Array([pin1, pin2, pin3].enumerated()), id: \.offset) { _, name in
+                        if let page = CameraToolPage(rawValue: name) {
+                            Button { openTool(page) } label: {
+                                Label(page.rawValue, systemImage: page.icon).font(.caption)
+                                    .frame(minHeight: 44).padding(.horizontal, 8)
+                                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+                            }.disabled(!model.canConfigure)
+                        }
+                    }
+                }
+            }
             LiveHistogram(guides: model.guides, overlayColor: overlayColor)
             if model.lowStorage { Text("Low storage · free space before a long recording").font(.caption).padding(8).background(overlayColor) }
             if model.camera.cooling { Text("iPhone is warm · optional processing is reduced").font(.caption).padding(8).background(overlayColor) }
@@ -178,7 +201,8 @@ struct CameraView: View {
                     .foregroundStyle(.white).accessibilityLabel("Shutter in \(model.countdown) seconds")
             }
             if let message = model.message {
-                Text(message).font(.caption).multilineTextAlignment(.center)
+                Label(message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
+                    .font(.callout).multilineTextAlignment(.center).accessibilityLabel(message)
                     .padding(10).background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
             }
             if model.hasPendingCapture && !model.busy {
@@ -395,10 +419,10 @@ struct CameraView: View {
     }
 
     private var toolPanelHeight: CGFloat {
-        if showsRecent || model.reviewingBurst { return .infinity }
+        if showsRecent || model.reviewingBurst || textSize.isAccessibilitySize { return .infinity }
         let base: CGFloat
         switch toolPath.last {
-        case nil: base = 270
+        case nil: return 270
         case .shoot: base = model.camera.dualEnabled ? 290 : 350
         case .timer: base = 260
         case .video: base = 350
@@ -555,7 +579,30 @@ struct CameraView: View {
             Toggle("Steadier video", isOn: $model.stabilization)
             Text("The selected lens determines which formats are available.").font(.footnote)
             Button("Apply video settings") { model.applyVideoSettings(); showsCaptureInfo = false }.buttonStyle(.borderedProminent).foregroundStyle(.black)
+        case .shortcuts:
+            Toggle("Show quick controls", isOn: $quickAccess)
+            shortcutPicker("First", selection: $pin1, excluding: [pin2, pin3])
+            shortcutPicker("Second", selection: $pin2, excluding: [pin1, pin3])
+            shortcutPicker("Third", selection: $pin3, excluding: [pin1, pin2])
+            Text("Three optional controls above the viewfinder. All tools remain available in Tools.").font(.footnote)
+        case .checks:
+            Text("iPhone beta checks").font(.headline)
+            Text("\(passedChecks.count) of \(deviceChecks.count) marked passed this session").font(.caption)
+            Text(deviceChecks[checkIndex]).fixedSize(horizontal: false, vertical: true)
+            Button("Mark passed and next") {
+                passedChecks.insert(checkIndex)
+                checkIndex = (checkIndex + 1) % deviceChecks.count
+            }.buttonStyle(.borderedProminent).foregroundStyle(.black)
+            Button("Not passed / skip") {
+                passedChecks.remove(checkIndex)
+                checkIndex = (checkIndex + 1) % deviceChecks.count
+            }.buttonStyle(.bordered)
+            Button("Reset checklist") { passedChecks = []; checkIndex = 0 }
+            Text("Mark a check only after testing it. No results are uploaded.").font(.footnote)
         case .preferences:
+            Button { toolPath = [.shortcuts] } label: { Label("Quick controls", systemImage: "chevron.right") }
+            Button { toolPath = [.checks] } label: { Label("Beta device checks", systemImage: "chevron.right") }
+            Toggle("Show local photo details", isOn: $showCaptureDetails)
             Toggle("Composition grid", isOn: $showsGrid)
             Toggle("Capture vibrations", isOn: $model.haptics)
             Picker("Dual Shot inset", selection: $dualCorner) {
@@ -595,10 +642,41 @@ struct CameraView: View {
                     if showHelp { Text(detail).font(.caption).foregroundStyle(.secondary) }
                 }
                 Spacer(minLength: 0)
+                if featureSelected(title) { Image(systemName: "checkmark").foregroundStyle(selection) }
             }.padding(8).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
         }.buttonStyle(.plain).disabled(!model.canConfigure).accessibilityHint(detail)
+            .accessibilityAddTraits(featureSelected(title) ? .isSelected : [])
     }
+
+    private func featureSelected(_ title: String) -> Bool {
+        switch title {
+        case "Automatic": return !model.camera.dualEnabled && model.mode == .photo && model.captureStyle == "Auto" && !model.burstEnabled
+        case "Action burst": return model.captureStyle == "Action"
+        case "Low-light burst · Beta": return model.captureStyle == "Night"
+        case "Best Shot": return model.burstEnabled && model.captureStyle == "Auto"
+        case "Dual Shot": return model.camera.dualEnabled
+        default: return title.hasPrefix("Turn off")
+        }
+    }
+    private func shortcutPicker(_ title: String, selection: Binding<String>, excluding: [String]) -> some View {
+        Picker(title, selection: selection) {
+            ForEach([CameraToolPage.shoot, .focus, .timer, .exposure, .color, .manualFocus, .details, .preferences].filter {
+                !excluding.contains($0.rawValue) || $0.rawValue == selection.wrappedValue
+            }, id: \.self) { Text($0.rawValue).tag($0.rawValue) }
+        }.pickerStyle(.menu)
+    }
+    private let deviceChecks = [
+        "In good light, photograph the same distant subject in Single Photo, Dual Fast, and Dual Detail. Compare main-camera sharpness in Photos at the same scale.",
+        "In Dual Shot, tap focus and adjust brightness on each preview. Enlarge each view and move the inset. Confirm focus and brightness stay unchanged.",
+        "Take five Fast pairs and five Detail pairs. Confirm both photos save for each successful pair, with correct labels and visible progress.",
+        "Repeat at a close distance and in low light. Compare shutter speed and ISO in local photo details; check focus and motion blur separately.",
+        "Background the app during Detail capture, then return. Confirm it recovers and clearly reports any partial capture or pending save.",
+        "Switch lenses, front/rear, Photo/Video, and Fast/Detail repeatedly. Confirm previews resume without freezes or crashes.",
+        "With Photos access denied, capture a photo. Confirm retry/recovery works after restoring permission; ensure no duplicate save.",
+        "Try larger text, VoiceOver, and increased contrast. Check every control is reachable and selected states are announced.",
+        "During normal extended use, check responsiveness and any warm-device fallback. Do not deliberately overheat the phone."
+    ]
 
     private func openPhotos() {
         guard let url = URL(string: "photos-redirect://") else { return }
@@ -613,12 +691,15 @@ struct CameraView: View {
 }
 
 private enum CameraToolPage: String, Hashable {
+    case shortcuts = "Quick controls", checks = "Beta device checks"
     case guides = "Viewfinder guides"
     case shoot = "Shot styles", focus = "Focus & depth", timer = "Timer", video = "Video quality"
     case rescue = "Photo Rescue", advanced = "Advanced", preferences = "Preferences"
     case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Info", gallery = "Design Preview"
     var icon: String {
         switch self {
+        case .shortcuts: return "pin"
+        case .checks: return "checklist"
         case .guides: return "waveform.path"
         case .shoot: return "camera"
         case .focus, .manualFocus: return "viewfinder"
@@ -943,6 +1024,8 @@ private struct RecentCaptureView: View {
     let close: () -> Void
     @Environment(\.openURL) private var openURL
     @State private var selection = 0
+    @State private var comparing = true
+    @AppStorage("camera.captureDetails") private var showDetails = false
     var body: some View {
         VStack(spacing: 8) {
             HStack {
@@ -955,13 +1038,33 @@ private struct RecentCaptureView: View {
                 Image(uiImage: image).resizable().scaledToFit()
                 Text("Video saved in Photos").font(.caption)
             } else if record.photos.indices.contains(selection) {
-                ZoomableCapture(data: record.photos[selection].data).id(selection)
+                if comparing && record.photos.count == 2 {
+                    HStack(spacing: 6) {
+                        ForEach(record.photos.indices, id: \.self) { index in
+                            VStack {
+                                ZoomableCapture(data: record.photos[index].data, maxSize: 1500)
+                                Button("Enlarge \(record.photos[index].label)") { selection = index; comparing = false }
+                                    .font(.caption).frame(minHeight: 44)
+                            }
+                        }
+                    }
+                } else { ZoomableCapture(data: record.photos[selection].data).id(selection) }
                 let photo = record.photos[selection]
                 Text("\(photo.label) · \(photo.width) × \(photo.height)").font(.caption)
+                if showDetails {
+                    Text(photo.details?.summary ?? "Capture details unavailable for this older photo.").font(.caption)
+                    if record.photos.count == 2, let gap = CaptureDetails.gap(record.photos[0].details, record.photos[1].details) {
+                        Text(String(format: "Photos taken %.3f s apart", gap)).font(.caption).monospacedDigit()
+                    }
+                    Text("Details stay with this iPhone’s local recent/recovery copy.").font(.caption2)
+                }
+                if record.photos.count == 2 {
+                    Button(comparing ? "Show one photo" : "Compare both") { comparing.toggle() }.frame(minHeight: 44)
+                }
                 if record.photos.count > 1 {
                     HStack {
                         ForEach(record.photos.indices, id: \.self) { index in
-                            Button(record.photos[index].label) { selection = index }
+                            Button(record.photos[index].label) { selection = index; comparing = false }
                                 .frame(maxWidth: .infinity, minHeight: 44)
                                 .background(selection == index ? Color.yellow.opacity(0.3) : .clear, in: RoundedRectangle(cornerRadius: 8))
                                 .accessibilityAddTraits(selection == index ? .isSelected : [])
@@ -979,6 +1082,7 @@ private struct RecentCaptureView: View {
 
 private struct ZoomableCapture: UIViewRepresentable {
     let data: Data
+    var maxSize: Int = 3000
     final class Coordinator: NSObject, UIScrollViewDelegate {
         let imageView = UIImageView()
         weak var scrollView: UIScrollView?
@@ -1013,7 +1117,7 @@ private struct ZoomableCapture: UIViewRepresentable {
         context.coordinator.scrollView = view
         let image = context.coordinator.imageView
         context.coordinator.decodeTask = Task { @MainActor [weak image] in
-            let decoded = await CapturePreviewDecoder.image(data, maxSize: 3000)
+            let decoded = await CapturePreviewDecoder.image(data, maxSize: maxSize)
             guard !Task.isCancelled else { return }
             image?.image = decoded
         }
