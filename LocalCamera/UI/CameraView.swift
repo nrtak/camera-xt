@@ -426,7 +426,7 @@ struct CameraView: View {
                 CompactToolLayout {
                     if model.camera.dualEnabled {
                         Text("Manual controls use a single camera.")
-                        Button("Switch to single Photo") { model.activate(.automatic) }.buttonStyle(.borderedProminent)
+                        Button("Switch to single Photo") { model.activate(.automatic) }.buttonStyle(.borderedProminent).foregroundStyle(.black)
                     } else {
                         ManualCameraControls(model: model, page: page)
                     }
@@ -474,13 +474,13 @@ struct CameraView: View {
                 Text("Off").tag(0); Text("3 sec").tag(3); Text("10 sec").tag(10)
             }.pickerStyle(.segmented)
             Text("The timer turns off after use or when you return from the background.").font(.footnote)
-            Button("Ready") { showsCaptureInfo = false }.buttonStyle(.borderedProminent)
+            Button("Ready") { showsCaptureInfo = false }.buttonStyle(.borderedProminent).foregroundStyle(.black)
         case .video:
             Picker("Resolution", selection: $model.videoWidth) { Text("1080p").tag(Int32(1920)); Text("4K").tag(Int32(3840)) }.pickerStyle(.segmented)
             Picker("Frame rate", selection: $model.videoFPS) { Text("24 fps").tag(Int32(24)); Text("30 fps").tag(Int32(30)); Text("60 fps").tag(Int32(60)) }.pickerStyle(.segmented)
             Toggle("Steadier video", isOn: $model.stabilization)
             Text("The selected lens determines which formats are available.").font(.footnote)
-            Button("Apply video settings") { model.applyVideoSettings(); showsCaptureInfo = false }.buttonStyle(.borderedProminent)
+            Button("Apply video settings") { model.applyVideoSettings(); showsCaptureInfo = false }.buttonStyle(.borderedProminent).foregroundStyle(.black)
         case .preferences:
             Toggle("Composition grid", isOn: $showsGrid)
             Text("Grid and your chosen rear lens are remembered. Timers and exposure locks reset; photos stay on your iPhone.").font(.callout).foregroundStyle(.secondary)
@@ -573,7 +573,7 @@ private struct PhotoRescueView: View {
                     }).accessibilityLabel("Adjustment strength").disabled(model.busy)
                 }
                 Button(model.saved ? "Copy saved" : "Save a copy") { Task { await model.save() } }
-                    .buttonStyle(.borderedProminent).disabled(model.busy || model.saved)
+                    .buttonStyle(.borderedProminent).foregroundStyle(.black).disabled(model.busy || model.saved)
                     .frame(maxWidth: .infinity)
                 Text("Your original stays unchanged.").font(.caption).foregroundStyle(.secondary)
             } else {
@@ -694,7 +694,7 @@ private struct BurstReview: View {
                 HStack {
                     Button("Save selected") { Task { await model.saveBurst(all: false) } }
                     Button("Save all \(model.burstPhotos.count)") { Task { await model.saveBurst(all: true) } }
-                }.buttonStyle(.borderedProminent)
+                }.buttonStyle(.borderedProminent).foregroundStyle(.black)
             }
             .padding()
             .navigationTitle("Best Shot")
