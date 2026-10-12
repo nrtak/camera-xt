@@ -24,6 +24,7 @@ struct CameraSnapshot {
     var message: String?
     var dualAvailable = false
     var dualEnabled = false
+    var dualMode: DualShotMode = .fast
     var dualFocusSupported = [false, false]
     var focusStates = ["Auto focus", "Auto focus"]
     var cooling = false
@@ -102,7 +103,7 @@ final class CaptureSessionManager {
                 self.disableAnalysis()
                 self.disableEyeFocus()
                 if self.snapshot.dualEnabled {
-                    if self.dual.busy { self.pendingMemoryFallback = true }
+                    if self.dual.busy { self.pendingMemoryFallback = true; self.dual.cancelRemainingCapture() }
                     else { self.setDualEnabled(false, reason: "Memory is low · returned to Single Photo.") }
                 }
             }
@@ -154,6 +155,7 @@ final class CaptureSessionManager {
     func stop() {
         queue.async {
             self.wantsRunning = false
+            self.dual.cancelRemainingCapture()
             self.meterTimer?.cancel()
             self.meterTimer = nil
             if self.movieProcessor != nil { self.stopMovieWhenStarted = true }
@@ -511,9 +513,9 @@ final class CaptureSessionManager {
         configureDimensions(input.device)
     }
 
-    func setDualEnabled(_ enabled: Bool, reason: String? = nil) {
+    func setDualEnabled(_ enabled: Bool, reason: String? = nil, mode: DualShotMode? = nil) {
         queue.async {
-            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled else { return }
+            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled || (enabled && mode != nil && mode != self.snapshot.dualMode) else { return }
             self.disableAnalysis()
             self.disableEyeFocus()
             self.activeSession.stopRunning()
@@ -521,13 +523,17 @@ final class CaptureSessionManager {
             do {
                 if enabled {
                     self.suspendSingleCamera()
-                    try self.dual.configure()
+                    self.dual.reset()
+                    let selectedMode = mode ?? self.snapshot.dualMode
+                    try self.dual.configure(mode: selectedMode)
+                    self.snapshot.dualMode = selectedMode
                     self.snapshot.dualEnabled = true
                     self.snapshot.selectedID = self.dual.inputs.first?.device.uniqueID
                     self.snapshot.resolution = self.dual.resolution
                 } else {
                     self.dual.reset()
                     self.snapshot.dualEnabled = false
+                    self.snapshot.dualMode = .fast
                     self.snapshot.selectedID = self.input?.device.uniqueID
                     try self.restoreSingleCamera()
                 }
@@ -545,6 +551,7 @@ final class CaptureSessionManager {
                 self.disconnectPreviews()
                 self.dual.reset()
                 self.snapshot.dualEnabled = false
+                self.snapshot.dualMode = .fast
                 self.snapshot.selectedID = self.input?.device.uniqueID
                 do {
                     try self.restoreSingleCamera()
@@ -954,7 +961,9 @@ private final class DualPhotoCamera {
     private var originals: [(AVCaptureDevice, AVCaptureDevice.Format, CMTime, CMTime)] = []
     private var processors: [Int: PhotoCaptureProcessor] = [:]
     private var results: [Int: Result<CapturedPhoto, Error>] = [:]
-    var busy: Bool { !processors.isEmpty }
+    private(set) var busy = false
+    private var mode: DualShotMode = .fast
+    private var cancelRemaining = false
     private(set) var resolution = "—"
 
     init(queue: DispatchQueue) { self.queue = queue }
@@ -969,7 +978,8 @@ private final class DualPhotoCamera {
     }
     static var isSupported: Bool { pair != nil }
 
-    func configure() throws {
+    func configure(mode: DualShotMode) throws {
+        self.mode = mode
         guard inputs.isEmpty else { return }
         guard let pair = Self.pair else { throw Failure.unsupported }
         session.beginConfiguration()
@@ -980,9 +990,15 @@ private final class DualPhotoCamera {
             let formats = device.formats.filter {
                 let size = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
                 return $0.isMultiCamSupported && size.width <= 1920 && size.height <= 1440 &&
-                    DualCaptureLimits.photoSize(in: $0.supportedMaxPhotoDimensions) != nil && $0.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }
+                    DualCaptureLimits.photoSize(in: $0.supportedMaxPhotoDimensions, mode: mode) != nil && $0.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }
             }
             guard let format = formats.max(by: {
+                if mode == .detail {
+                    let a = DualCaptureLimits.photoSize(in: $0.supportedMaxPhotoDimensions, mode: mode)!
+                    let b = DualCaptureLimits.photoSize(in: $1.supportedMaxPhotoDimensions, mode: mode)!
+                    let areaA = Int64(a.width) * Int64(a.height), areaB = Int64(b.width) * Int64(b.height)
+                    if areaA != areaB { return areaA < areaB }
+                }
                 let a = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
                 let b = CMVideoFormatDescriptionGetDimensions($1.formatDescription)
                 return Int64(a.width) * Int64(a.height) < Int64(b.width) * Int64(b.height)
@@ -1006,9 +1022,9 @@ private final class DualPhotoCamera {
             guard session.canAddConnection(connection) else { throw Failure.unsupported }
             session.addConnection(connection)
             if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
-            output.maxPhotoQualityPrioritization = .speed
+            output.maxPhotoQualityPrioritization = mode == .detail ? .quality : .speed
             guard device.activeFormat.isMultiCamSupported,
-                  let size = DualCaptureLimits.photoSize(in: device.activeFormat.supportedMaxPhotoDimensions) else { throw Failure.unsupported }
+                  let size = DualCaptureLimits.photoSize(in: device.activeFormat.supportedMaxPhotoDimensions, mode: mode) else { throw Failure.unsupported }
             output.maxPhotoDimensions = size
             labels.append("\(size.width) × \(size.height)")
         }
@@ -1052,45 +1068,74 @@ private final class DualPhotoCamera {
         for (index, output) in outputs.enumerated() {
             let device = inputs[index].device
             guard device.activeFormat.isMultiCamSupported,
-                  DualCaptureLimits.accepts(output.maxPhotoDimensions, supported: device.activeFormat.supportedMaxPhotoDimensions),
+                  DualCaptureLimits.accepts(output.maxPhotoDimensions, supported: device.activeFormat.supportedMaxPhotoDimensions, mode: mode),
                   let connection = output.connection(with: .video), connection.isEnabled, connection.isActive,
                   let codec = [AVVideoCodecType.hevc, .jpeg].first(where: { output.availablePhotoCodecTypes.contains($0) }) else {
                 completion(.failure(Failure.unsupported)); return
             }
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
             settings.maxPhotoDimensions = output.maxPhotoDimensions
-            settings.photoQualityPrioritization = .speed
+            settings.photoQualityPrioritization = mode == .detail ? .quality : .speed
             requests.append(settings)
         }
         results.removeAll()
-        // Submit back-to-back; independent sensors do not guarantee identical exposure times.
-        for (index, output) in outputs.enumerated() {
-            let settings = requests[index]
-            let processor = PhotoCaptureProcessor { [weak self] result in
-                guard let self else { return }
-                self.queue.async {
-                    self.results[index] = result
-                    self.processors[index] = nil
-                    guard self.results.count == 2 else { return }
-                    let successful = (0..<2).compactMap { index -> (Int, CapturedPhoto)? in
-                        guard var photo = try? self.results[index]?.get() else { return nil }
-                        photo.lensLabel = index == 0 ? "Main · 1×" : "Ultra Wide · 0.5×"
-                        return (index, photo)
-                    }
-                    guard var first = successful.first?.1 else {
-                        completion(.failure(CameraFailure.noPhoto)); self.results.removeAll(); return
-                    }
-                    first.companions = successful.dropFirst().map { $0.1 }
-                    first.warning = successful.count == 2 ? "Both photos saved" :
-                        "Only \(successful[0].0 == 0 ? "Main" : "Ultra Wide") photo saved. The other camera did not capture a photo."
-                    self.results.removeAll()
-                    completion(.success(first))
-                }
-            }
-            processors[index] = processor
-            output.capturePhoto(with: settings, delegate: processor)
+        busy = true
+        cancelRemaining = false
+        for index in mode.initialCaptureIndices {
+            submit(index, requests: requests, completion: completion)
         }
     }
+
+    func cancelRemainingCapture() { cancelRemaining = true }
+
+    private func submit(_ index: Int, requests: [AVCapturePhotoSettings],
+                        completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+        // Check again after the first Detail photo: the app may have backgrounded,
+        // or iOS may have reported pressure while its processing was in flight.
+        guard !cancelRemaining, session.isRunning, !session.isInterrupted,
+              ProcessInfo.processInfo.thermalState != .serious,
+              ProcessInfo.processInfo.thermalState != .critical,
+              inputs.allSatisfy({ ![.serious, .critical, .shutdown].contains($0.device.systemPressureState.level) }),
+              let connection = outputs[index].connection(with: .video), connection.isEnabled, connection.isActive else {
+            receive(.failure(Failure.overloaded), index: index, requests: requests, completion: completion)
+            return
+        }
+        let processor = PhotoCaptureProcessor { [weak self] result in
+            guard let self else { return }
+            self.queue.async {
+                self.processors[index] = nil
+                self.receive(result, index: index, requests: requests, completion: completion)
+            }
+        }
+        processors[index] = processor
+        outputs[index].capturePhoto(with: requests[index], delegate: processor)
+    }
+
+    private func receive(_ result: Result<CapturedPhoto, Error>, index: Int,
+                         requests: [AVCapturePhotoSettings],
+                         completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+        results[index] = result
+        if let next = mode.nextCaptureIndex(after: index) {
+            submit(next, requests: requests, completion: completion)
+            return
+        }
+        guard results.count == 2 else { return }
+        let successful = (0..<2).compactMap { index -> (Int, CapturedPhoto)? in
+            guard var photo = try? results[index]?.get() else { return nil }
+            photo.lensLabel = index == 0 ? "Main · 1×" : "Ultra Wide · 0.5×"
+            return (index, photo)
+        }
+        results.removeAll()
+        busy = false
+        guard var first = successful.first?.1 else {
+            completion(.failure(CameraFailure.noPhoto)); return
+        }
+        first.companions = successful.dropFirst().map { $0.1 }
+        first.warning = successful.count == 2 ? "Both photos saved" :
+            "Only \(successful[0].0 == 0 ? "Main" : "Ultra Wide") photo saved. The other camera did not capture a photo."
+        completion(.success(first))
+    }
+
 }
 
 
@@ -1157,11 +1202,19 @@ private final class ViewfinderAnalyzer: NSObject, AVCaptureVideoDataOutputSample
 
 /// Keep paired still captures within a strict per-sensor memory budget.
 enum DualCaptureLimits {
-    static func photoSize(in sizes: [CMVideoDimensions]) -> CMVideoDimensions? {
-        sizes.filter { $0.width > 0 && $0.height > 0 && Int64($0.width) * Int64($0.height) <= 12_500_000 }
+    static func photoSize(in sizes: [CMVideoDimensions], mode: DualShotMode = .fast) -> CMVideoDimensions? {
+        sizes.filter { $0.width > 0 && $0.height > 0 && Int64($0.width) * Int64($0.height) <= mode.pixelLimit }
             .max { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) }
     }
-    static func accepts(_ size: CMVideoDimensions, supported: [CMVideoDimensions]) -> Bool {
-        photoSize(in: [size]) != nil && supported.contains { $0.width == size.width && $0.height == size.height }
+    static func accepts(_ size: CMVideoDimensions, supported: [CMVideoDimensions], mode: DualShotMode = .fast) -> Bool {
+        photoSize(in: [size], mode: mode) != nil && supported.contains { $0.width == size.width && $0.height == size.height }
     }
+}
+
+/// Fast submits both requests together; Detail waits for didFinishCapture before the second.
+enum DualShotMode: String, CaseIterable {
+    case fast = "Fast", detail = "Detail"
+    var pixelLimit: Int64 { self == .fast ? 12_500_000 : 49_000_000 }
+    var initialCaptureIndices: [Int] { self == .fast ? [0, 1] : [0] }
+    func nextCaptureIndex(after index: Int) -> Int? { self == .detail && index == 0 ? 1 : nil }
 }
