@@ -77,6 +77,7 @@ final class CaptureSessionManager {
     private var movieProcessor: MovieCaptureProcessor?
     private var audioInput: AVCaptureDeviceInput?
     private var stopMovieWhenStarted = false
+    var onWarning: ((String) -> Void)?
     var onMovie: ((Result<URL, Error>) -> Void)?
     private var controls = CameraControls()
     private var meterTimer: DispatchSourceTimer?
@@ -489,7 +490,8 @@ final class CaptureSessionManager {
                 } else if let device = self.input?.device { try self.applyControls(to: device) }
                 if self.wantsRunning { self.activeSession.startRunning() }
                 self.snapshot.focusLocked = !enabled && !self.controls.automaticFocus
-                self.publish(message: reason)
+                self.publish()
+                if let reason { self.onWarning?(reason) }
             } catch {
                 self.disconnectPreviews()
                 self.dual.reset()
@@ -652,6 +654,10 @@ final class CaptureSessionManager {
             guard self.snapshot.videoMode, self.session.isRunning, !self.session.isInterrupted, self.movieProcessor == nil else {
                 self.onMovie?(.failure(CameraFailure.unavailable)); return
             }
+            if AVCaptureDevice.authorizationStatus(for: .audio) != .authorized, let audio = self.audioInput {
+                self.session.beginConfiguration(); self.session.removeInput(audio); self.session.commitConfiguration()
+                self.audioInput = nil
+            }
             if self.audioInput == nil && AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
                 do {
                     if let microphone = AVCaptureDevice.default(for: .audio) {
@@ -667,7 +673,7 @@ final class CaptureSessionManager {
             let processor = MovieCaptureProcessor(started: { [weak self] in
                 guard let self else { return }
                 self.queue.async {
-                    self.snapshot.audioRecording = self.movie.connection(with: .audio)?.isEnabled == true
+                    self.snapshot.audioRecording = self.movie.connection(with: .audio)?.isEnabled == true && AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
                     self.snapshot.recording = true
                     if self.stopMovieWhenStarted || !self.wantsRunning { self.movie.stopRecording() }
                     self.publish()
