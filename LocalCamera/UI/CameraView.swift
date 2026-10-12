@@ -16,12 +16,20 @@ struct CameraView: View {
     @State private var showsCaptureInfo = false
     @GestureState private var holdingPeek = false
     @State private var accessiblePeek = false
-    @State private var enlargedDualIndex: Int?
+    @AppStorage("camera.dualLayout") private var dualLayout = -1
+    @AppStorage("camera.dualCorner") private var dualCorner = 3
+    @AppStorage("camera.lastTool") private var lastTool = ""
+    @AppStorage("camera.showHelp") private var showHelp = false
+    @State private var showsRecent = false
+    private var enlargedDualIndex: Int? {
+        get { (0...1).contains(dualLayout) ? dualLayout : nil }
+        nonmutating set { dualLayout = newValue ?? -1 }
+    }
     private var isPeeking: Bool { holdingPeek || accessiblePeek }
     private var hasAdjustments: Bool {
         model.captureStyle != "Auto" || model.timerSeconds > 0 || model.burstEnabled ||
         model.camera.dualEnabled || model.camera.depthEnabled || model.camera.eyeFocusEnabled ||
-        model.camera.focusLocked || !model.controls.automaticExposure || !model.controls.automaticFocus ||
+        model.camera.focusLocked || model.camera.analysisMode != "Off" || !model.controls.automaticExposure || !model.controls.automaticFocus ||
         !model.controls.automaticWhiteBalance || abs(model.exposureBias) > 0.05
     }
 
@@ -45,19 +53,16 @@ struct CameraView: View {
                                     .frame(width: width, height: height)
                                     .clipShape(RoundedRectangle(cornerRadius: inset ? 12 : 0))
                                     .overlay { RoundedRectangle(cornerRadius: inset ? 12 : 0).strokeBorder(.white.opacity(inset ? 0.8 : 0), lineWidth: 2).allowsHitTesting(false) }
-                                    .offset(x: inset ? geometry.size.width - width - 8 : 0,
-                                            y: enlargedDualIndex == nil ? CGFloat(index) * (height + 4) : inset ? geometry.size.height - height - 8 : 0)
+                                    .offset(x: inset ? (dualCorner % 2 == 0 ? 8 : geometry.size.width - width - 8) : 0,
+                                            y: enlargedDualIndex == nil ? CGFloat(index) * (height + 4) : inset ? (dualCorner < 2 ? 8 : geometry.size.height - height - 8) : 0)
                                     .zIndex(inset ? 1 : 0)
                             }
                         }
                     }
                 } else {
-                    CameraPreview(engine: model.engine, onFocus: model.focus)
+                    CameraPreview(engine: model.engine, onFocus: model.focus, showsFocusFeedback: model.canConfigure, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !isPeeking, guideImage: isPeeking ? nil : model.guideImage)
                         .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
-                }
-                if showsGrid && model.camera.running && !isPeeking && !model.camera.dualEnabled {
-                    compositionGrid.ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true)
                 }
             }
 
@@ -72,10 +77,13 @@ struct CameraView: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if showsCaptureInfo || model.reviewingBurst {
+            if showsCaptureInfo || model.reviewingBurst || showsRecent {
                 GeometryReader { geometry in
                     Group {
-                        if model.reviewingBurst {
+                        if showsRecent, let recent = model.recent {
+                            RecentCaptureView(record: recent, close: { showsRecent = false })
+                                .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
+                        } else if model.reviewingBurst {
                             BurstReview(model: model)
                                 .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -95,6 +103,7 @@ struct CameraView: View {
         }
         .safeAreaInset(edge: .top, spacing: 0) { captureHUD.opacity(isPeeking ? 0 : 1).disabled(isPeeking).accessibilityHidden(isPeeking) }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls }
+        .onChange(of: toolPath) { _, path in lastTool = path.last?.rawValue ?? "" }
         .onChange(of: showsCaptureInfo) { _, _ in accessiblePeek = false }
         .onChange(of: model.reviewingBurst) { _, _ in accessiblePeek = false }
         .foregroundStyle(ink)
@@ -112,15 +121,17 @@ struct CameraView: View {
     }
 
     private func dualViewfinder(_ title: String, index: Int) -> some View {
-        CameraPreview(engine: model.engine, onFocus: { point, _ in
-            model.focusDual(at: point, index: index)
+        CameraPreview(engine: model.engine, onFocus: { point, locked in
+            model.focusDual(at: point, index: index, locked: locked)
         }, secondary: index == 1, showsFocusFeedback: model.canConfigure &&
-            model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index])
+            model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
+            focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
+            exposureOnly: model.exposurePointOnly)
         .background(.black)
         .overlay(alignment: .topLeading) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.caption.weight(.semibold))
-                Text(model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index] ? "Tap to focus" : "Tap focus unavailable")
+                Text(model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Tap focus unavailable")
                     .font(.caption2)
                 Button {
                     enlargedDualIndex = enlargedDualIndex == index ? nil : index
@@ -136,7 +147,9 @@ struct CameraView: View {
     }
 
     private func openTool(_ page: CameraToolPage? = nil) {
-        toolPath = page.map { [$0] } ?? []
+        let selected = page ?? CameraToolPage(rawValue: lastTool)
+        toolPath = selected.map { [$0] } ?? []
+        showsRecent = false
         showsCaptureInfo = true
     }
 
@@ -152,6 +165,13 @@ struct CameraView: View {
                 HStack(spacing: 8) { activeIndicators }
                 VStack(spacing: 6) { activeIndicators }
             }
+            if !model.histogram.isEmpty {
+                HistogramGuide(bins: model.histogram).frame(width: 128, height: 44)
+                    .padding(6).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityLabel("Live brightness histogram, darkest tones on the left")
+            }
+            if model.lowStorage { Text("Low storage · free space before a long recording").font(.caption).padding(8).background(overlayColor) }
+            if model.camera.cooling { Text("iPhone is warm · optional processing is reduced").font(.caption).padding(8).background(overlayColor) }
             if model.countdown > 0 {
                 Text("\(model.countdown)").font(.system(size: 64, weight: .bold, design: .rounded))
                     .foregroundStyle(.white).accessibilityLabel("Shutter in \(model.countdown) seconds")
@@ -176,6 +196,7 @@ struct CameraView: View {
         if model.timerSeconds > 0 { indicator("Timer \(model.timerSeconds)s", page: .timer) }
         if model.camera.focusLocked { indicator("Focus locked", page: .focus) }
         else if model.camera.eyeFocusEnabled { indicator("Eye focus", page: .focus) }
+        if model.camera.analysisMode != "Off" { indicator(model.camera.analysisMode, page: .guides) }
         if model.camera.depthEnabled { indicator("Depth", page: .focus) }
         if model.burstEnabled && model.captureStyle == "Auto" { indicator("3-shot burst", page: .shoot) }
         if model.camera.dualEnabled { indicator("Dual Shot", page: .shoot) }
@@ -183,7 +204,14 @@ struct CameraView: View {
         if abs(model.exposureBias) > 0.05 { indicator(String(format: "%+.1f EV", model.exposureBias), page: .exposure) }
         if !model.controls.automaticFocus { indicator("Manual focus", page: .manualFocus) }
         if !model.controls.automaticWhiteBalance { indicator("Manual color", page: .color) }
-        if model.camera.recording { Text("Recording").foregroundStyle(.red).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8)) }
+        if model.camera.recording, let started = model.recordingStarted {
+            HStack {
+                Image(systemName: "record.circle").foregroundStyle(.red)
+                Text(started, style: .timer).monospacedDigit()
+                Image(systemName: model.camera.audioRecording ? "mic.fill" : "mic.slash.fill")
+            }.font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityLabel(model.camera.audioRecording ? "Recording with sound" : "Recording without sound")
+        }
     }
 
     private func indicator(_ title: String, page: CameraToolPage) -> some View {
@@ -249,15 +277,16 @@ struct CameraView: View {
 
     private var captureControls: some View {
         VStack(spacing: 6) {
-            if !showsCaptureInfo && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled {
-                lensSelector
-            }
-            if showsCaptureInfo || model.reviewingBurst || hasAdjustments {
-                ViewThatFits(in: .horizontal) {
-                    HStack { overlayActions }
-                    VStack(spacing: 4) { overlayActions }
-                }
-            }
+            lensSelector
+                .opacity(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled ? 1 : 0)
+                .allowsHitTesting(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled)
+                .accessibilityHidden(showsCaptureInfo || showsRecent || model.reviewingBurst || model.selectedLens?.isFront != false || model.camera.dualEnabled)
+                .frame(height: 44)
+            HStack { overlayActions }
+                .frame(height: 44)
+                .opacity(showsCaptureInfo || showsRecent || model.reviewingBurst || hasAdjustments ? 1 : 0)
+                .allowsHitTesting(showsCaptureInfo || showsRecent || model.reviewingBurst || hasAdjustments)
+                .accessibilityHidden(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && !hasAdjustments)
             HStack(spacing: 12) {
                 ForEach(CaptureMode.allCases, id: \.self) { mode in
                     Button { model.selectMode(mode) } label: {
@@ -279,10 +308,8 @@ struct CameraView: View {
 
             HStack {
                 Button {
-                    guard let url = URL(string: "photos-redirect://") else { return }
-                    openURL(url) { accepted in
-                        if !accepted { model.message = "Photos could not be opened. Open the Photos app from your Home Screen to view your saved captures." }
-                    }
+                    if model.recent != nil { showsCaptureInfo = false; showsRecent = true }
+                    else { openPhotos() }
                 } label: {
                     VStack(spacing: 3) {
                         ZStack(alignment: .bottomTrailing) {
@@ -304,11 +331,11 @@ struct CameraView: View {
                         Text("Photos").font(.caption2)
                     }
                 }
-                .accessibilityLabel(model.lastSavedThumbnail == nil ? "Open Photos" : "Last saved photo. Open Photos")
+                .accessibilityLabel(model.lastSavedThumbnail == nil ? "Open Photos" : "Review last saved capture")
                 .disabled(!model.canConfigure)
                 .frame(maxWidth: .infinity)
 
-                Button { showsCaptureInfo = false; model.shutter() } label: {
+                Button { showsCaptureInfo = false; showsRecent = false; model.shutter() } label: {
                     ZStack {
                         Circle().fill(model.mode == .video ? Color.red : Color.white)
                         Circle().strokeBorder(Color.black.opacity(0.65), lineWidth: 2).padding(5)
@@ -346,7 +373,7 @@ struct CameraView: View {
     }
 
     @ViewBuilder private var overlayActions: some View {
-        if showsCaptureInfo || model.reviewingBurst {
+        if showsCaptureInfo || model.reviewingBurst || showsRecent {
             Label(isPeeking ? "Release to return" : "Peek at scene", systemImage: "eye")
                 .font(.callout.weight(.semibold))
                 .frame(maxWidth: .infinity, minHeight: 44)
@@ -372,13 +399,14 @@ struct CameraView: View {
     private var captureInfo: some View {
         VStack(spacing: 0) {
             HStack {
-                if !toolPath.isEmpty {
-                    Button { toolPath.removeLast() } label: {
-                        Image(systemName: "chevron.left").frame(width: 44, height: 44)
-                    }.accessibilityLabel("Back to camera tools")
-                }
+                Button { toolPath = [] } label: {
+                    Image(systemName: "square.grid.3x3").frame(width: 44, height: 44)
+                }.accessibilityLabel("All camera tools")
                 Text(toolPath.last?.rawValue ?? "Camera Tools").font(.headline)
                 Spacer()
+                Button { showHelp.toggle() } label: {
+                    Image(systemName: showHelp ? "info.circle.fill" : "info.circle").frame(width: 44, height: 44)
+                }.accessibilityLabel(showHelp ? "Hide tool explanations" : "Show tool explanations")
                 Button { showsCaptureInfo = false } label: {
                     Image(systemName: "xmark").frame(width: 44, height: 44)
                 }.accessibilityLabel("Close camera tools")
@@ -422,9 +450,25 @@ struct CameraView: View {
                     toolGrid([.exposure, .color, .manualFocus, .details])
                     Button("Reset to automatic", action: model.resetControls).buttonStyle(.bordered)
                 }
+            case .guides:
+                CompactToolLayout {
+                    Picker("Viewfinder guide", selection: Binding(get: { model.camera.analysisMode }, set: { model.engine.setAnalysis($0) })) {
+                        Text("Off").tag("Off"); Text("Peaking").tag("Peaking")
+                        Text("Highlights").tag("Highlights"); Text("Histogram").tag("Histogram")
+                    }.pickerStyle(.segmented).disabled(!model.canConfigure || model.camera.dualEnabled || model.mode == .video)
+                    Text(model.camera.dualEnabled || model.mode == .video ? "Guides need single-camera Photo mode. Switch to Photo and turn off Dual Shot." : "Peaking marks strong edges; highlights mark near-white preview areas. These are approximate guides, not a guarantee of focus or clipping in the saved photo.").font(.footnote)
+                    Text("One guide at a time. Eye focus turns off while guides are active. Guides pause when your iPhone is warm and never appear in saved photos.").font(.footnote)
+                }
             case .exposure, .color, .manualFocus:
                 CompactToolLayout {
-                    if model.camera.dualEnabled {
+                    if model.camera.dualEnabled && page == .exposure {
+                        ForEach(0..<2, id: \.self) { index in
+                            Text(index == 0 ? "Main brightness" : "Ultra Wide brightness")
+                            Slider(value: Binding(get: { model.dualBrightness[index] }, set: { model.setDualBrightness($0, index: index) }), in: -2...2, step: 0.1)
+                                .accessibilityLabel(index == 0 ? "Main brightness" : "Ultra Wide brightness")
+                            Text(String(format: "%+.1f EV", model.dualBrightness[index])).monospacedDigit()
+                        }
+                    } else if model.camera.dualEnabled {
                         Text("Manual controls use a single camera.")
                         Button("Switch to single Photo") { model.activate(.automatic) }.buttonStyle(.borderedProminent).foregroundStyle(.black)
                     } else {
@@ -446,7 +490,9 @@ struct CameraView: View {
     @ViewBuilder private func simpleToolPage(_ page: CameraToolPage) -> some View {
         switch page {
         case .shoot:
-            Text("Choose what you want to capture.").foregroundStyle(.secondary)
+            if showHelp {
+                Text("Dual Shot takes main and ultra-wide photos back-to-back; exposures are not guaranteed to be simultaneous. Resolution and low-light quality can be lower than single-camera capture.").font(.footnote)
+            }
             if model.camera.dualEnabled || model.mode == .video {
                 Text("Selecting a style switches to its compatible Photo setup.").font(.footnote)
             }
@@ -458,8 +504,11 @@ struct CameraView: View {
                 featureButton("Dual Shot", icon: "camera.on.rectangle", detail: "Main and ultra-wide photos from one press") { useTool(.dual) }
             }
         case .focus:
-            Text("Tap to focus. Hold to lock. No setup needed.").foregroundStyle(.secondary)
-            Button("Reset focus and exposure") { model.focus(at: CGPoint(x: 0.5, y: 0.5), locked: false) }.buttonStyle(.bordered)
+            Picker("Tap adjusts", selection: $model.exposurePointOnly) {
+                Text("Focus").tag(false); Text("Brightness").tag(true)
+            }.pickerStyle(.segmented)
+            if showHelp { Text("Focus and brightness use separate points. Hold to request a focus lock; the label confirms when the lens is locked, not whether your subject is sharp.").font(.footnote) }
+            Button("Unlock and reset focus / exposure") { model.resetControls() }.buttonStyle(.bordered)
             featureButton(model.camera.eyeFocusEnabled ? "Turn off eye focus" : "Eye focus", icon: "eye", detail: "Experimental. Follows an eye on the largest face in rear Photo mode.") {
                 if model.camera.eyeFocusEnabled { model.setEyeFocus(false) } else { useTool(.eye) }
             }
@@ -483,13 +532,29 @@ struct CameraView: View {
             Button("Apply video settings") { model.applyVideoSettings(); showsCaptureInfo = false }.buttonStyle(.borderedProminent).foregroundStyle(.black)
         case .preferences:
             Toggle("Composition grid", isOn: $showsGrid)
-            Text("Grid and your chosen rear lens are remembered. Timers and exposure locks reset; photos stay on your iPhone.").font(.callout).foregroundStyle(.secondary)
+            Toggle("Capture vibrations", isOn: $model.haptics)
+            Picker("Dual Shot inset", selection: $dualCorner) {
+                Text("Top left").tag(0); Text("Top right").tag(1)
+                Text("Bottom left").tag(2); Text("Bottom right").tag(3)
+            }
+            if showHelp { Text("Reset to Auto clears capture settings, timer, and locks. Your grid, vibrations, lens, and layout preferences stay unchanged.").font(.footnote) }
+            Button("Clear recent preview") { Task { await model.clearRecent() } }.buttonStyle(.bordered)
+            if showHelp { Text("Only the latest capture is cached here. Clearing it does not delete anything in Photos.").font(.footnote) }
+            Button("Viewfinder guides") { toolPath = [.guides] }.buttonStyle(.bordered)
             Button("Design Preview") { toolPath.append(.gallery) }.buttonStyle(.bordered)
             Button("Reset capture settings") { model.activate(.automatic); showsCaptureInfo = false }.buttonStyle(.bordered)
         case .details:
             LabeledContent("Mode", value: model.mode.rawValue)
             LabeledContent("Lens", value: model.selectedLens?.name ?? "Unavailable")
             LabeledContent("Resolution", value: model.mode == .photo ? model.camera.resolution : model.camera.videoLabel)
+            if let recent = model.recent, !recent.photos.isEmpty {
+                ForEach(recent.photos.indices, id: \.self) { index in
+                    let photo = recent.photos[index]
+                    LabeledContent("Last \(photo.label)", value: "\(photo.width) × \(photo.height)")
+                }
+            }
+            if let latency = model.readyMilliseconds { LabeledContent("Camera ready", value: "\(latency) ms after opening") }
+            Text("Readiness is measured locally; shutter response still needs a device test.").font(.caption)
             LabeledContent("Exposure", value: model.camera.exposureLabel)
             LabeledContent("Focus", value: model.camera.focusLabel)
         default: EmptyView()
@@ -502,13 +567,20 @@ struct CameraView: View {
                 Image(systemName: icon).font(.title2).frame(width: 30)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title).font(.headline)
-                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    if showHelp { Text(detail).font(.caption).foregroundStyle(.secondary) }
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right").font(.caption)
             }.padding(8).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
-        }.buttonStyle(.plain).disabled(!model.canConfigure)
+        }.buttonStyle(.plain).disabled(!model.canConfigure).accessibilityHint(detail)
+    }
+
+    private func openPhotos() {
+        guard let url = URL(string: "photos-redirect://") else { return }
+        openURL(url) { accepted in
+            if !accepted { model.message = "Open Photos from your Home Screen to see your library." }
+        }
     }
 
     private func openSettings() {
@@ -517,11 +589,13 @@ struct CameraView: View {
 }
 
 private enum CameraToolPage: String, Hashable {
+    case guides = "Viewfinder guides"
     case shoot = "Capture", focus = "Focus & depth", timer = "Timer", video = "Video quality"
     case rescue = "Photo Rescue", advanced = "Advanced", preferences = "Preferences"
     case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Info", gallery = "Design Preview"
     var icon: String {
         switch self {
+        case .guides: return "waveform.path"
         case .shoot: return "camera"
         case .focus, .manualFocus: return "viewfinder"
         case .timer: return "timer"
@@ -566,6 +640,10 @@ private struct PhotoRescueView: View {
                     .resizable().scaledToFit().frame(maxWidth: .infinity).frame(height: 240)
                     .accessibilityLabel(showsOriginal ? "Original photo" : "Adjusted preview")
                 Toggle("Show original", isOn: $showsOriginal)
+                Picker("Look", selection: $model.look) {
+                    ForEach(PhotoLook.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }.pickerStyle(.segmented).disabled(model.busy)
+                    .onChange(of: model.look) { _, _ in Task { await model.apply() } }
                 HStack {
                     Text("Strength")
                     Slider(value: $model.strength, in: 0...1, step: 0.1, onEditingChanged: { editing in
@@ -832,5 +910,116 @@ private struct CameraDesignDetail: View {
         .padding(.top, 12)
         .navigationTitle(CameraDesignScreen.all[selection].title)
         .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+
+private struct RecentCaptureView: View {
+    let record: CaptureStore.Record
+    let close: () -> Void
+    @Environment(\.openURL) private var openURL
+    @State private var selection = 0
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text(record.isVideo ? "Last video" : record.photos.count > 1 ? "Paired photos" : "Last photo").font(.headline)
+                Spacer()
+                Button(action: close) { Image(systemName: "xmark").frame(width: 44, height: 44) }
+                    .accessibilityLabel("Close recent capture")
+            }
+            if record.isVideo, let data = record.thumbnail, let image = UIImage(data: data) {
+                Image(uiImage: image).resizable().scaledToFit()
+                Text("Video saved in Photos").font(.caption)
+            } else if record.photos.indices.contains(selection) {
+                ZoomableCapture(data: record.photos[selection].data).id(selection)
+                let photo = record.photos[selection]
+                Text("\(photo.label) · \(photo.width) × \(photo.height)").font(.caption)
+                if record.photos.count > 1 {
+                    HStack {
+                        ForEach(record.photos.indices, id: \.self) { index in
+                            Button(record.photos[index].label) { selection = index }
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                                .background(selection == index ? Color.yellow.opacity(0.3) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                                .accessibilityAddTraits(selection == index ? .isSelected : [])
+                        }
+                    }
+                }
+                Text("Pinch or double-tap to inspect. Preview is reduced to protect memory.").font(.caption)
+            } else { Text("Open Photos to review this video.") }
+            Button("Open Photos") {
+                if let url = URL(string: "photos-redirect://") { openURL(url) }
+            }.frame(minHeight: 44)
+        }.padding(12)
+    }
+}
+
+private struct ZoomableCapture: UIViewRepresentable {
+    let data: Data
+    final class Coordinator: NSObject, UIScrollViewDelegate {
+        let imageView = UIImageView()
+        weak var scrollView: UIScrollView?
+        @objc func zoomIn(_ action: UIAccessibilityCustomAction) -> Bool {
+            guard let scrollView else { return false }
+            scrollView.setZoomScale(min(5, scrollView.zoomScale + 1), animated: !UIAccessibility.isReduceMotionEnabled)
+            return true
+        }
+        @objc func zoomOut(_ action: UIAccessibilityCustomAction) -> Bool {
+            scrollView?.setZoomScale(1, animated: !UIAccessibility.isReduceMotionEnabled)
+            return true
+        }
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? { imageView }
+        @objc func doubleTap(_ gesture: UITapGestureRecognizer) {
+            guard let scroll = imageView.superview as? UIScrollView else { return }
+            scroll.setZoomScale(scroll.zoomScale > 1 ? 1 : 3, animated: !UIAccessibility.isReduceMotionEnabled)
+        }
+    }
+    final class ZoomView: UIScrollView {
+        weak var picture: UIImageView?
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            if zoomScale == 1 { picture?.frame = bounds; contentSize = bounds.size }
+        }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeUIView(context: Context) -> ZoomView {
+        let view = ZoomView()
+        view.minimumZoomScale = 1; view.maximumZoomScale = 5
+        view.delegate = context.coordinator
+        context.coordinator.scrollView = view
+        let image = context.coordinator.imageView
+        if let source = CGImageSourceCreateWithData(data as CFData, nil),
+           let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 3000
+           ] as CFDictionary) { image.image = UIImage(cgImage: cg) }
+        image.contentMode = .scaleAspectFit
+        image.isUserInteractionEnabled = true
+        image.isAccessibilityElement = true
+        image.accessibilityLabel = "Saved photo"
+        image.accessibilityCustomActions = [
+            UIAccessibilityCustomAction(name: "Zoom in", target: context.coordinator, selector: #selector(Coordinator.zoomIn(_:))),
+            UIAccessibilityCustomAction(name: "Fit photo", target: context.coordinator, selector: #selector(Coordinator.zoomOut(_:)))
+        ]
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTap(_:)))
+        tap.numberOfTapsRequired = 2; image.addGestureRecognizer(tap)
+        view.addSubview(image); view.picture = image
+        return view
+    }
+    func updateUIView(_ uiView: ZoomView, context: Context) {}
+}
+
+private struct HistogramGuide: View {
+    let bins: [Double]
+    var body: some View {
+        GeometryReader { geometry in
+            Path { path in
+                let width = geometry.size.width / CGFloat(max(1, bins.count))
+                for (index, value) in bins.enumerated() {
+                    let height = geometry.size.height * value
+                    path.addRect(CGRect(x: CGFloat(index) * width, y: geometry.size.height - height, width: max(1, width - 1), height: height))
+                }
+            }.fill(.white.opacity(0.8))
+        }.allowsHitTesting(false)
     }
 }
