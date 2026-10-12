@@ -11,19 +11,21 @@ struct RescuedPhoto {
     let after: UIImage
 }
 
+enum PhotoLook: String, CaseIterable { case natural = "Natural", warm = "Warm", mono = "Mono" }
+
 enum PhotoRescueProcessor {
     private static let queue = DispatchQueue(label: "CameraXT.photoRescue", qos: .userInitiated)
-    static func process(_ data: Data, strength: Double) async throws -> RescuedPhoto {
+    static func process(_ data: Data, strength: Double, look: PhotoLook = .natural) async throws -> RescuedPhoto {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 let result: Result<RescuedPhoto, Error> = Result {
-                    try autoreleasepool { try render(data, strength: strength) }
+                    try autoreleasepool { try render(data, strength: strength, look: look) }
                 }
                 continuation.resume(with: result)
             }
         }
     }
-    private static func render(_ data: Data, strength: Double) throws -> RescuedPhoto {
+    private static func render(_ data: Data, strength: Double, look: PhotoLook) throws -> RescuedPhoto {
         guard data.count <= 100_000_000,
               let source = CGImageSourceCreateWithData(data as CFData, nil),
               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [
@@ -45,6 +47,11 @@ enum PhotoRescueProcessor {
             adjusted = filter.outputImage ?? adjusted
         }
         adjusted = adjusted.applyingFilter("CINoiseReduction", parameters: ["inputNoiseLevel": 0.015, "inputSharpness": 0.2])
+        if look == .warm {
+            adjusted = adjusted.applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 7000, y: 0)])
+        } else if look == .mono {
+            adjusted = adjusted.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0])
+        }
         let blended = original.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: adjusted, kCIInputTimeKey: amount]).cropped(to: bounds)
         let context = CIContext(options: [.cacheIntermediates: false])
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -68,6 +75,7 @@ struct CapturedPhoto {
     let dimensions: CMVideoDimensions
     var companions: [CapturedPhoto] = []
     var warning: String?
+    var lensLabel: String?
 }
 
 /// Compares a small burst on-device. Originals remain available for the user's choice.
@@ -75,6 +83,7 @@ enum PhotoRanker {
     private static let queue = DispatchQueue(label: "CameraXT.photoRanking", qos: .userInitiated)
     static func recommend(_ photos: [CapturedPhoto], completion: @escaping (Int) -> Void) {
         queue.async {
+            if ProcessInfo.processInfo.thermalState == .serious || ProcessInfo.processInfo.thermalState == .critical { completion(0); return }
             let context = CIContext(options: [.cacheIntermediates: false])
             var bestIndex = 0
             var bestScore = -Double.infinity
