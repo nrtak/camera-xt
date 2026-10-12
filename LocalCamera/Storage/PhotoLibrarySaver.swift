@@ -45,12 +45,14 @@ actor CaptureStore {
         let width: Int32
         let height: Int32
         let label: String
+        let details: CaptureDetails?
         init(_ photo: CapturedPhoto, index: Int) {
             data = photo.data; width = photo.dimensions.width; height = photo.dimensions.height
+            details = photo.details
             label = photo.lensLabel ?? "Photo \(index + 1)"
         }
         var captured: CapturedPhoto {
-            CapturedPhoto(data: data, dimensions: CMVideoDimensions(width: width, height: height), lensLabel: label)
+            CapturedPhoto(data: data, dimensions: CMVideoDimensions(width: width, height: height), lensLabel: label, details: details)
         }
     }
     struct Record: Codable {
