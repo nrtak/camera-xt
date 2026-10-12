@@ -57,6 +57,45 @@ enum CaptureMode: String, CaseIterable { case photo = "Photo", video = "Video" }
 enum QuickCaptureTool: Equatable { case action, night, dual, depth, eye, burst, automatic }
 
 @MainActor
+final class ViewfinderGuideState: ObservableObject {
+    @Published var image: UIImage?
+    @Published var histogram: [Double] = []
+}
+
+// Serial decoding bounds concurrent image memory and keeps ImageIO off the UI thread.
+enum CapturePreviewDecoder {
+    private static let queue = DispatchQueue(label: "camera.preview.decode", qos: .userInitiated)
+
+    static func image(_ data: Data, maxSize: Int) async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                let image: UIImage? = autoreleasepool {
+                    guard let source = CGImageSourceCreateWithData(data as CFData,
+                            [kCGImageSourceShouldCache: false] as CFDictionary),
+                          let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                            kCGImageSourceCreateThumbnailFromImageAlways: true,
+                            kCGImageSourceCreateThumbnailWithTransform: true,
+                            kCGImageSourceShouldCacheImmediately: true,
+                            kCGImageSourceThumbnailMaxPixelSize: maxSize
+                          ] as CFDictionary) else { return nil }
+                    return UIImage(cgImage: cg)
+                }
+                continuation.resume(returning: image)
+            }
+        }
+    }
+
+    static func thumbnail(_ data: Data) async -> Data? {
+        guard let image = await image(data, maxSize: 256) else { return nil }
+        return await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: autoreleasepool { image.jpegData(compressionQuality: 0.85) })
+            }
+        }
+    }
+}
+
+@MainActor
 final class CameraViewModel: ObservableObject {
     @Published private(set) var camera = CameraSnapshot()
     @Published private(set) var permission = AVCaptureDevice.authorizationStatus(for: .video)
@@ -70,8 +109,7 @@ final class CameraViewModel: ObservableObject {
     @Published var haptics = UserDefaults.standard.bool(forKey: "camera.haptics") {
         didSet { UserDefaults.standard.set(haptics, forKey: "camera.haptics") }
     }
-    @Published private(set) var guideImage: UIImage?
-    @Published private(set) var histogram: [Double] = []
+    let guides = ViewfinderGuideState()
     @Published var exposurePointOnly = false
     @Published var dualBrightness: [Float] = [0, 0]
     private let store = CaptureStore()
@@ -330,19 +368,22 @@ final class CameraViewModel: ObservableObject {
         self.saver = saver
         engine.onWarning = { [weak self] warning in Task { @MainActor [weak self] in self?.message = warning } }
         engine.onAnalysis = { [weak self] image, bins in
-            Task { @MainActor [weak self] in self?.guideImage = image; self?.histogram = bins }
+            Task { @MainActor [weak self] in self?.guides.image = image; self?.guides.histogram = bins }
         }
         Task { await restoreCaptures() }
         engine.onMeter = { [weak self] meter in
             Task { @MainActor [weak self] in
-                self?.camera.exposureLabel = meter.exposureLabel
-                self?.camera.focusLabel = meter.focusLabel
-                self?.camera.currentISO = meter.currentISO
-                self?.camera.currentShutter = meter.currentShutter
-                self?.camera.focusLocked = meter.focusLocked
-                self?.camera.focusStates = meter.focusStates
-                self?.camera.cooling = meter.cooling
-                if let self, self.resetOnReturn, self.active, self.canConfigure {
+                guard let self else { return }
+                var updated = self.camera
+                updated.exposureLabel = meter.exposureLabel
+                updated.focusLabel = meter.focusLabel
+                updated.currentISO = meter.currentISO
+                updated.currentShutter = meter.currentShutter
+                updated.focusLocked = meter.focusLocked
+                updated.focusStates = meter.focusStates
+                updated.cooling = meter.cooling
+                self.camera = updated
+                if self.resetOnReturn, self.active, self.canConfigure {
                     self.resetOnReturn = false
                     self.resetTemporarySettings()
                 }
@@ -428,13 +469,7 @@ final class CameraViewModel: ObservableObject {
         if value {
             storageTask = Task { [weak self] in
                 while !Task.isCancelled {
-                    guard let self else { return }
-                    let bytes = await self.store.availableBytes()
-                    self.lowStorage = bytes.map { $0 < 500_000_000 } ?? false
-                    if self.lowStorage && self.camera.recording && (bytes ?? .max) < 150_000_000 {
-                        self.engine.stopRecording()
-                        self.message = "Recording stopped to protect the remaining storage."
-                    }
+                    await self?.refreshStorage()
                     do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
                 }
             }
@@ -448,6 +483,16 @@ final class CameraViewModel: ObservableObject {
         }
         permission = AVCaptureDevice.authorizationStatus(for: .video)
         if active && permission == .authorized && !editingPhoto { engine.start() } else { engine.stop() }
+    }
+
+    private func refreshStorage() async {
+        let bytes = await store.availableBytes()
+        guard active, !Task.isCancelled else { return }
+        lowStorage = bytes.map { $0 < 500_000_000 } ?? false
+        if lowStorage && camera.recording && (bytes ?? .max) < 150_000_000 {
+            engine.stopRecording()
+            message = "Recording stopped to protect the remaining storage."
+        }
     }
 
     func requestCamera() async {
@@ -499,7 +544,11 @@ final class CameraViewModel: ObservableObject {
                         Task { @MainActor [weak self] in
                             guard let self else { return }
                             self.burstPhotos = photos
-                            self.burstPreviews = photos.map { Self.preview($0.data) }
+                            var previews: [UIImage] = []
+                            for photo in photos {
+                                previews.append(await CapturePreviewDecoder.image(photo.data, maxSize: 1200) ?? UIImage())
+                            }
+                            self.burstPreviews = previews
                             self.selectedBurstIndex = max(0, index)
                             self.recommendedBurstIndex = index
                             self.busy = false
@@ -526,16 +575,6 @@ final class CameraViewModel: ObservableObject {
                 }
             }
         }
-    }
-
-    private static func preview(_ data: Data, maxSize: Int = 1600) -> UIImage {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: maxSize
-              ] as CFDictionary) else { return UIImage() }
-        return UIImage(cgImage: image)
     }
 
     func saveBurst(all: Bool) async {
@@ -585,7 +624,7 @@ final class CameraViewModel: ObservableObject {
                 try await saver.saveVideo(video)
                 savedMessage = "Video saved"
             } else if let photo = pendingPhoto {
-                thumbnail = Self.preview(photo.data, maxSize: 256).jpegData(compressionQuality: 0.85)
+                thumbnail = await CapturePreviewDecoder.thumbnail(photo.data)
                 try await saver.save(photo)
                 savedMessage = photo.warning ?? (photo.companions.isEmpty ? "Saved" : "Saved \(1 + photo.companions.count) photos")
             } else { return }
@@ -593,7 +632,7 @@ final class CameraViewModel: ObservableObject {
             pendingPhoto = nil; pendingVideo = nil
             do {
                 recent = try await store.finish(thumbnail: thumbnail)
-                updateRecentThumbnail()
+                await updateRecentThumbnail()
                 message = savedMessage
             } catch {
                 message = "Saved to Photos, but local history could not be updated."
@@ -609,7 +648,7 @@ final class CameraViewModel: ObservableObject {
     private func restoreCaptures() async {
         defer { restoring = false }
         recent = try? await store.load("recent.plist")
-        updateRecentThumbnail()
+        await updateRecentThumbnail()
         do {
             recoveryReadFailed = false
             if let record = try await store.load("pending.plist") {
@@ -624,12 +663,16 @@ final class CameraViewModel: ObservableObject {
         } catch { recoveryReadFailed = true; message = "Capture recovery could not be read. Keep this app installed and free storage before trying again." }
     }
 
-    private func updateRecentThumbnail() {
-        lastSavedThumbnail = recent?.thumbnail.flatMap { UIImage(data: $0) }
-        if lastSavedThumbnail == nil, let data = recent?.photos.first?.data {
-            lastSavedThumbnail = Self.preview(data, maxSize: 256)
+    private func updateRecentThumbnail() async {
+        guard let record = recent else {
+            lastSavedThumbnail = nil; lastSavedPhotoCount = 0
+            return
         }
-        lastSavedPhotoCount = recent?.photos.count ?? 0
+        let data = record.thumbnail ?? record.photos.first?.data
+        let image = if let data { await CapturePreviewDecoder.image(data, maxSize: 256) } else { nil as UIImage? }
+        guard recent?.date == record.date else { return }
+        lastSavedThumbnail = image
+        lastSavedPhotoCount = record.photos.count
     }
 
     func clearRecent() async {
