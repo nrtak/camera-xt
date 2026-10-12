@@ -108,6 +108,7 @@ struct CameraPreview: UIViewRepresentable {
 /// Reject transient invalid camera geometry before assigning CALayer/UIView frames.
 enum PreviewGeometry {
     static func isValid(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite && !rect.isEmpty &&
         rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite &&
         rect.width > 0 && rect.height > 0
     }
