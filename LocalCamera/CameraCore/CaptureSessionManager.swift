@@ -774,6 +774,10 @@ final class CaptureSessionManager {
         focusRequests[device.uniqueID] = nil
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
+        if automatic {
+            if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5) }
+            if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5) }
+        }
         if device.isFocusModeSupported(.continuousAutoFocus) {
             device.automaticallyAdjustsFaceDrivenAutoFocusEnabled = false
             device.isFaceDrivenAutoFocusEnabled = controls.facePriority && !snapshot.eyeFocusEnabled
@@ -946,9 +950,10 @@ private final class MovieCaptureProcessor: NSObject, AVCaptureFileOutputRecordin
 /// Owns only the paired still-photo pipeline. All access uses the parent's session queue.
 private final class DualPhotoCamera {
     enum Failure: LocalizedError {
-        case unsupported, overloaded
+        case unsupported, overloaded, focusUnsettled
         var errorDescription: String? {
             switch self {
+            case .focusUnsettled: return "Focus is still adjusting. Tap your subject, move back if close, then try again."
             case .unsupported: return "Main + Ultra Wide capture is unavailable on this camera configuration. Single photo is ready."
             case .overloaded: return "Dual Shot needs more camera resources than are currently available. Use Single Photo or let the iPhone cool before retrying."
             }
@@ -989,7 +994,8 @@ private final class DualPhotoCamera {
             // Keep the sensor's preview workload modest while preserving native still dimensions.
             let formats = device.formats.filter {
                 let size = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
-                return $0.isMultiCamSupported && size.width <= 1920 && size.height <= 1440 &&
+                return $0.isMultiCamSupported &&
+                    (device.deviceType != .builtInWideAngleCamera || $0.autoFocusSystem != .none) && size.width <= 1920 && size.height <= 1440 &&
                     DualCaptureLimits.photoSize(in: $0.supportedMaxPhotoDimensions, mode: mode) != nil && $0.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }
             }
             guard let format = formats.max(by: {
@@ -1089,7 +1095,8 @@ private final class DualPhotoCamera {
     func cancelRemainingCapture() { cancelRemaining = true }
 
     private func submit(_ index: Int, requests: [AVCapturePhotoSettings],
-                        completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+                        completion: @escaping (Result<CapturedPhoto, Error>) -> Void,
+                        focusWindow: FocusSettlingWindow? = nil) {
         // Check again after the first Detail photo: the app may have backgrounded,
         // or iOS may have reported pressure while its processing was in flight.
         guard !cancelRemaining, session.isRunning, !session.isInterrupted,
@@ -1099,6 +1106,21 @@ private final class DualPhotoCamera {
               let connection = outputs[index].connection(with: .video), connection.isEnabled, connection.isActive else {
             receive(.failure(Failure.overloaded), index: index, requests: requests, completion: completion)
             return
+        }
+        if mode == .detail {
+            let now = ProcessInfo.processInfo.systemUptime
+            var window = focusWindow ?? FocusSettlingWindow(startedAt: now)
+            switch window.update(adjusting: inputs[index].device.isAdjustingFocus, now: now) {
+            case .wait:
+                queue.asyncAfter(deadline: .now() + 0.05) { [weak self, window] in
+                    self?.submit(index, requests: requests, completion: completion, focusWindow: window)
+                }
+                return
+            case .timedOut:
+                receive(.failure(Failure.focusUnsettled), index: index, requests: requests, completion: completion)
+                return
+            case .ready: break
+            }
         }
         let processor = PhotoCaptureProcessor { [weak self] result in
             guard let self else { return }
@@ -1125,14 +1147,18 @@ private final class DualPhotoCamera {
             photo.lensLabel = index == 0 ? "Main · 1×" : "Ultra Wide · 0.5×"
             return (index, photo)
         }
+        let failure = results.values.compactMap { result -> Error? in
+            if case .failure(let error) = result { return error }
+            return nil
+        }.first
         results.removeAll()
         busy = false
         guard var first = successful.first?.1 else {
-            completion(.failure(CameraFailure.noPhoto)); return
+            completion(.failure(failure ?? CameraFailure.noPhoto)); return
         }
         first.companions = successful.dropFirst().map { $0.1 }
         first.warning = successful.count == 2 ? "Both photos saved" :
-            "Only \(successful[0].0 == 0 ? "Main" : "Ultra Wide") photo saved. The other camera did not capture a photo."
+            "Only \(successful[0].0 == 0 ? "Main" : "Ultra Wide") photo saved. \(failure?.localizedDescription ?? "The other camera did not capture a photo.")"
         completion(.success(first))
     }
 
@@ -1217,4 +1243,19 @@ enum DualShotMode: String, CaseIterable {
     var pixelLimit: Int64 { self == .fast ? 12_500_000 : 49_000_000 }
     var initialCaptureIndices: [Int] { self == .fast ? [0, 1] : [0] }
     func nextCaptureIndex(after index: Int) -> Int? { self == .detail && index == 0 ? 1 : nil }
+}
+
+/// Requires a short uninterrupted idle period; never stalls the capture queue.
+struct FocusSettlingWindow {
+    enum Decision: Equatable { case wait, ready, timedOut }
+    let startedAt: TimeInterval
+    private var idleSince: TimeInterval?
+    init(startedAt: TimeInterval) { self.startedAt = startedAt }
+    mutating func update(adjusting: Bool, now: TimeInterval) -> Decision {
+        if adjusting { idleSince = nil }
+        else if idleSince == nil { idleSince = now }
+        if let idleSince, now - idleSince >= 0.1 { return .ready }
+        if now - startedAt >= 1 { return .timedOut }
+        return .wait
+    }
 }
