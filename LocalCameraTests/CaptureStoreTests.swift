@@ -103,4 +103,27 @@ final class CaptureStoreTests: XCTestCase {
         let invalid = await CapturePreviewDecoder.image(Data([0]), maxSize: 200)
         XCTAssertNil(invalid)
     }
+    func testDualCaptureRejectsOversizedOnlyFormats() {
+        let huge = CMVideoDimensions(width: 8064, height: 6048)
+        XCTAssertNil(DualCaptureLimits.photoSize(in: [huge]))
+        XCTAssertFalse(DualCaptureLimits.accepts(huge, supported: [huge]))
+    }
+    func testDualCaptureRequiresExactSupportedDimensions() {
+        let small = CMVideoDimensions(width: 1920, height: 1080)
+        let native = CMVideoDimensions(width: 4032, height: 3024)
+        let huge = CMVideoDimensions(width: 8064, height: 6048)
+        XCTAssertEqual(DualCaptureLimits.photoSize(in: [huge, small, native])?.width, 4032)
+        XCTAssertTrue(DualCaptureLimits.accepts(native, supported: [small, native]))
+        XCTAssertFalse(DualCaptureLimits.accepts(native, supported: [small]))
+        XCTAssertNil(DualCaptureLimits.photoSize(in: [CMVideoDimensions(width: 0, height: 3024)]))
+    }
+    func testPreviewRejectsInvalidTransitionGeometry() {
+        XCTAssertFalse(PreviewGeometry.isValid(.null))
+        XCTAssertFalse(PreviewGeometry.isValid(.infinite))
+        XCTAssertFalse(PreviewGeometry.isValid(.zero))
+        XCTAssertFalse(PreviewGeometry.isValid(CGRect(x: CGFloat.nan, y: 0, width: 100, height: 100)))
+        XCTAssertFalse(PreviewGeometry.isValid(CGRect(x: 0, y: 0, width: CGFloat.infinity, height: 100)))
+        XCTAssertTrue(PreviewGeometry.isValid(CGRect(x: 0, y: 20, width: 390, height: 520)))
+    }
+
 }
