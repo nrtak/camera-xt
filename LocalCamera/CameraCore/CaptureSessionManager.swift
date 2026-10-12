@@ -78,6 +78,7 @@ final class CaptureSessionManager {
     private var movieProcessor: MovieCaptureProcessor?
     private var audioInput: AVCaptureDeviceInput?
     private var stopMovieWhenStarted = false
+    var onCaptureProgress: ((String) -> Void)?
     var onWarning: ((String) -> Void)?
     var onMovie: ((Result<URL, Error>) -> Void)?
     private var controls = CameraControls()
@@ -260,6 +261,7 @@ final class CaptureSessionManager {
     func capture(speed: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         queue.async {
             if self.snapshot.dualEnabled {
+                self.dual.onProgress = self.onCaptureProgress
                 self.dual.capture { [weak self] result in
                     if let self, self.pendingMemoryFallback {
                         self.pendingMemoryFallback = false
@@ -280,11 +282,16 @@ final class CaptureSessionManager {
             settings.isDepthDataDeliveryEnabled = self.snapshot.depthEnabled && self.output.isDepthDataDeliveryEnabled
             settings.embedsDepthDataInPhoto = settings.isDepthDataDeliveryEnabled
             if self.input?.device.isFlashAvailable == true && self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
+            let lensLabel = self.snapshot.lenses.first(where: { $0.id == self.snapshot.selectedID })?.name ?? "Camera"
             let processor = PhotoCaptureProcessor(expectsDepth: settings.isDepthDataDeliveryEnabled) { [weak self] result in
                 guard let self = self else { return }
                 self.queue.async {
                     self.processor = nil
-                    completion(result)
+                    completion(result.map { original in
+                        var photo = original
+                        photo.lensLabel = lensLabel
+                        return photo
+                    })
                 }
             }
             self.processor = processor
@@ -816,6 +823,12 @@ final class CaptureSessionManager {
         timer.setEventHandler { [weak self] in
             guard let self, self.activeSession.isRunning else { return }
             self.updateMeter()
+            if self.snapshot.cooling && (self.snapshot.analysisMode != "Off" || self.snapshot.eyeFocusEnabled) {
+                self.disableAnalysis()
+                self.disableEyeFocus()
+                self.publish()
+                self.onWarning?("Camera is warm · optional guides and eye tracking paused.")
+            }
             if self.snapshot.dualEnabled, !self.dual.busy,
                self.snapshot.cooling || self.dual.inputs.contains(where: { [.serious, .critical, .shutdown].contains($0.device.systemPressureState.level) }) {
                 self.setDualEnabled(false, reason: "Dual Shot paused to cool the camera. Single-camera Photo is ready.")
@@ -968,6 +981,7 @@ private final class DualPhotoCamera {
     private var results: [Int: Result<CapturedPhoto, Error>] = [:]
     private(set) var busy = false
     private var mode: DualShotMode = .fast
+    var onProgress: ((String) -> Void)?
     private var cancelRemaining = false
     private(set) var resolution = "—"
 
@@ -1032,7 +1046,7 @@ private final class DualPhotoCamera {
             guard device.activeFormat.isMultiCamSupported,
                   let size = DualCaptureLimits.photoSize(in: device.activeFormat.supportedMaxPhotoDimensions, mode: mode) else { throw Failure.unsupported }
             output.maxPhotoDimensions = size
-            labels.append("\(size.width) × \(size.height)")
+            labels.append(String(format: "%.1f MP", Double(size.width) * Double(size.height) / 1_000_000))
         }
         resolution = labels.joined(separator: " + ")
     }
@@ -1087,6 +1101,7 @@ private final class DualPhotoCamera {
         results.removeAll()
         busy = true
         cancelRemaining = false
+        onProgress?(mode == .detail ? "Hold still · focusing photo 1 of 2" : "Capturing both views…")
         for index in mode.initialCaptureIndices {
             submit(index, requests: requests, completion: completion)
         }
@@ -1130,6 +1145,7 @@ private final class DualPhotoCamera {
             }
         }
         processors[index] = processor
+        if mode == .detail { onProgress?("Hold still · photo \(index + 1) of 2") }
         outputs[index].capturePhoto(with: requests[index], delegate: processor)
     }
 
@@ -1138,6 +1154,7 @@ private final class DualPhotoCamera {
                          completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         results[index] = result
         if let next = mode.nextCaptureIndex(after: index) {
+            onProgress?("Hold still · focusing photo 2 of 2")
             submit(next, requests: requests, completion: completion)
             return
         }
