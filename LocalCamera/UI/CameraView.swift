@@ -90,7 +90,7 @@ struct CameraView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                         } else { captureInfo }
                     }
-                        .frame(height: geometry.size.height * 0.82)
+                        .frame(height: min(geometry.size.height * 0.82, toolPanelHeight))
                         .contentShape(Rectangle())
                         .background { Rectangle().fill(Color.clear).contentShape(Rectangle()).onTapGesture {} }
                         .opacity(isPeeking ? 0 : 1)
@@ -161,7 +161,7 @@ struct CameraView: View {
     private var captureHUD: some View {
         VStack(spacing: 8) {
             Button { openTool(.details) } label: {
-                Text("\(model.mode.rawValue) | \(model.camera.dualEnabled ? "Dual Shot" : model.selectedLens?.name ?? "Camera")")
+                Text("\(model.mode.rawValue) | \(model.camera.dualEnabled ? "Dual · \(model.camera.dualMode.rawValue)" : model.selectedLens?.name ?? "Camera")")
                     .font(.subheadline.weight(.semibold)).padding(12)
                     .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
             }
@@ -200,7 +200,7 @@ struct CameraView: View {
         if model.camera.analysisMode != "Off" { indicator(model.camera.analysisMode, page: .guides) }
         if model.camera.depthEnabled { indicator("Depth", page: .focus) }
         if model.burstEnabled && model.captureStyle == "Auto" { indicator("3-shot burst", page: .shoot) }
-        if model.camera.dualEnabled { indicator("Dual Shot", page: .shoot) }
+        if model.camera.dualEnabled { indicator("Dual · \(model.camera.dualMode.rawValue)", page: .shoot) }
         if !model.controls.automaticExposure && model.captureStyle == "Auto" { indicator("Manual exposure", page: .exposure) }
         if abs(model.exposureBias) > 0.05 { indicator(String(format: "%+.1f EV", model.exposureBias), page: .exposure) }
         if !model.controls.automaticFocus { indicator("Manual focus", page: .manualFocus) }
@@ -394,12 +394,28 @@ struct CameraView: View {
         Button("Discard", role: .destructive) { confirmDiscard = true }
     }
 
+    private var toolPanelHeight: CGFloat {
+        if showsRecent || model.reviewingBurst { return .infinity }
+        let base: CGFloat
+        switch toolPath.last {
+        case nil: base = 270
+        case .shoot: base = model.camera.dualEnabled ? 290 : 350
+        case .timer: base = 260
+        case .video: base = 350
+        case .gallery, .rescue: return .infinity
+        default: base = 440
+        }
+        return base + (showHelp ? 120 : 0)
+    }
+
     private var captureInfo: some View {
         VStack(spacing: 0) {
             HStack {
-                Button { toolPath = [] } label: {
-                    Image(systemName: "square.grid.3x3").frame(width: 44, height: 44)
-                }.accessibilityLabel("All camera tools")
+                if !toolPath.isEmpty {
+                    Button { toolPath = [] } label: {
+                        Image(systemName: "chevron.left").frame(width: 44, height: 44)
+                    }.accessibilityLabel("All camera tools")
+                }
                 Text(toolPath.last?.rawValue ?? "Camera Tools").font(.headline)
                 Spacer()
                 Button { showHelp.toggle() } label: {
@@ -490,9 +506,18 @@ struct CameraView: View {
         switch page {
         case .shoot:
             if showHelp {
-                Text("Dual Shot takes main and ultra-wide photos back-to-back; exposures are not guaranteed to be simultaneous. Resolution and low-light quality can be lower than single-camera capture.").font(.footnote)
+                Text("Fast takes both views close together. Detail waits for the main photo to finish before taking the ultra-wide photo. Moving subjects may change position between photos.").font(.footnote)
             }
-            if model.camera.dualEnabled || model.mode == .video {
+            if model.camera.dualEnabled {
+                Picker("Dual Shot capture", selection: Binding(get: { model.camera.dualMode }, set: { model.setDualMode($0) })) {
+                    ForEach(DualShotMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }.pickerStyle(.segmented).disabled(!model.canConfigure)
+                Text(model.camera.dualMode == .fast ? "Fast · Up to 12 MP per view. Best for movement." : "Detail · Beta. Hold still for both photos. Up to 48 MP where supported; a pause is expected.")
+                    .font(.footnote)
+                Text(model.camera.resolution).font(.caption).monospacedDigit()
+                featureButton("Single Photo", icon: "camera", detail: "Return to one camera") { useTool(.automatic) }
+            } else {
+            if model.mode == .video {
                 Text("Selecting a style switches to its compatible Photo setup.").font(.footnote)
             }
             featureButton("Automatic", icon: "camera", detail: "Everyday photos with automatic settings") { useTool(.automatic) }
@@ -501,6 +526,7 @@ struct CameraView: View {
             featureButton("Best Shot", icon: "square.stack", detail: "Take 3 photos, then choose your favorite") { useTool(.burst) }
             if model.camera.dualAvailable {
                 featureButton("Dual Shot", icon: "camera.on.rectangle", detail: "Main and ultra-wide photos from one press") { useTool(.dual) }
+            }
             }
         case .focus:
             Picker("Tap adjusts", selection: $model.exposurePointOnly) {
@@ -569,7 +595,6 @@ struct CameraView: View {
                     if showHelp { Text(detail).font(.caption).foregroundStyle(.secondary) }
                 }
                 Spacer(minLength: 0)
-                Image(systemName: "chevron.right").font(.caption)
             }.padding(8).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
         }.buttonStyle(.plain).disabled(!model.canConfigure).accessibilityHint(detail)
@@ -589,7 +614,7 @@ struct CameraView: View {
 
 private enum CameraToolPage: String, Hashable {
     case guides = "Viewfinder guides"
-    case shoot = "Capture", focus = "Focus & depth", timer = "Timer", video = "Video quality"
+    case shoot = "Shot styles", focus = "Focus & depth", timer = "Timer", video = "Video quality"
     case rescue = "Photo Rescue", advanced = "Advanced", preferences = "Preferences"
     case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Info", gallery = "Design Preview"
     var icon: String {
