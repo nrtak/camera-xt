@@ -16,6 +16,7 @@ struct CameraView: View {
     @AppStorage("camera.pin2") private var pin2 = "Timer"
     @AppStorage("camera.pin3") private var pin3 = "Shot styles"
     @AppStorage("camera.captureDetails") private var showCaptureDetails = false
+    @State private var preferencesSection = 0
     @State private var checkIndex = 0
     @State private var passedChecks: Set<Int> = []
     @State private var confirmDiscard = false
@@ -424,6 +425,7 @@ struct CameraView: View {
         switch toolPath.last {
         case nil: return 270
         case .shoot: base = model.camera.dualEnabled ? 290 : 350
+        case .preferences: base = preferencesSection == 0 ? 350 : 470
         case .timer: base = 260
         case .video: base = 350
         case .gallery, .rescue: return .infinity
@@ -600,21 +602,26 @@ struct CameraView: View {
             Button("Reset checklist") { passedChecks = []; checkIndex = 0 }
             Text("Mark a check only after testing it. No results are uploaded.").font(.footnote)
         case .preferences:
-            Button { toolPath = [.shortcuts] } label: { Label("Quick controls", systemImage: "chevron.right") }
-            Button { toolPath = [.checks] } label: { Label("Beta device checks", systemImage: "chevron.right") }
-            Toggle("Show local photo details", isOn: $showCaptureDetails)
-            Toggle("Composition grid", isOn: $showsGrid)
-            Toggle("Capture vibrations", isOn: $model.haptics)
-            Picker("Dual Shot inset", selection: $dualCorner) {
-                Text("Top left").tag(0); Text("Top right").tag(1)
-                Text("Bottom left").tag(2); Text("Bottom right").tag(3)
+            Picker("Preferences section", selection: $preferencesSection) {
+                Text("Camera").tag(0); Text("Review & setup").tag(1)
+            }.pickerStyle(.segmented)
+            if preferencesSection == 0 {
+                Toggle("Composition grid", isOn: $showsGrid)
+                Toggle("Capture vibrations", isOn: $model.haptics)
+                Picker("Dual Shot inset", selection: $dualCorner) {
+                    Text("Top left").tag(0); Text("Top right").tag(1)
+                    Text("Bottom left").tag(2); Text("Bottom right").tag(3)
+                }
+                Button("Viewfinder guides") { toolPath = [.guides] }.buttonStyle(.bordered)
+            } else {
+                Button { toolPath = [.shortcuts] } label: { Label("Quick controls", systemImage: "chevron.right").frame(minHeight: 44) }
+                Button { toolPath = [.checks] } label: { Label("Beta device checks", systemImage: "chevron.right").frame(minHeight: 44) }
+                Toggle("Show local photo details", isOn: $showCaptureDetails)
+                Button("Clear recent preview") { Task { await model.clearRecent() } }.buttonStyle(.bordered)
+                if showHelp { Text("Clears only the local recent copy and its details, never your Photos library or unsaved recovery copy.").font(.footnote) }
+                Button("Design Preview") { toolPath.append(.gallery) }.buttonStyle(.bordered)
+                Button("Reset capture settings") { model.activate(.automatic); showsCaptureInfo = false }.buttonStyle(.bordered)
             }
-            if showHelp { Text("Reset to Auto clears capture settings, timer, and locks. Your grid, vibrations, lens, and layout preferences stay unchanged.").font(.footnote) }
-            Button("Clear recent preview") { Task { await model.clearRecent() } }.buttonStyle(.bordered)
-            if showHelp { Text("Only the latest capture is cached here. Clearing it does not delete anything in Photos.").font(.footnote) }
-            Button("Viewfinder guides") { toolPath = [.guides] }.buttonStyle(.bordered)
-            Button("Design Preview") { toolPath.append(.gallery) }.buttonStyle(.bordered)
-            Button("Reset capture settings") { model.activate(.automatic); showsCaptureInfo = false }.buttonStyle(.bordered)
         case .details:
             LabeledContent("Mode", value: model.mode.rawValue)
             LabeledContent("Lens", value: model.selectedLens?.name ?? "Unavailable")
