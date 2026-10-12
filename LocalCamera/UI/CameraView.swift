@@ -9,6 +9,7 @@ struct CameraView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
     @State private var confirmDiscard = false
     @AppStorage("camera.showsGrid") private var showsGrid = true
     @State private var toolPath: [CameraToolPage] = []
@@ -24,7 +25,8 @@ struct CameraView: View {
         !model.controls.automaticWhiteBalance || abs(model.exposureBias) > 0.05
     }
 
-    private let ink = Color(red: 0.10, green: 0.14, blue: 0.22)
+    private let ink = Color.white
+    private var overlayColor: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.75 : 0.55) }
     private let selection = Color(red: 1, green: 0.94, blue: 0.36)
 
     var body: some View {
@@ -64,8 +66,6 @@ struct CameraView: View {
                     Color.clear.allowsHitTesting(false)
                     if model.permission != .authorized || model.camera.message != nil {
                         cameraNotice.padding(.horizontal, 24).frame(maxWidth: .infinity)
-                    } else if !showsCaptureInfo && !model.reviewingBurst && !isPeeking && model.selectedLens?.isFront == false && !model.camera.dualEnabled {
-                        lensSelector.padding(.trailing, 14)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -77,8 +77,8 @@ struct CameraView: View {
                     Group {
                         if model.reviewingBurst {
                             BurstReview(model: model)
-                                .background(Color.white.opacity(reduceTransparency ? 1 : 0.72), in: RoundedRectangle(cornerRadius: 24))
-                                .clipShape(RoundedRectangle(cornerRadius: 24))
+                                .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
                         } else { captureInfo }
                     }
                         .frame(height: geometry.size.height * 0.82)
@@ -99,7 +99,7 @@ struct CameraView: View {
         .onChange(of: model.reviewingBurst) { _, _ in accessiblePeek = false }
         .foregroundStyle(ink)
         .tint(ink)
-        .preferredColorScheme(.light)
+        .preferredColorScheme(.dark)
         .task { model.setActive(scenePhase == .active) }
         .onChange(of: scenePhase) {
             if $0 != .active { accessiblePeek = false }
@@ -130,7 +130,7 @@ struct CameraView: View {
                 }
                 .accessibilityLabel(enlargedDualIndex == index ? "Show both cameras equally" : "Enlarge \(title)")
             }
-            .padding(6).background(.white.opacity(0.85), in: RoundedRectangle(cornerRadius: 12)).padding(6)
+            .padding(6).background(overlayColor, in: RoundedRectangle(cornerRadius: 12)).padding(6)
         }
         .accessibilityLabel("\(title) live viewfinder. Tap to focus this camera.")
     }
@@ -145,7 +145,7 @@ struct CameraView: View {
             Button { openTool(.details) } label: {
                 Text("\(model.mode.rawValue) | \(model.camera.dualEnabled ? "Dual Shot" : model.selectedLens?.name ?? "Camera")")
                     .font(.subheadline.weight(.semibold)).padding(12)
-                    .background(Color.white.opacity(0.96), in: Capsule())
+                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
             }
             .disabled(!model.canConfigure)
             ViewThatFits(in: .horizontal) {
@@ -158,14 +158,14 @@ struct CameraView: View {
             }
             if let message = model.message {
                 Text(message).font(.caption).multilineTextAlignment(.center)
-                    .padding(10).background(Color.white.opacity(0.96), in: RoundedRectangle(cornerRadius: 12))
+                    .padding(10).background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
             }
             if model.hasPendingCapture && !model.busy {
                 ViewThatFits(in: .horizontal) {
                     HStack { saveRecovery }
                     VStack { saveRecovery }
                 }.font(.callout).padding(10)
-                    .background(Color.white.opacity(0.96), in: RoundedRectangle(cornerRadius: 12))
+                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
             }
         }
         .buttonStyle(.plain).padding(.horizontal, 14).padding(.top, 6)
@@ -183,29 +183,30 @@ struct CameraView: View {
         if abs(model.exposureBias) > 0.05 { indicator(String(format: "%+.1f EV", model.exposureBias), page: .exposure) }
         if !model.controls.automaticFocus { indicator("Manual focus", page: .manualFocus) }
         if !model.controls.automaticWhiteBalance { indicator("Manual color", page: .color) }
-        if model.camera.recording { Text("Recording").foregroundStyle(.red).padding(8).background(Color.white.opacity(0.96), in: Capsule()) }
+        if model.camera.recording { Text("Recording").foregroundStyle(.red).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8)) }
     }
 
     private func indicator(_ title: String, page: CameraToolPage) -> some View {
         Button(title) { openTool(page) }.font(.caption.weight(.semibold))
-            .padding(10).background(selection, in: Capsule())
+            .padding(8).foregroundStyle(.black).background(selection, in: RoundedRectangle(cornerRadius: 8))
             .disabled(!model.canConfigure)
     }
 
     private var lensSelector: some View {
-        VStack(spacing: 4) {
-            ForEach(model.camera.lenses.filter { !$0.isFront && $0.name != "Depth" }) { lens in
+        HStack(spacing: 10) {
+            ForEach(model.camera.lenses.filter { !$0.isFront && $0.name != "Depth" }.sorted { ($0.zoomFactor ?? 100) < ($1.zoomFactor ?? 100) }) { lens in
                 Button { model.select(lens) } label: {
-                    Text(lens.name).font(.caption.weight(.semibold))
-                        .frame(width: 68, height: 44)
-                        .background(lens.id == model.camera.selectedID ? selection : .clear, in: Capsule())
+                    Text(lens.zoomLabel).font(.subheadline.weight(.semibold)).monospacedDigit()
+                        .frame(minWidth: 44, minHeight: 44)
+                        .foregroundStyle(lens.id == model.camera.selectedID ? Color.black : .white)
+                        .background(lens.id == model.camera.selectedID ? selection : Color.white.opacity(0.08), in: Circle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("\(lens.name) camera")
+                .accessibilityLabel("\(lens.zoomLabel), \(lens.name) camera")
                 .accessibilityAddTraits(lens.id == model.camera.selectedID ? .isSelected : [])
             }
         }
-        .padding(5).background(Color.white.opacity(0.96), in: Capsule()).disabled(!model.canSwitch)
+        .disabled(!model.canSwitch)
     }
 
     private var compositionGrid: some View {
@@ -243,11 +244,14 @@ struct CameraView: View {
         }
         .multilineTextAlignment(.center)
         .padding(24)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+        .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var captureControls: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 6) {
+            if !showsCaptureInfo && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled {
+                lensSelector
+            }
             if showsCaptureInfo || model.reviewingBurst || hasAdjustments {
                 ViewThatFits(in: .horizontal) {
                     HStack { overlayActions }
@@ -260,7 +264,8 @@ struct CameraView: View {
                         Text(mode.rawValue.uppercased())
                             .font(.caption.weight(.semibold))
                             .frame(minWidth: 80, minHeight: 44)
-                            .background(model.mode == mode ? selection : .clear, in: Capsule())
+                            .foregroundStyle(model.mode == mode ? Color.black : .white)
+                            .background(model.mode == mode ? selection : .clear, in: RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(model.mode == mode ? .isSelected : [])
@@ -289,11 +294,11 @@ struct CameraView: View {
                                 }
                             }
                             .frame(width: 48, height: 48).clipped()
-                            .background(.white.opacity(0.45))
+                            .background(.white.opacity(0.1))
                             .clipShape(RoundedRectangle(cornerRadius: 9))
                             if model.lastSavedPhotoCount > 1 {
                                 Text("\(model.lastSavedPhotoCount)").font(.caption2.bold()).padding(3)
-                                    .background(.white, in: Capsule())
+                                    .foregroundStyle(.black).background(.white, in: RoundedRectangle(cornerRadius: 8))
                             }
                         }
                         Text("Photos").font(.caption2)
@@ -306,9 +311,9 @@ struct CameraView: View {
                 Button { showsCaptureInfo = false; model.shutter() } label: {
                     ZStack {
                         Circle().fill(model.mode == .video ? Color.red : Color.white)
-                        Circle().strokeBorder(ink.opacity(0.65), lineWidth: 2).padding(5)
+                        Circle().strokeBorder(Color.black.opacity(0.65), lineWidth: 2).padding(5)
                         if model.camera.recording { RoundedRectangle(cornerRadius: 4).fill(.white).frame(width: 28, height: 28) }
-                        else if model.busy { ProgressView().tint(ink) }
+                        else if model.busy { ProgressView().tint(.black) }
                     }
                     .frame(width: 76, height: 76)
                     .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
@@ -322,7 +327,7 @@ struct CameraView: View {
                     Image(systemName: "arrow.triangle.2.circlepath.camera")
                         .font(.title3)
                         .frame(width: 48, height: 48)
-                        .background(.white.opacity(0.45), in: Circle())
+                        .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
                     Text("Flip").font(.caption2)
                     }
                 }
@@ -335,8 +340,8 @@ struct CameraView: View {
         .padding(.horizontal, 18).padding(.top, 10).padding(.bottom, 14)
         .frame(maxWidth: .infinity)
         .background {
-            UnevenRoundedRectangle(topLeadingRadius: 28, topTrailingRadius: 28)
-                .fill(Color.white.opacity(reduceTransparency ? 1 : 0.72)).ignoresSafeArea(edges: .bottom)
+            UnevenRoundedRectangle(topLeadingRadius: 12, topTrailingRadius: 12)
+                .fill(overlayColor).ignoresSafeArea(edges: .bottom)
         }
     }
 
@@ -382,44 +387,28 @@ struct CameraView: View {
                 toolPage(page)
             } else {
                 CompactToolLayout {
-                    toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .exposure, .color, .manualFocus, .details, .rescue, .preferences, .gallery])
-                    HStack(spacing: 12) {
-                        quickPreset("Action", icon: "figure.run", detail: "Fast movement", tool: .action)
-                        quickPreset("Night", icon: "moon", detail: "Hold still · Experimental", tool: .night)
-                    }
-                    Button("Reset to Auto") { useTool(.automatic) }
-                        .frame(maxWidth: .infinity, minHeight: 44)
+                    toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .exposure, .color, .manualFocus, .details, .rescue, .preferences])
                 }
             }
         }
-        .background(Color.white.opacity(reduceTransparency ? 1 : 0.72), in: RoundedRectangle(cornerRadius: 24))
-        .overlay { RoundedRectangle(cornerRadius: 24).strokeBorder(.white.opacity(0.5), lineWidth: 1).allowsHitTesting(false) }
-        .clipShape(RoundedRectangle(cornerRadius: 24))
+        .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
+        .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.white.opacity(0.15), lineWidth: 1).allowsHitTesting(false) }
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
     private func toolGrid(_ pages: [CameraToolPage]) -> some View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
             ForEach(pages, id: \.self) { page in
                 Button { toolPath.append(page) } label: {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Image(systemName: page.icon).font(.title2)
-                        Text(page.rawValue).font(.caption.weight(.semibold))
+                    VStack(alignment: .leading, spacing: 5) {
+                        Image(systemName: page.icon).font(.title3)
+                        Text(page.rawValue).font(.caption.weight(.semibold)).lineLimit(2)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).padding(10)
-                    .background(Color.gray.opacity(0.09), in: RoundedRectangle(cornerRadius: 18))
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).padding(8)
+                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
                 }.buttonStyle(.plain)
             }
         }
-    }
-
-    private func quickPreset(_ title: String, icon: String, detail: String, tool: QuickCaptureTool) -> some View {
-        Button { useTool(tool) } label: {
-            VStack(alignment: .leading, spacing: 5) {
-                Label(title, systemImage: icon).font(.headline)
-                Text(detail).font(.caption)
-            }.frame(maxWidth: .infinity, minHeight: 40, alignment: .leading).padding(10)
-                .background(selection, in: RoundedRectangle(cornerRadius: 18))
-        }.buttonStyle(.plain).disabled(!model.canConfigure || !model.camera.running)
     }
 
     @ViewBuilder private func toolPage(_ page: CameraToolPage) -> some View {
@@ -513,12 +502,12 @@ struct CameraView: View {
                 Image(systemName: icon).font(.title2).frame(width: 30)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title).font(.headline)
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right").font(.caption)
-            }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.gray.opacity(0.09), in: RoundedRectangle(cornerRadius: 16))
+            }.padding(8).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
         }.buttonStyle(.plain).disabled(!model.canConfigure)
     }
 
@@ -528,9 +517,9 @@ struct CameraView: View {
 }
 
 private enum CameraToolPage: String, Hashable {
-    case shoot = "Capture style", focus = "Focus & depth", timer = "Timer", video = "Video quality"
+    case shoot = "Capture", focus = "Focus & depth", timer = "Timer", video = "Video quality"
     case rescue = "Photo Rescue", advanced = "Advanced", preferences = "Preferences"
-    case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Capture details", gallery = "Design Preview"
+    case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Info", gallery = "Design Preview"
     var icon: String {
         switch self {
         case .shoot: return "camera"
@@ -813,7 +802,7 @@ private struct CameraDesignDetail: View {
             Text("DESIGN PREVIEW · NOT LIVE")
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 14).padding(.vertical, 8)
-                .background(Color.yellow.opacity(0.4), in: Capsule())
+                .background(Color.yellow.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
             TabView(selection: $selection) {
                 ForEach(CameraDesignScreen.all) { screen in
                     ScrollView {
