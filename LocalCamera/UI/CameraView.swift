@@ -21,6 +21,7 @@ struct CameraView: View {
     @AppStorage("camera.lastTool") private var lastTool = ""
     @AppStorage("camera.showHelp") private var showHelp = false
     @State private var showsRecent = false
+    @State private var selectedDualIndex = 0
     private var enlargedDualIndex: Int? {
         get { (0...1).contains(dualLayout) ? dualLayout : nil }
         nonmutating set { dualLayout = newValue ?? -1 }
@@ -60,7 +61,7 @@ struct CameraView: View {
                         }
                     }
                 } else {
-                    CameraPreview(engine: model.engine, onFocus: model.focus, showsFocusFeedback: model.canConfigure, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !isPeeking, guideImage: isPeeking ? nil : model.guideImage)
+                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, showsFocusFeedback: model.canConfigure, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !isPeeking, hidesGuides: isPeeking)
                         .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
                 }
@@ -122,15 +123,19 @@ struct CameraView: View {
 
     private func dualViewfinder(_ title: String, index: Int) -> some View {
         CameraPreview(engine: model.engine, onFocus: { point, locked in
+            selectedDualIndex = index
             model.focusDual(at: point, index: index, locked: locked)
         }, secondary: index == 1, showsFocusFeedback: model.canConfigure &&
             model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
             focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
             exposureOnly: model.exposurePointOnly)
         .background(.black)
+        .overlay { Rectangle().strokeBorder(selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
         .overlay(alignment: .topLeading) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.caption.weight(.semibold))
+                Button("Brightness") { selectedDualIndex = index; openTool(.exposure) }
+                    .font(.caption2).frame(minHeight: 44).disabled(!model.canConfigure)
                 Text(model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Tap focus unavailable")
                     .font(.caption2)
                 Button {
@@ -165,11 +170,7 @@ struct CameraView: View {
                 HStack(spacing: 8) { activeIndicators }
                 VStack(spacing: 6) { activeIndicators }
             }
-            if !model.histogram.isEmpty {
-                HistogramGuide(bins: model.histogram).frame(width: 128, height: 44)
-                    .padding(6).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
-                    .accessibilityLabel("Live brightness histogram, darkest tones on the left")
-            }
+            LiveHistogram(guides: model.guides, overlayColor: overlayColor)
             if model.lowStorage { Text("Low storage · free space before a long recording").font(.caption).padding(8).background(overlayColor) }
             if model.camera.cooling { Text("iPhone is warm · optional processing is reduced").font(.caption).padding(8).background(overlayColor) }
             if model.countdown > 0 {
@@ -277,16 +278,13 @@ struct CameraView: View {
 
     private var captureControls: some View {
         VStack(spacing: 6) {
-            lensSelector
-                .opacity(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled ? 1 : 0)
-                .allowsHitTesting(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled)
-                .accessibilityHidden(showsCaptureInfo || showsRecent || model.reviewingBurst || model.selectedLens?.isFront != false || model.camera.dualEnabled)
-                .frame(height: 44)
-            HStack { overlayActions }
-                .frame(height: 44)
-                .opacity(showsCaptureInfo || showsRecent || model.reviewingBurst || hasAdjustments ? 1 : 0)
-                .allowsHitTesting(showsCaptureInfo || showsRecent || model.reviewingBurst || hasAdjustments)
-                .accessibilityHidden(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && !hasAdjustments)
+            ZStack {
+                lensSelector
+                    .opacity(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled ? 1 : 0)
+                    .allowsHitTesting(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled)
+                    .accessibilityHidden(showsCaptureInfo || showsRecent || model.reviewingBurst || model.selectedLens?.isFront != false || model.camera.dualEnabled)
+                if showsCaptureInfo || showsRecent || model.reviewingBurst { HStack { overlayActions } }
+            }.frame(height: 44)
             HStack(spacing: 12) {
                 ForEach(CaptureMode.allCases, id: \.self) { mode in
                     Button { model.selectMode(mode) } label: {
@@ -464,7 +462,8 @@ struct CameraView: View {
                     if model.camera.dualEnabled && page == .exposure {
                         ForEach(0..<2, id: \.self) { index in
                             Text(index == 0 ? "Main brightness" : "Ultra Wide brightness")
-                            Slider(value: Binding(get: { model.dualBrightness[index] }, set: { model.setDualBrightness($0, index: index) }), in: -2...2, step: 0.1)
+                                .foregroundStyle(selectedDualIndex == index ? selection : .white)
+                            Slider(value: Binding(get: { model.dualBrightness[index] }, set: { selectedDualIndex = index; model.setDualBrightness($0, index: index) }), in: -2...2, step: 0.1)
                                 .accessibilityLabel(index == 0 ? "Main brightness" : "Ultra Wide brightness")
                             Text(String(format: "%+.1f EV", model.dualBrightness[index])).monospacedDigit()
                         }
@@ -497,8 +496,8 @@ struct CameraView: View {
                 Text("Selecting a style switches to its compatible Photo setup.").font(.footnote)
             }
             featureButton("Automatic", icon: "camera", detail: "Everyday photos with automatic settings") { useTool(.automatic) }
-            featureButton("Action", icon: "figure.run", detail: "Fast shutter and 3 photos. Needs good light.") { useTool(.action) }
-            featureButton("Night", icon: "moon", detail: "Experimental. Hold still; timer and 3 slow exposures.") { useTool(.night) }
+            featureButton("Action burst", icon: "figure.run", detail: "Fast shutter and 3 photos. Needs good light.") { useTool(.action) }
+            featureButton("Low-light burst · Beta", icon: "moon", detail: "Experimental. Hold still; timer and 3 slow exposures.") { useTool(.night) }
             featureButton("Best Shot", icon: "square.stack", detail: "Take 3 photos, then choose your favorite") { useTool(.burst) }
             if model.camera.dualAvailable {
                 featureButton("Dual Shot", icon: "camera.on.rectangle", detail: "Main and ultra-wide photos from one press") { useTool(.dual) }
@@ -509,7 +508,7 @@ struct CameraView: View {
             }.pickerStyle(.segmented)
             if showHelp { Text("Focus and brightness use separate points. Hold to request a focus lock; the label confirms when the lens is locked, not whether your subject is sharp.").font(.footnote) }
             Button("Unlock and reset focus / exposure") { model.resetControls() }.buttonStyle(.bordered)
-            featureButton(model.camera.eyeFocusEnabled ? "Turn off eye focus" : "Eye focus", icon: "eye", detail: "Experimental. Follows an eye on the largest face in rear Photo mode.") {
+            featureButton(model.camera.eyeFocusEnabled ? "Turn off eye focus" : "Eye focus · Beta", icon: "eye", detail: "Experimental. Follows an eye on the largest face in rear Photo mode.") {
                 if model.camera.eyeFocusEnabled { model.setEyeFocus(false) } else { useTool(.eye) }
             }
             if model.camera.lenses.contains(where: { $0.name == "Depth" || $0.name == "Front Depth" }) {
@@ -922,7 +921,7 @@ private struct RecentCaptureView: View {
     var body: some View {
         VStack(spacing: 8) {
             HStack {
-                Text(record.isVideo ? "Last video" : record.photos.count > 1 ? "Paired photos" : "Last photo").font(.headline)
+                Text(record.isVideo ? "Last video" : record.photos.count > 1 ? "Saved photos" : "Last photo").font(.headline)
                 Spacer()
                 Button(action: close) { Image(systemName: "xmark").frame(width: 44, height: 44) }
                     .accessibilityLabel("Close recent capture")
@@ -958,6 +957,7 @@ private struct ZoomableCapture: UIViewRepresentable {
     final class Coordinator: NSObject, UIScrollViewDelegate {
         let imageView = UIImageView()
         weak var scrollView: UIScrollView?
+        var decodeTask: Task<Void, Never>?
         @objc func zoomIn(_ action: UIAccessibilityCustomAction) -> Bool {
             guard let scrollView else { return false }
             scrollView.setZoomScale(min(5, scrollView.zoomScale + 1), animated: !UIAccessibility.isReduceMotionEnabled)
@@ -987,12 +987,11 @@ private struct ZoomableCapture: UIViewRepresentable {
         view.delegate = context.coordinator
         context.coordinator.scrollView = view
         let image = context.coordinator.imageView
-        if let source = CGImageSourceCreateWithData(data as CFData, nil),
-           let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 3000
-           ] as CFDictionary) { image.image = UIImage(cgImage: cg) }
+        context.coordinator.decodeTask = Task { @MainActor [weak image] in
+            let decoded = await CapturePreviewDecoder.image(data, maxSize: 3000)
+            guard !Task.isCancelled else { return }
+            image?.image = decoded
+        }
         image.contentMode = .scaleAspectFit
         image.isUserInteractionEnabled = true
         image.isAccessibilityElement = true
@@ -1005,6 +1004,12 @@ private struct ZoomableCapture: UIViewRepresentable {
         tap.numberOfTapsRequired = 2; image.addGestureRecognizer(tap)
         view.addSubview(image); view.picture = image
         return view
+    }
+    static func dismantleUIView(_ view: ZoomView, coordinator: Coordinator) {
+        coordinator.decodeTask?.cancel()
+        coordinator.decodeTask = nil
+        coordinator.imageView.image = nil
+        view.delegate = nil
     }
     func updateUIView(_ uiView: ZoomView, context: Context) {}
 }
@@ -1021,5 +1026,33 @@ private struct HistogramGuide: View {
                 }
             }.fill(.white.opacity(0.8))
         }.allowsHitTesting(false)
+    }
+}
+
+private struct GuidedCameraPreview: View {
+    @ObservedObject var guides: ViewfinderGuideState
+    let engine: CaptureSessionManager
+    var onFocus: (CGPoint, Bool) -> Void
+    var showsFocusFeedback: Bool
+    var focusState: String
+    var exposureOnly: Bool
+    var showsGrid: Bool
+    var hidesGuides: Bool
+    var body: some View {
+        CameraPreview(engine: engine, onFocus: onFocus, showsFocusFeedback: showsFocusFeedback,
+                      focusState: focusState, exposureOnly: exposureOnly, showsGrid: showsGrid,
+                      guideImage: hidesGuides ? nil : guides.image)
+    }
+}
+
+private struct LiveHistogram: View {
+    @ObservedObject var guides: ViewfinderGuideState
+    let overlayColor: Color
+    var body: some View {
+        if !guides.histogram.isEmpty {
+            HistogramGuide(bins: guides.histogram).frame(width: 128, height: 44)
+                .padding(6).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityLabel("Live brightness histogram, darkest tones on the left")
+        }
     }
 }
