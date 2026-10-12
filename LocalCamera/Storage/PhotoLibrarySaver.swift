@@ -93,6 +93,7 @@ actor CaptureStore {
         try write(Record(photos: photos, warning: photo.warning), name: "pending.plist")
     }
     func stageVideo(_ source: URL) throws -> URL {
+        guard FileManager.default.fileExists(atPath: source.path) else { throw CocoaError(.fileReadNoSuchFile) }
         try prepare()
         let destination = root.appendingPathComponent("pending.mov")
         if source.standardizedFileURL != destination.standardizedFileURL {
@@ -107,7 +108,11 @@ actor CaptureStore {
         try write(Record(photos: [], videoName: "pending.mov"), name: "pending.plist")
         return destination
     }
-    func videoURL() -> URL { root.appendingPathComponent("pending.mov") }
+    func videoURL() throws -> URL {
+        let url = root.appendingPathComponent("pending.mov")
+        guard FileManager.default.fileExists(atPath: url.path) else { throw CocoaError(.fileReadNoSuchFile) }
+        return url
+    }
     func finish(thumbnail: Data?) throws -> Record? {
         guard var record = try load("pending.plist") else { return nil }
         record.saved = true
