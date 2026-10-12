@@ -126,4 +126,21 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertTrue(PreviewGeometry.isValid(CGRect(x: 0, y: 20, width: 390, height: 520)))
     }
 
+    func testDetailAllowsSupported48MPButRejectsLargerAndUnsupportedSizes() {
+        let native = CMVideoDimensions(width: 8064, height: 6048)
+        let tooLarge = CMVideoDimensions(width: 10000, height: 10000)
+        XCTAssertTrue(DualCaptureLimits.accepts(native, supported: [native], mode: .detail))
+        XCTAssertFalse(DualCaptureLimits.accepts(native, supported: [], mode: .detail))
+        XCTAssertNil(DualCaptureLimits.photoSize(in: [tooLarge], mode: .detail))
+        XCTAssertNil(DualCaptureLimits.photoSize(in: [native], mode: .fast))
+    }
+    func testDetailStartsOnlyMainAndSchedulesUltraAfterMainFinishes() {
+        XCTAssertEqual(DualShotMode.detail.initialCaptureIndices, [0])
+        XCTAssertEqual(DualShotMode.detail.nextCaptureIndex(after: 0), 1)
+        XCTAssertNil(DualShotMode.detail.nextCaptureIndex(after: 1))
+        XCTAssertEqual(DualShotMode.fast.initialCaptureIndices, [0, 1])
+        XCTAssertNil(DualShotMode.fast.nextCaptureIndex(after: 0))
+        XCTAssertNil(DualShotMode.fast.nextCaptureIndex(after: 1))
+    }
+
 }
