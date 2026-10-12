@@ -143,4 +143,18 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertNil(DualShotMode.fast.nextCaptureIndex(after: 1))
     }
 
+    func testFocusWaitRestartsAfterLensMovesAgain() {
+        var window = FocusSettlingWindow(startedAt: 0)
+        XCTAssertEqual(window.update(adjusting: false, now: 0), .wait)
+        XCTAssertEqual(window.update(adjusting: true, now: 0.08), .wait)
+        XCTAssertEqual(window.update(adjusting: false, now: 0.12), .wait)
+        XCTAssertEqual(window.update(adjusting: false, now: 0.18), .wait)
+        XCTAssertEqual(window.update(adjusting: false, now: 0.23), .ready)
+    }
+    func testFocusHuntingHasBoundedWait() {
+        var window = FocusSettlingWindow(startedAt: 5)
+        XCTAssertEqual(window.update(adjusting: true, now: 5.9), .wait)
+        XCTAssertEqual(window.update(adjusting: true, now: 6), .timedOut)
+    }
+
 }
