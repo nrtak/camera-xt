@@ -19,13 +19,15 @@ struct CameraPreview: UIViewRepresentable {
         var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
         let grid = CAShapeLayer()
         let guide = UIImageView()
-        var showsGrid = false
+        private var gridFrame = CGRect.null
         override func layoutSubviews() {
             super.layoutSubviews()
             if grid.superlayer == nil { layer.addSublayer(grid) }
             if guide.superview == nil { guide.isUserInteractionEnabled = false; guide.contentMode = .scaleAspectFit; addSubview(guide) }
             let frame = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
             guide.frame = frame
+            guard gridFrame != frame else { return }
+            gridFrame = frame
             let path = UIBezierPath()
             for fraction in [CGFloat(1.0 / 3), CGFloat(2.0 / 3)] {
                 let x = frame.minX + frame.width * fraction, y = frame.minY + frame.height * fraction
@@ -33,7 +35,7 @@ struct CameraPreview: UIViewRepresentable {
                 path.move(to: CGPoint(x: frame.minX, y: y)); path.addLine(to: CGPoint(x: frame.maxX, y: y))
             }
             grid.path = path.cgPath; grid.strokeColor = UIColor.white.withAlphaComponent(0.3).cgColor
-            grid.lineWidth = 0.5; grid.isHidden = !showsGrid
+            grid.lineWidth = 0.5
         }
     }
     final class Coordinator: NSObject {
@@ -94,7 +96,7 @@ struct CameraPreview: UIViewRepresentable {
         context.coordinator.exposureOnly = exposureOnly
         if focusState == "Focus locked" { context.coordinator.marker?.text = "Focus locked" }
         else if focusState == "Auto focus", context.coordinator.marker?.text == "Focus locked" { context.coordinator.marker?.removeFromSuperview() }
-        view.guide.image = guideImage
-        view.showsGrid = showsGrid; view.setNeedsLayout()
+        if view.guide.image !== guideImage { view.guide.image = guideImage }
+        view.grid.isHidden = !showsGrid
     }
 }
