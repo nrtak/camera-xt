@@ -76,6 +76,7 @@ struct CapturedPhoto {
     var companions: [CapturedPhoto] = []
     var warning: String?
     var lensLabel: String?
+    var details: CaptureDetails?
 }
 
 /// Compares a small burst on-device. Originals remain available for the user's choice.
@@ -161,12 +162,33 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
             result = .failure(error)
         } else if let data = photo.fileDataRepresentation() {
             let note = expectsDepth ? (photo.depthData == nil ? "Photo saved; depth was unavailable for this scene." : "Photo saved with embedded depth.") : nil
-            result = .success(CapturedPhoto(data: data, dimensions: photo.resolvedSettings.photoDimensions, warning: note))
+            let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
+            let iso = (exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber])?.first?.doubleValue
+            let exposure = (exif[kCGImagePropertyExifExposureTime as String] as? NSNumber)?.doubleValue
+            let time = CMTimeGetSeconds(photo.timestamp)
+            let details = CaptureDetails(iso: iso, exposureSeconds: exposure, timestamp: time.isFinite ? time : nil)
+            result = .success(CapturedPhoto(data: data, dimensions: photo.resolvedSettings.photoDimensions, warning: note, details: details))
         }
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
         completion(error.map { .failure($0) } ?? result)
+    }
+}
+
+/// Numeric capture facts only. Stored with local recovery/recent photos, never transmitted.
+struct CaptureDetails: Codable, Equatable {
+    let iso: Double?
+    let exposureSeconds: Double?
+    let timestamp: Double?
+    var summary: String {
+        let isoText = iso.map { String(format: "ISO %.0f", $0) } ?? "ISO unavailable"
+        let shutter = exposureSeconds.map { String(format: "%.4f s", $0) } ?? "Shutter unavailable"
+        return "\(isoText) · \(shutter)"
+    }
+    static func gap(_ a: CaptureDetails?, _ b: CaptureDetails?) -> Double? {
+        guard let a = a?.timestamp, let b = b?.timestamp, a.isFinite, b.isFinite else { return nil }
+        return abs(b - a)
     }
 }
