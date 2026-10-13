@@ -23,8 +23,9 @@ struct CameraView: View {
     @AppStorage("camera.showsGrid") private var showsGrid = true
     @State private var toolPath: [CameraToolPage] = []
     @State private var showsCaptureInfo = false
-    @GestureState private var holdingPeek = false
-    @State private var accessiblePeek = false
+    @State private var showsZoom = false
+    @State private var lastZoomUpdate = Date.distantPast
+    @State private var pinchStart: Double?
     @AppStorage("camera.dualLayout") private var dualLayout = -1
     @AppStorage("camera.dualCorner") private var dualCorner = 3
     @AppStorage("camera.showHelp") private var showHelp = false
@@ -35,7 +36,6 @@ struct CameraView: View {
         get { (0...1).contains(dualLayout) ? dualLayout : nil }
         nonmutating set { dualLayout = newValue ?? -1 }
     }
-    private var isPeeking: Bool { holdingPeek || accessiblePeek }
     private var hasAdjustments: Bool {
         model.captureStyle != "Auto" || model.timerSeconds > 0 || model.burstEnabled ||
         model.camera.dualEnabled || model.camera.depthEnabled || model.camera.eyeFocusEnabled ||
@@ -59,7 +59,7 @@ struct CameraView: View {
                                 let width = inset ? geometry.size.width * 0.38 : geometry.size.width
                                 let height = enlargedDualIndex == nil ? (geometry.size.height - 4) / 2 :
                                     inset ? geometry.size.height * 0.32 : geometry.size.height
-                                dualViewfinder(index == 0 ? "Main · 1×" : "Ultra Wide · 0.5×", index: index)
+                                dualViewfinder(zoomText(zoomState(index).value), index: index)
                                     .frame(width: width, height: height)
                                     .clipShape(RoundedRectangle(cornerRadius: inset ? 12 : 0))
                                     .overlay { RoundedRectangle(cornerRadius: inset ? 12 : 0).strokeBorder(.white.opacity(inset ? 0.8 : 0), lineWidth: 2).allowsHitTesting(false) }
@@ -70,9 +70,10 @@ struct CameraView: View {
                         }
                     }
                 } else {
-                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, showsFocusFeedback: model.canConfigure, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !isPeeking, hidesGuides: isPeeking)
+                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, showsFocusFeedback: model.canConfigure, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid, hidesGuides: false)
                         .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
+                        .simultaneousGesture(zoomGesture(nil))
                 }
             }
 
@@ -102,26 +103,20 @@ struct CameraView: View {
                         .frame(height: min(geometry.size.height * 0.82, toolPanelHeight))
                         .contentShape(Rectangle())
                         .background { Rectangle().fill(Color.clear).contentShape(Rectangle()).onTapGesture {} }
-                        .opacity(isPeeking ? 0 : 1)
-                        .disabled(isPeeking)
-                        .accessibilityHidden(isPeeking)
                         .frame(maxHeight: .infinity, alignment: .bottom)
                 }
                 .padding(.horizontal, 10)
                 .padding(.bottom, 8)
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) { captureHUD.opacity(isPeeking ? 0 : 1).disabled(isPeeking).accessibilityHidden(isPeeking) }
+        .safeAreaInset(edge: .top, spacing: 0) { captureHUD }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false }
-        .onChange(of: showsCaptureInfo) { _, _ in accessiblePeek = false }
-        .onChange(of: model.reviewingBurst) { _, _ in accessiblePeek = false }
         .foregroundStyle(ink)
         .tint(ink)
         .preferredColorScheme(.dark)
         .task { model.setActive(scenePhase == .active) }
         .onChange(of: scenePhase) {
-            if $0 != .active { accessiblePeek = false }
             if $0 == .background { model.enteredBackground() }
             model.setActive($0 == .active)
         }
@@ -140,6 +135,7 @@ struct CameraView: View {
             focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
             exposureOnly: model.exposurePointOnly)
         .background(.black)
+        .simultaneousGesture(zoomGesture(index))
         .overlay { Rectangle().strokeBorder(selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
         .overlay(alignment: .bottomLeading) {
             VStack(alignment: .leading, spacing: 2) {
@@ -165,15 +161,13 @@ struct CameraView: View {
                     if sizes.indices.contains(index) { Text(sizes[index]).font(.caption2).monospacedDigit() }
                     Text(model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index] && model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Fixed focus")
                         .font(.caption2)
+                    Button("Zoom") { selectedDualIndex = index; showsZoom.toggle() }.frame(minHeight: 44)
                     Button("Brightness") { openTool(.exposure) }
                         .font(.caption).frame(minHeight: 44).disabled(!model.canConfigure)
                 }
             }
             .padding(.horizontal, 6)
             .background(overlayColor, in: RoundedRectangle(cornerRadius: 8)).padding(6)
-            .opacity(isPeeking ? 0 : 1)
-            .disabled(isPeeking)
-            .accessibilityHidden(isPeeking)
         }
         .accessibilityLabel("\(title) live viewfinder. Tap to focus this camera.")
     }
@@ -210,8 +204,9 @@ struct CameraView: View {
     }
 
     private var captureStatus: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 12) {
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
+                if showsZoom { zoomSlider }
                 if hasAdjustments {
                     Button { openTool() } label: {
                         Label("Adjustments", systemImage: "slider.horizontal.3")
@@ -265,21 +260,69 @@ struct CameraView: View {
         .padding(.horizontal, 14)
     }
 
-    private var lensSelector: some View {
-        HStack(spacing: 10) {
-            ForEach(model.camera.lenses.filter { !$0.isFront && $0.name != "Depth" }.sorted { ($0.zoomFactor ?? 100) < ($1.zoomFactor ?? 100) }) { lens in
-                Button { model.select(lens) } label: {
-                    Text(lens.zoomLabel).font(.subheadline.weight(.semibold)).monospacedDigit()
-                        .frame(minWidth: 44, minHeight: 44)
-                        .foregroundStyle(lens.id == model.camera.selectedID ? Color.black : .white)
-                        .background(lens.id == model.camera.selectedID ? selection : Color.white.opacity(0.08), in: Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("\(lens.zoomLabel), \(lens.name) camera")
-                .accessibilityAddTraits(lens.id == model.camera.selectedID ? .isSelected : [])
+    private func zoomState(_ index: Int? = nil) -> CameraZoom {
+        let target = index ?? 0
+        return model.camera.zooms.indices.contains(target) ? model.camera.zooms[target] : CameraZoom()
+    }
+
+    private func zoomText(_ value: Double) -> String { String(format: "%.1f×", value) }
+
+    private func zoomGesture(_ index: Int?) -> some Gesture {
+        MagnificationGesture().onChanged { scale in
+            guard model.canConfigure else { return }
+            if pinchStart == nil { pinchStart = zoomState(index).value }
+            if let index { selectedDualIndex = index }
+            showsZoom = true
+            guard Date().timeIntervalSince(lastZoomUpdate) > 0.05 else { return }
+            lastZoomUpdate = Date()
+            model.engine.setZoom((pinchStart ?? 1) * Double(scale), dualIndex: index)
+        }.onEnded { _ in pinchStart = nil }
+    }
+
+    private var zoomSlider: some View {
+        let index: Int? = model.camera.dualEnabled ? selectedDualIndex : nil
+        let zoom = zoomState(index)
+        return HStack {
+            Text(zoomText(zoom.value)).monospacedDigit().font(.caption)
+            if zoom.maximum > zoom.minimum {
+                Slider(value: Binding(get: { log(max(zoom.minimum, zoom.value)) }, set: {
+                    let value = exp($0)
+                    let stops = [zoom.minimum, 1, 2, 3, 5, 10].filter { $0 >= zoom.minimum && $0 <= zoom.maximum }
+                    let snapped = stops.first(where: { abs(log(value / $0)) < 0.015 }) ?? value
+                    model.engine.setZoom(snapped, dualIndex: index)
+                }), in: log(zoom.minimum)...log(zoom.maximum))
+                .accessibilityLabel("Camera zoom")
+                .accessibilityValue(zoomText(zoom.value))
+                .disabled(!model.canConfigure)
             }
-        }
-        .disabled(!model.canSwitch)
+            Button { showsZoom = false } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
+                .accessibilityLabel("Close zoom slider")
+        }.padding(.leading, 12).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var lensSelector: some View {
+        HStack(spacing: 8) {
+            ForEach(model.camera.lenses.filter { !$0.isFront && $0.name != "Depth" }.sorted { ($0.zoomFactor ?? 100) < ($1.zoomFactor ?? 100) }) { lens in
+                if model.selectedLens?.isFront == false {
+                    Button { model.select(lens) } label: {
+                        Text(lens.zoomLabel).font(.subheadline.weight(.semibold)).monospacedDigit()
+                            .frame(minWidth: 44, minHeight: 44)
+                            .foregroundStyle(lens.id == model.camera.selectedID && abs(zoomState().value - (lens.zoomFactor ?? 1)) < 0.05 ? selection : .white)
+                    }
+                    .simultaneousGesture(LongPressGesture().onEnded { _ in showsZoom = true })
+                    .accessibilityLabel("\(lens.zoomLabel) zoom")
+                    if lens.zoomFactor == 1 && lens.maximumZoom >= 2 {
+                        Button("2×") { model.select(lens, zoom: 2) }
+                            .frame(minWidth: 44, minHeight: 44)
+                            .foregroundStyle(lens.id == model.camera.selectedID && abs(zoomState().value - 2) < 0.05 ? selection : .white)
+                            .simultaneousGesture(LongPressGesture().onEnded { _ in showsZoom = true })
+                    }
+                }
+            }
+            Button { showsZoom.toggle() } label: {
+                Image(systemName: "magnifyingglass").frame(width: 44, height: 44)
+            }.accessibilityLabel("Adjust zoom")
+        }.buttonStyle(.plain).disabled(!model.canConfigure)
     }
 
     private var compositionGrid: some View {
@@ -322,13 +365,9 @@ struct CameraView: View {
 
     private var captureControls: some View {
         VStack(spacing: 6) {
-            ZStack {
+            if !showsCaptureInfo && !showsRecent && !model.reviewingBurst && !model.camera.dualEnabled {
                 lensSelector
-                    .opacity(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled ? 1 : 0)
-                    .allowsHitTesting(!showsCaptureInfo && !showsRecent && !model.reviewingBurst && model.selectedLens?.isFront == false && !model.camera.dualEnabled)
-                    .accessibilityHidden(showsCaptureInfo || showsRecent || model.reviewingBurst || model.selectedLens?.isFront != false || model.camera.dualEnabled)
-                if showsCaptureInfo || showsRecent || model.reviewingBurst { HStack { overlayActions } }
-            }.frame(height: 44)
+            }
             HStack(spacing: 12) {
                 ForEach(CaptureMode.allCases, id: \.self) { mode in
                     Button { model.selectMode(mode) } label: {
@@ -408,24 +447,6 @@ struct CameraView: View {
         }
     }
 
-    @ViewBuilder private var overlayActions: some View {
-        if showsCaptureInfo || model.reviewingBurst || showsRecent {
-            Label(isPeeking ? "Release to return" : "Peek at scene", systemImage: "eye")
-                .font(.callout.weight(.semibold))
-                .frame(maxWidth: .infinity, minHeight: 44)
-                .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0).updating($holdingPeek) { _, state, _ in state = true })
-                .accessibilityAddTraits(.isButton)
-                .accessibilityLabel(accessiblePeek ? "Restore tools" : "Peek at scene")
-                .accessibilityHint("Hold to hide the panel. With VoiceOver, double tap to toggle.")
-                .accessibilityAction { accessiblePeek.toggle() }
-        }
-        Button("Reset to Auto") { accessiblePeek = false; useTool(.automatic) }
-            .font(.callout.weight(.semibold))
-            .frame(maxWidth: .infinity, minHeight: 44)
-            .disabled(!model.canConfigure)
-    }
-
     @ViewBuilder private var saveRecovery: some View {
         Button("Retry save") { Task { await model.retrySave() } }
         Button("Settings", action: openSettings)
@@ -436,7 +457,7 @@ struct CameraView: View {
         if showsRecent || model.reviewingBurst || textSize.isAccessibilitySize { return .infinity }
         let base: CGFloat
         switch toolPath.last {
-        case nil: return 270
+        case nil: return hasAdjustments ? 314 : 270
         case .shoot: base = model.camera.dualEnabled ? 290 : 350
         case .preferences: base = preferencesSection == 0 ? 350 : 470
         case .timer: base = 260
@@ -468,6 +489,7 @@ struct CameraView: View {
                 toolPage(page)
             } else {
                 CompactToolLayout {
+                    if hasAdjustments { Button("Reset to Auto") { useTool(.automatic) }.frame(minHeight: 44) }
                     toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .exposure, .color, .manualFocus, .details, .rescue, .preferences])
                 }
             }
