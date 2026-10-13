@@ -27,10 +27,10 @@ struct CameraView: View {
     @State private var accessiblePeek = false
     @AppStorage("camera.dualLayout") private var dualLayout = -1
     @AppStorage("camera.dualCorner") private var dualCorner = 3
-    @AppStorage("camera.lastTool") private var lastTool = ""
     @AppStorage("camera.showHelp") private var showHelp = false
     @State private var showsRecent = false
     @State private var selectedDualIndex = 0
+    @State private var showsDualAdjustments = false
     private var enlargedDualIndex: Int? {
         get { (0...1).contains(dualLayout) ? dualLayout : nil }
         nonmutating set { dualLayout = newValue ?? -1 }
@@ -113,7 +113,7 @@ struct CameraView: View {
         }
         .safeAreaInset(edge: .top, spacing: 0) { captureHUD.opacity(isPeeking ? 0 : 1).disabled(isPeeking).accessibilityHidden(isPeeking) }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls }
-        .onChange(of: toolPath) { _, path in lastTool = path.last?.rawValue ?? "" }
+        .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false }
         .onChange(of: showsCaptureInfo) { _, _ in accessiblePeek = false }
         .onChange(of: model.reviewingBurst) { _, _ in accessiblePeek = false }
         .foregroundStyle(ink)
@@ -133,6 +133,7 @@ struct CameraView: View {
     private func dualViewfinder(_ title: String, index: Int) -> some View {
         CameraPreview(engine: model.engine, onFocus: { point, locked in
             selectedDualIndex = index
+            showsDualAdjustments = true
             model.focusDual(at: point, index: index, locked: locked)
         }, secondary: index == 1, showsFocusFeedback: model.canConfigure &&
             model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
@@ -140,110 +141,128 @@ struct CameraView: View {
             exposureOnly: model.exposurePointOnly)
         .background(.black)
         .overlay { Rectangle().strokeBorder(selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
-        .overlay(alignment: .topLeading) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.caption.weight(.semibold))
-                let sizes = model.camera.resolution.components(separatedBy: " + ")
-                if sizes.indices.contains(index) { Text(sizes[index]).font(.caption2).monospacedDigit() }
-                Button("Brightness") { selectedDualIndex = index; openTool(.exposure) }
-                    .font(.caption2).frame(minHeight: 44).disabled(!model.canConfigure)
-                Text(model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index] && model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Fixed focus")
-                    .font(.caption2)
-                Button {
-                    enlargedDualIndex = enlargedDualIndex == index ? nil : index
-                } label: {
-                    Image(systemName: enlargedDualIndex == index ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                        .frame(minWidth: 44, minHeight: 44)
+        .overlay(alignment: .bottomLeading) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 0) {
+                    Button {
+                        showsDualAdjustments = selectedDualIndex != index || !showsDualAdjustments
+                        selectedDualIndex = index
+                    } label: {
+                        Text(title).font(.caption.weight(.semibold))
+                            .frame(minHeight: 44).padding(.horizontal, 8)
+                    }
+                    .accessibilityLabel("Adjust \(title)")
+                    Button {
+                        enlargedDualIndex = enlargedDualIndex == index ? nil : index
+                    } label: {
+                        Image(systemName: enlargedDualIndex == index ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                            .frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel(enlargedDualIndex == index ? "Show both cameras equally" : "Enlarge \(title)")
                 }
-                .accessibilityLabel(enlargedDualIndex == index ? "Show both cameras equally" : "Enlarge \(title)")
+                if showsDualAdjustments && selectedDualIndex == index {
+                    let sizes = model.camera.resolution.components(separatedBy: " + ")
+                    if sizes.indices.contains(index) { Text(sizes[index]).font(.caption2).monospacedDigit() }
+                    Text(model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index] && model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Fixed focus")
+                        .font(.caption2)
+                    Button("Brightness") { openTool(.exposure) }
+                        .font(.caption).frame(minHeight: 44).disabled(!model.canConfigure)
+                }
             }
-            .padding(6).background(overlayColor, in: RoundedRectangle(cornerRadius: 12)).padding(6)
+            .padding(.horizontal, 6)
+            .background(overlayColor, in: RoundedRectangle(cornerRadius: 8)).padding(6)
+            .opacity(isPeeking ? 0 : 1)
+            .disabled(isPeeking)
+            .accessibilityHidden(isPeeking)
         }
         .accessibilityLabel("\(title) live viewfinder. Tap to focus this camera.")
     }
 
     private func openTool(_ page: CameraToolPage? = nil) {
-        let selected = page ?? CameraToolPage(rawValue: lastTool)
-        toolPath = selected.map { [$0] } ?? []
+        toolPath = page.map { [$0] } ?? []
         showsRecent = false
         showsCaptureInfo = true
     }
 
     private var captureHUD: some View {
-        VStack(spacing: 8) {
+        HStack(spacing: 8) {
             Button { openTool(.details) } label: {
-                Text("\(model.mode.rawValue) | \(model.camera.dualEnabled ? "Dual · \(model.camera.dualMode.rawValue)" : model.selectedLens?.name ?? "Camera")")
-                    .font(.subheadline.weight(.semibold)).padding(12)
-                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+                Text(model.camera.dualEnabled ? "Dual · \(model.camera.dualMode.rawValue)" : model.mode.rawValue)
+                    .font(.subheadline.weight(.semibold)).lineLimit(1)
+                    .frame(minHeight: 44)
             }
-            .disabled(!model.canConfigure)
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) { activeIndicators }
-                VStack(spacing: 6) { activeIndicators }
-            }
-            if quickAccess && !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
-                HStack(spacing: 8) {
-                    ForEach(Array([pin1, pin2, pin3].enumerated()), id: \.offset) { _, name in
-                        if let page = CameraToolPage(rawValue: name) {
-                            Button { openTool(page) } label: {
-                                Label(page.rawValue, systemImage: page.icon).font(.caption)
-                                    .frame(minHeight: 44).padding(.horizontal, 8)
-                                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
-                            }.disabled(!model.canConfigure)
+            .accessibilityLabel("Capture details")
+            Spacer(minLength: 8)
+            Button { openTool() } label: {
+                Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44)
+            }.accessibilityLabel("Camera tools")
+            Button { openTool(.preferences) } label: {
+                Image(systemName: "gearshape").frame(width: 44, height: 44)
+            }.accessibilityLabel("Camera preferences")
+        }
+        .disabled(!model.canConfigure)
+        .padding(.horizontal, 14)
+        .background(overlayColor)
+        .overlay(alignment: .top) {
+            captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 48)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var captureStatus: some View {
+        VStack(spacing: 6) {
+            if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
+                if hasAdjustments {
+                    Button { openTool() } label: {
+                        Label("Adjustments", systemImage: "slider.horizontal.3")
+                            .font(.caption).frame(minHeight: 44).padding(.horizontal, 10)
+                    }.background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+                        .disabled(!model.canConfigure)
+                }
+                if quickAccess {
+                    HStack(spacing: 0) {
+                        ForEach(Array([pin1, pin2, pin3].enumerated()), id: \.offset) { _, name in
+                            if let page = CameraToolPage(rawValue: name) {
+                                Button { openTool(page) } label: {
+                                    Image(systemName: page.icon).frame(maxWidth: .infinity, minHeight: 44)
+                                }.accessibilityLabel(page.rawValue).disabled(!model.canConfigure)
+                            }
                         }
-                    }
+                    }.frame(maxWidth: 220)
+                        .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+                }
+                LiveHistogram(guides: model.guides, overlayColor: overlayColor)
+            }
+            if model.camera.recording, let started = model.recordingStarted {
+                HStack {
+                    Image(systemName: "record.circle").foregroundStyle(.red)
+                    Text(started, style: .timer).monospacedDigit()
+                    Image(systemName: model.camera.audioRecording ? "mic.fill" : "mic.slash.fill")
+                }.padding(8).background(overlayColor)
+            }
+            if model.countdown > 0 {
+                Text("\(model.countdown)").font(.system(size: 64, weight: .bold))
+                    .accessibilityLabel("Shutter in \(model.countdown) seconds")
+            }
+            VStack(spacing: 6) {
+                if model.lowStorage { Text("Low storage · free space before recording").font(.caption) }
+                if model.camera.cooling { Text("iPhone is warm · processing reduced").font(.caption) }
+                if let message = model.message {
+                    Label(message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
+                        .font(.callout).accessibilityLabel(message)
+                }
+                if model.hasPendingCapture && !model.busy {
+                    ViewThatFits(in: .horizontal) {
+                        HStack { saveRecovery }
+                        VStack { saveRecovery }
+                    }.font(.callout)
                 }
             }
-            LiveHistogram(guides: model.guides, overlayColor: overlayColor)
-            if model.lowStorage { Text("Low storage · free space before a long recording").font(.caption).padding(8).background(overlayColor) }
-            if model.camera.cooling { Text("iPhone is warm · optional processing is reduced").font(.caption).padding(8).background(overlayColor) }
-            if model.countdown > 0 {
-                Text("\(model.countdown)").font(.system(size: 64, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white).accessibilityLabel("Shutter in \(model.countdown) seconds")
-            }
-            if let message = model.message {
-                Label(message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
-                    .font(.callout).multilineTextAlignment(.center).accessibilityLabel(message)
-                    .padding(10).background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
-            }
-            if model.hasPendingCapture && !model.busy {
-                ViewThatFits(in: .horizontal) {
-                    HStack { saveRecovery }
-                    VStack { saveRecovery }
-                }.font(.callout).padding(10)
-                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
-            }
+            .multilineTextAlignment(.center)
+            .padding(model.message != nil || model.lowStorage || model.camera.cooling || model.hasPendingCapture ? 10 : 0)
+            .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
         }
-        .buttonStyle(.plain).padding(.horizontal, 14).padding(.top, 6)
-    }
-
-    @ViewBuilder private var activeIndicators: some View {
-        if model.captureStyle != "Auto" { indicator(model.captureStyle, page: .shoot) }
-        if model.timerSeconds > 0 { indicator("Timer \(model.timerSeconds)s", page: .timer) }
-        if model.camera.focusLocked { indicator("Focus locked", page: .focus) }
-        else if model.camera.eyeFocusEnabled { indicator("Eye focus", page: .focus) }
-        if model.camera.analysisMode != "Off" { indicator(model.camera.analysisMode, page: .guides) }
-        if model.camera.depthEnabled { indicator("Depth", page: .focus) }
-        if model.burstEnabled && model.captureStyle == "Auto" { indicator("3-shot burst", page: .shoot) }
-        if model.camera.dualEnabled { indicator("Dual · \(model.camera.dualMode.rawValue)", page: .shoot) }
-        if !model.controls.automaticExposure && model.captureStyle == "Auto" { indicator("Manual exposure", page: .exposure) }
-        if abs(model.exposureBias) > 0.05 { indicator(String(format: "%+.1f EV", model.exposureBias), page: .exposure) }
-        if !model.controls.automaticFocus { indicator("Manual focus", page: .manualFocus) }
-        if !model.controls.automaticWhiteBalance { indicator("Manual color", page: .color) }
-        if model.camera.recording, let started = model.recordingStarted {
-            HStack {
-                Image(systemName: "record.circle").foregroundStyle(.red)
-                Text(started, style: .timer).monospacedDigit()
-                Image(systemName: model.camera.audioRecording ? "mic.fill" : "mic.slash.fill")
-            }.font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
-                .accessibilityLabel(model.camera.audioRecording ? "Recording with sound" : "Recording without sound")
-        }
-    }
-
-    private func indicator(_ title: String, page: CameraToolPage) -> some View {
-        Button(title) { openTool(page) }.font(.caption.weight(.semibold))
-            .padding(8).foregroundStyle(.black).background(selection, in: RoundedRectangle(cornerRadius: 8))
-            .disabled(!model.canConfigure)
+        .padding(.horizontal, 14)
     }
 
     private var lensSelector: some View {
@@ -316,16 +335,12 @@ struct CameraView: View {
                         Text(mode.rawValue.uppercased())
                             .font(.caption.weight(.semibold))
                             .frame(minWidth: 80, minHeight: 44)
-                            .foregroundStyle(model.mode == mode ? Color.black : .white)
-                            .background(model.mode == mode ? selection : .clear, in: RoundedRectangle(cornerRadius: 8))
+                            .foregroundStyle(model.mode == mode ? selection : .white.opacity(0.65))
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(model.mode == mode ? .isSelected : [])
                 }
-                Button { openTool() } label: {
-                    Label("Tools", systemImage: "slider.horizontal.3")
-                        .font(.caption.weight(.semibold)).frame(minWidth: 70, minHeight: 44)
-                }.buttonStyle(.plain).accessibilityLabel("Camera Tools")
+
             }
             .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.recording)
 
@@ -351,7 +366,6 @@ struct CameraView: View {
                                     .foregroundStyle(.black).background(.white, in: RoundedRectangle(cornerRadius: 8))
                             }
                         }
-                        Text("Photos").font(.caption2)
                     }
                 }
                 .accessibilityLabel(model.lastSavedThumbnail == nil ? "Open Photos" : "Review last saved capture")
@@ -377,8 +391,7 @@ struct CameraView: View {
                     Image(systemName: "arrow.triangle.2.circlepath.camera")
                         .font(.title3)
                         .frame(width: 48, height: 48)
-                        .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-                    Text("Flip").font(.caption2)
+
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -473,7 +486,7 @@ struct CameraView: View {
                         Text(page.rawValue).font(.caption.weight(.semibold)).lineLimit(2)
                     }
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).padding(8)
-                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+
                 }.buttonStyle(.plain)
             }
         }
