@@ -338,7 +338,7 @@ final class CameraViewModel: ObservableObject {
         }
         if let lens = requiredLens, lens.id != camera.selectedID {
             configuring = true
-            engine.select(lens.id, zoom: zoom)
+            engine.select(lens.id)
             return
         }
         pendingTool = nil
