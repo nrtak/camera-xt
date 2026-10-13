@@ -338,7 +338,7 @@ final class CameraViewModel: ObservableObject {
         }
         if let lens = requiredLens, lens.id != camera.selectedID {
             configuring = true
-            engine.select(lens.id)
+            engine.select(lens.id, zoom: zoom)
             return
         }
         pendingTool = nil
@@ -521,14 +521,14 @@ final class CameraViewModel: ObservableObject {
         if active && permission == .authorized { engine.start() }
     }
 
-    func select(_ lens: CameraLens) {
+    func select(_ lens: CameraLens, zoom: Double = 1) {
         guard canSwitch else { return }
         if !lens.isFront {
             lastRearLensID = lens.id
             UserDefaults.standard.set(lens.id, forKey: "camera.preferredRearLens")
         }
         configuring = true
-        engine.select(lens.id)
+        engine.select(lens.id, zoom: zoom)
     }
 
     func flip() {
