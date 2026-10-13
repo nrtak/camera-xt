@@ -5,6 +5,7 @@ struct CameraLens: Identifiable, Equatable {
     let name: String
     let isFront: Bool
     var zoomFactor: Double? = nil
+    var maximumZoom: Double = 1
     var zoomLabel: String {
         guard let zoomFactor else { return name }
         return zoomFactor.rounded() == zoomFactor ? String(format: "%.0f×", zoomFactor) : String(format: "%.1f×", zoomFactor)
@@ -46,6 +47,6 @@ enum CameraDeviceCatalog {
             default: name = "Wide"
             }
         }
-        return CameraLens(id: device.uniqueID, name: name, isFront: device.position == .front, zoomFactor: displayZoom(for: device))
+        return CameraLens(id: device.uniqueID, name: name, isFront: device.position == .front, zoomFactor: displayZoom(for: device), maximumZoom: Double(device.maxAvailableVideoZoomFactor))
     }
 }
