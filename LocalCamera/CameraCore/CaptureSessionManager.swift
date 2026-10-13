@@ -16,7 +16,15 @@ struct CameraControls: Equatable {
     var flash: AVCaptureDevice.FlashMode = .off
 }
 
+struct CameraZoom {
+    var value: Double = 1
+    var minimum: Double = 1
+    var maximum: Double = 1
+}
+
 struct CameraSnapshot {
+    var zooms: [CameraZoom] = []
+
     var lenses: [CameraLens] = []
     var selectedID: String?
     var resolution = "—"
@@ -209,7 +217,7 @@ final class CaptureSessionManager {
         try applyControls(to: device)
     }
 
-    func select(_ id: String) {
+    func select(_ id: String, zoom: Double = 1) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, !self.snapshot.dualEnabled, let oldInput = self.input,
                   let device = self.devices.first(where: { $0.uniqueID == id }) else { return }
@@ -226,6 +234,7 @@ final class CaptureSessionManager {
                     self.snapshot.selectedID = id
                     self.session.commitConfiguration()
                     try self.applyControls(to: device)
+                    try self.applyZoom(zoom, to: device)
                     self.connectPreview()
                     self.publish()
                 } else {
@@ -234,6 +243,33 @@ final class CaptureSessionManager {
                     throw CameraFailure.input
                 }
             } catch { self.publish(message: error.localizedDescription) }
+        }
+    }
+
+    private func applyZoom(_ factor: Double, to device: AVCaptureDevice) throws {
+        guard factor.isFinite else { return }
+        try device.lockForConfiguration()
+        defer { device.unlockForConfiguration() }
+        device.videoZoomFactor = min(max(CGFloat(factor), device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
+    }
+
+    func setZoom(_ displayed: Double, dualIndex: Int? = nil) {
+        queue.async {
+            guard displayed.isFinite, !self.burstRunning, self.processor == nil,
+                  self.movieProcessor == nil, !self.dual.busy else { return }
+            let device: AVCaptureDevice
+            if self.snapshot.dualEnabled {
+                guard let index = dualIndex, self.dual.inputs.indices.contains(index) else { return }
+                device = self.dual.inputs[index].device
+            } else {
+                guard dualIndex == nil, let current = self.input?.device else { return }
+                device = current
+            }
+            let base = self.snapshot.lenses.first(where: { $0.id == device.uniqueID })?.zoomFactor ?? 1
+            do {
+                try self.applyZoom(displayed / base, to: device)
+                self.publish()
+            } catch { self.onWarning?(error.localizedDescription) }
         }
     }
 
@@ -301,6 +337,13 @@ final class CaptureSessionManager {
 
     private func publish(message: String? = nil) {
         updateMeter()
+        let zoomDevices = snapshot.dualEnabled ? dual.inputs.map(\.device) : [input?.device].compactMap { $0 }
+        snapshot.zooms = zoomDevices.map { device in
+            let base = snapshot.lenses.first(where: { $0.id == device.uniqueID })?.zoomFactor ?? 1
+            return CameraZoom(value: Double(device.videoZoomFactor) * base,
+                              minimum: Double(device.minAvailableVideoZoomFactor) * base,
+                              maximum: Double(device.maxAvailableVideoZoomFactor) * base)
+        }
         snapshot.depthAvailable = !snapshot.dualEnabled && !snapshot.videoMode && output.isDepthDataDeliveryEnabled
         if !snapshot.depthAvailable { snapshot.depthEnabled = false }
         snapshot.dualFocusSupported = snapshot.dualEnabled ? dual.inputs.map {
