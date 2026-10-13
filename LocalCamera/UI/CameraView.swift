@@ -26,6 +26,7 @@ struct CameraView: View {
     @State private var showsZoom = false
     @State private var lastZoomUpdate = Date.distantPast
     @State private var pinchStart: Double?
+    @State private var pinchDeviceID: String?
     @AppStorage("camera.dualLayout") private var dualLayout = -1
     @AppStorage("camera.dualCorner") private var dualCorner = 3
     @AppStorage("camera.showHelp") private var showHelp = false
@@ -270,13 +271,18 @@ struct CameraView: View {
     private func zoomGesture(_ index: Int?) -> some Gesture {
         MagnificationGesture().onChanged { scale in
             guard model.canConfigure else { return }
-            if pinchStart == nil { pinchStart = zoomState(index).value }
+            if pinchStart == nil { pinchStart = zoomState(index).value; pinchDeviceID = zoomState(index).deviceID }
             if let index { selectedDualIndex = index }
             showsZoom = true
             guard Date().timeIntervalSince(lastZoomUpdate) > 0.05 else { return }
             lastZoomUpdate = Date()
-            model.engine.setZoom((pinchStart ?? 1) * Double(scale), dualIndex: index)
-        }.onEnded { _ in pinchStart = nil }
+            model.engine.setZoom((pinchStart ?? 1) * Double(scale), deviceID: pinchDeviceID ?? "", dualIndex: index)
+        }.onEnded { scale in
+            if model.canConfigure, let start = pinchStart, let id = pinchDeviceID {
+                model.engine.setZoom(start * Double(scale), deviceID: id, dualIndex: index)
+            }
+            pinchStart = nil; pinchDeviceID = nil
+        }
     }
 
     private var zoomSlider: some View {
@@ -289,7 +295,7 @@ struct CameraView: View {
                     let value = exp($0)
                     let stops = [zoom.minimum, 1, 2, 3, 5, 10].filter { $0 >= zoom.minimum && $0 <= zoom.maximum }
                     let snapped = stops.first(where: { abs(log(value / $0)) < 0.015 }) ?? value
-                    model.engine.setZoom(snapped, dualIndex: index)
+                    model.engine.setZoom(snapped, deviceID: zoom.deviceID, dualIndex: index)
                 }), in: log(zoom.minimum)...log(zoom.maximum))
                 .accessibilityLabel("Camera zoom")
                 .accessibilityValue(zoomText(zoom.value))
@@ -298,6 +304,15 @@ struct CameraView: View {
             Button { showsZoom = false } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
                 .accessibilityLabel("Close zoom slider")
         }.padding(.leading, 12).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func zoomButtonGesture(tap: @escaping () -> Void) -> some Gesture {
+        LongPressGesture().exclusively(before: TapGesture()).onEnded { result in
+            switch result {
+            case .first: showsZoom = true
+            case .second: tap()
+            }
+        }
     }
 
     private var lensSelector: some View {
@@ -309,7 +324,7 @@ struct CameraView: View {
                             .frame(minWidth: 44, minHeight: 44)
                             .foregroundStyle(lens.id == model.camera.selectedID && abs(zoomState().value - (lens.zoomFactor ?? 1)) < 0.05 ? selection : .white)
                     }
-                    .simultaneousGesture(LongPressGesture().onEnded { _ in showsZoom = true })
+                    .highPriorityGesture(zoomButtonGesture { model.select(lens) })
                     .accessibilityLabel("\(lens.zoomLabel) zoom")
                     .disabled(!model.canSwitch)
                     if lens.zoomFactor == 1 && lens.maximumZoom >= 2 {
@@ -317,7 +332,7 @@ struct CameraView: View {
                             .disabled(!model.canSwitch)
                             .frame(minWidth: 44, minHeight: 44)
                             .foregroundStyle(lens.id == model.camera.selectedID && abs(zoomState().value - 2) < 0.05 ? selection : .white)
-                            .simultaneousGesture(LongPressGesture().onEnded { _ in showsZoom = true })
+                            .highPriorityGesture(zoomButtonGesture { model.select(lens, zoom: 2) })
                     }
                 }
             }
