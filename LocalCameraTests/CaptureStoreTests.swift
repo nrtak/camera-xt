@@ -4,6 +4,17 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testZoomRestorationClampsToChangedFormatLimits() {
+        XCTAssertEqual(ZoomLimits.clamp(8, minimum: 1, maximum: 4), 4)
+        XCTAssertEqual(ZoomLimits.clamp(0.5, minimum: 1, maximum: 4), 1)
+        XCTAssertEqual(ZoomLimits.clamp(2.3, minimum: 1, maximum: 4), 2.3)
+    }
+    func testZoomRejectsInvalidValuesAndRanges() {
+        XCTAssertNil(ZoomLimits.clamp(.nan, minimum: 1, maximum: 4))
+        XCTAssertNil(ZoomLimits.clamp(.infinity, minimum: 1, maximum: 4))
+        XCTAssertNil(ZoomLimits.clamp(2, minimum: 4, maximum: 1))
+        XCTAssertNil(ZoomLimits.clamp(2, minimum: 0, maximum: 4))
+    }
     private var root: URL!
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
