@@ -16,7 +16,15 @@ struct CameraControls: Equatable {
     var flash: AVCaptureDevice.FlashMode = .off
 }
 
+enum ZoomLimits {
+    static func clamp(_ value: Double, minimum: Double, maximum: Double) -> Double? {
+        guard value.isFinite, minimum.isFinite, maximum.isFinite, minimum >= 1, maximum >= minimum else { return nil }
+        return min(max(value, minimum), maximum)
+    }
+}
+
 struct CameraZoom {
+    var deviceID = ""
     var value: Double = 1
     var minimum: Double = 1
     var maximum: Double = 1
@@ -221,6 +229,11 @@ final class CaptureSessionManager {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, !self.snapshot.dualEnabled, let oldInput = self.input,
                   let device = self.devices.first(where: { $0.uniqueID == id }) else { return }
+            if oldInput.device.uniqueID == device.uniqueID {
+                do { try self.applyZoom(zoom, to: device); self.publish() }
+                catch { self.publish(message: error.localizedDescription) }
+                return
+            }
             self.disableAnalysis()
             self.disableEyeFocus()
             do {
@@ -250,10 +263,11 @@ final class CaptureSessionManager {
         guard factor.isFinite else { return }
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
-        device.videoZoomFactor = min(max(CGFloat(factor), device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
+        guard let value = ZoomLimits.clamp(factor, minimum: Double(device.minAvailableVideoZoomFactor), maximum: Double(device.maxAvailableVideoZoomFactor)) else { return }
+        if abs(Double(device.videoZoomFactor) - value) > 0.0001 { device.videoZoomFactor = CGFloat(value) }
     }
 
-    func setZoom(_ displayed: Double, dualIndex: Int? = nil) {
+    func setZoom(_ displayed: Double, deviceID: String, dualIndex: Int? = nil) {
         queue.async {
             guard displayed.isFinite, !self.burstRunning, self.processor == nil,
                   self.movieProcessor == nil, !self.dual.busy else { return }
@@ -265,9 +279,12 @@ final class CaptureSessionManager {
                 guard dualIndex == nil, let current = self.input?.device else { return }
                 device = current
             }
+            guard device.uniqueID == deviceID else { return }
             let base = self.snapshot.lenses.first(where: { $0.id == device.uniqueID })?.zoomFactor ?? 1
+            guard let target = ZoomLimits.clamp(displayed / base, minimum: Double(device.minAvailableVideoZoomFactor), maximum: Double(device.maxAvailableVideoZoomFactor)),
+                  abs(Double(device.videoZoomFactor) - target) > 0.0001 else { return }
             do {
-                try self.applyZoom(displayed / base, to: device)
+                try self.applyZoom(target, to: device)
                 self.publish()
             } catch { self.onWarning?(error.localizedDescription) }
         }
@@ -340,7 +357,7 @@ final class CaptureSessionManager {
         let zoomDevices = snapshot.dualEnabled ? dual.inputs.map(\.device) : [input?.device].compactMap { $0 }
         snapshot.zooms = zoomDevices.map { device in
             let base = snapshot.lenses.first(where: { $0.id == device.uniqueID })?.zoomFactor ?? 1
-            return CameraZoom(value: Double(device.videoZoomFactor) * base,
+            return CameraZoom(deviceID: device.uniqueID, value: Double(device.videoZoomFactor) * base,
                               minimum: Double(device.minAvailableVideoZoomFactor) * base,
                               maximum: Double(device.maxAvailableVideoZoomFactor) * base)
         }
@@ -1019,7 +1036,7 @@ private final class DualPhotoCamera {
     private let queue: DispatchQueue
     private(set) var inputs: [AVCaptureDeviceInput] = []
     private var outputs: [AVCapturePhotoOutput] = []
-    private var originals: [(AVCaptureDevice, AVCaptureDevice.Format, CMTime, CMTime)] = []
+    private var originals: [(AVCaptureDevice, AVCaptureDevice.Format, CMTime, CMTime, CGFloat)] = []
     private var processors: [Int: PhotoCaptureProcessor] = [:]
     private var results: [Int: Result<CapturedPhoto, Error>] = [:]
     private(set) var busy = false
@@ -1066,13 +1083,14 @@ private final class DualPhotoCamera {
                 let b = CMVideoFormatDescriptionGetDimensions($1.formatDescription)
                 return Int64(a.width) * Int64(a.height) < Int64(b.width) * Int64(b.height)
             }) else { throw Failure.unsupported }
-            originals.append((device, device.activeFormat, device.activeVideoMinFrameDuration, device.activeVideoMaxFrameDuration))
+            originals.append((device, device.activeFormat, device.activeVideoMinFrameDuration, device.activeVideoMaxFrameDuration, device.videoZoomFactor))
             let input = try AVCaptureDeviceInput(device: device)
             guard session.canAddInput(input) else { throw Failure.unsupported }
             session.addInputWithNoConnections(input)
             inputs.append(input)
             try device.lockForConfiguration()
             device.activeFormat = format
+            device.videoZoomFactor = device.minAvailableVideoZoomFactor
             device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
             device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
             device.unlockForConfiguration()
@@ -1103,10 +1121,13 @@ private final class DualPhotoCamera {
         session.commitConfiguration()
         inputs.removeAll()
         outputs.removeAll()
-        for (device, format, minimum, maximum) in originals {
+        for (device, format, minimum, maximum, zoom) in originals {
             do {
                 try device.lockForConfiguration()
                 device.activeFormat = format
+                if let restored = ZoomLimits.clamp(Double(zoom), minimum: Double(device.minAvailableVideoZoomFactor), maximum: Double(device.maxAvailableVideoZoomFactor)) {
+                    device.videoZoomFactor = CGFloat(restored)
+                }
                 device.activeVideoMinFrameDuration = minimum
                 device.activeVideoMaxFrameDuration = maximum
                 device.unlockForConfiguration()
