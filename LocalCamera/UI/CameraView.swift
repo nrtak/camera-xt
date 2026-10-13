@@ -311,8 +311,10 @@ struct CameraView: View {
                     }
                     .simultaneousGesture(LongPressGesture().onEnded { _ in showsZoom = true })
                     .accessibilityLabel("\(lens.zoomLabel) zoom")
+                    .disabled(!model.canSwitch)
                     if lens.zoomFactor == 1 && lens.maximumZoom >= 2 {
                         Button("2×") { model.select(lens, zoom: 2) }
+                            .disabled(!model.canSwitch)
                             .frame(minWidth: 44, minHeight: 44)
                             .foregroundStyle(lens.id == model.camera.selectedID && abs(zoomState().value - 2) < 0.05 ? selection : .white)
                             .simultaneousGesture(LongPressGesture().onEnded { _ in showsZoom = true })
@@ -364,7 +366,7 @@ struct CameraView: View {
     }
 
     private var captureControls: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 12) {
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst && !model.camera.dualEnabled {
                 lensSelector
             }
