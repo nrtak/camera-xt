@@ -15,6 +15,23 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertNil(ZoomLimits.clamp(2, minimum: 4, maximum: 1))
         XCTAssertNil(ZoomLimits.clamp(2, minimum: 0, maximum: 4))
     }
+    func testZoomShortcutsMatchCapabilitySets() {
+        let ultra = CameraLens(id: "u", name: "Ultra Wide", isFront: false, zoomFactor: 0.5, maximumZoom: 16)
+        let miniMain = CameraLens(id: "m", name: "Wide", isFront: false, zoomFactor: 1, maximumZoom: 16)
+        XCTAssertEqual(ZoomShortcuts.make([ultra, miniMain]).map(\.value), [0.5, 1])
+        let proMain = CameraLens(id: "m", name: "Wide", isFront: false, zoomFactor: 1, maximumZoom: 16, secondaryZooms: [2])
+        let tele = CameraLens(id: "t", name: "Telephoto", isFront: false, zoomFactor: 5, maximumZoom: 16)
+        XCTAssertEqual(ZoomShortcuts.make([tele, proMain, ultra]).map(\.value), [0.5, 1, 2, 5])
+        let tele3 = CameraLens(id: "t", name: "Telephoto", isFront: false, zoomFactor: 3, maximumZoom: 16)
+        XCTAssertEqual(ZoomShortcuts.make([ultra, proMain, tele3]).map(\.value), [0.5, 1, 2, 3])
+    }
+    func testZoomShortcutsPreferPhysicalLensAndRejectInvalidStops() {
+        let main = CameraLens(id: "m", name: "Wide", isFront: false, zoomFactor: 1, maximumZoom: 4, secondaryZooms: [2, 2, .nan, 8])
+        let tele = CameraLens(id: "t", name: "Telephoto", isFront: false, zoomFactor: 2, maximumZoom: 4)
+        let choices = ZoomShortcuts.make([main, tele])
+        XCTAssertEqual(choices.map(\.value), [1, 2])
+        XCTAssertEqual(choices.last?.lens.id, "t")
+    }
     private var root: URL!
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
