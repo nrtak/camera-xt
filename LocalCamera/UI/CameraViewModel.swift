@@ -104,6 +104,8 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var recent: CaptureStore.Record?
     @Published private(set) var recordingStarted: Date?
     @Published private(set) var readyMilliseconds: Int?
+    @Published private(set) var lastCaptureMilliseconds: Int?
+    @Published private(set) var lastSaveMilliseconds: Int?
     @Published private(set) var lowStorage = false
     @Published private(set) var recoveryProtected = false
     @Published var haptics = UserDefaults.standard.bool(forKey: "camera.haptics") {
@@ -580,12 +582,14 @@ final class CameraViewModel: ObservableObject {
         }
         message = "Capturing…"
         expectingCaptureProgress = true
+        let captureStarted = ProcessInfo.processInfo.systemUptime
         engine.capture { [weak self] result in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 switch result {
                 case .success(let photo):
                     self.expectingCaptureProgress = false
+                    self.lastCaptureMilliseconds = Int((ProcessInfo.processInfo.systemUptime - captureStarted) * 1000)
                     self.pendingPhoto = photo
                     await self.savePending()
                 case .failure(let error):
@@ -636,6 +640,7 @@ final class CameraViewModel: ObservableObject {
             return
         }
         message = "Saving to Photos…"
+        let saveStarted = ProcessInfo.processInfo.systemUptime
         do {
             let thumbnail: Data?
             let savedMessage: String
@@ -648,6 +653,7 @@ final class CameraViewModel: ObservableObject {
                 try await saver.save(photo)
                 savedMessage = photo.warning ?? (photo.companions.isEmpty ? "Saved" : "Saved \(1 + photo.companions.count) photos")
             } else { return }
+            lastSaveMilliseconds = Int((ProcessInfo.processInfo.systemUptime - saveStarted) * 1000)
             // Photos has committed. Cache failures must never offer an automatic duplicate save.
             pendingPhoto = nil; pendingVideo = nil
             do {
