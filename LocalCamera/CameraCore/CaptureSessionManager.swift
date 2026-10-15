@@ -751,8 +751,10 @@ final class CaptureSessionManager {
         }
     }
 
-    func setVideoMode(_ enabled: Bool, width: Int32 = 1920, fps: Int32 = 30, stabilized: Bool = true) {
+    func setVideoMode(_ enabled: Bool, width: Int32 = 1920, fps: Int32 = 30, stabilized: Bool = true,
+                      completion: ((CameraSnapshot) -> Void)? = nil) {
         queue.async {
+            defer { completion?(self.snapshot) }
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
                   let device = self.input?.device else { self.publish(); return }
             self.disableAnalysis()
@@ -781,6 +783,12 @@ final class CaptureSessionManager {
                     if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = true }
                     device.unlockForConfiguration()
                     self.snapshot.videoMode = true
+                    if self.audioInput == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+                       let microphone = AVCaptureDevice.default(for: .audio),
+                       let audio = try? AVCaptureDeviceInput(device: microphone), self.session.canAddInput(audio) {
+                        self.session.addInput(audio)
+                        self.audioInput = audio
+                    }
                     self.snapshot.videoLabel = "\(width == 3840 ? "4K" : "1080p") · \(fps) fps"
                     self.snapshot.stabilized = false
                     if let connection = self.movie.connection(with: .video) {
