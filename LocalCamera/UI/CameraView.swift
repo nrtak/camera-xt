@@ -633,7 +633,8 @@ struct CameraView: View {
         switch toolPath.last {
         case nil: return (advancedTools ? 560 : 290) + (hasAdjustments ? 44 : 0)
         case .shoot: base = model.camera.dualEnabled ? 370 : 350
-        case .preferences: base = 480
+        case .preferences:
+            base = preferencesSection == 0 ? 320 : preferencesSection == 1 ? (showQuickControls && quickAccess ? 510 : 360) : 450
         case .timer: base = 260
         case .video: base = 350
         case .gallery, .rescue: return .infinity
