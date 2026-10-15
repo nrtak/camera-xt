@@ -1,6 +1,7 @@
 import AVFoundation
 import SwiftUI
 import UIKit
+import ImageIO
 
 struct CameraPreview: UIViewRepresentable {
     let engine: CaptureSessionManager
@@ -20,8 +21,15 @@ struct CameraPreview: UIViewRepresentable {
         let grid = CAShapeLayer()
         let guide = UIImageView()
         private var gridFrame = CGRect.null
+        var orientationChanged: ((AVCaptureVideoOrientation) -> Void)?
+        private var lastOrientation: UIInterfaceOrientation = .unknown
         override func layoutSubviews() {
             super.layoutSubviews()
+            if let orientation = window?.windowScene?.interfaceOrientation,
+               orientation != .unknown, orientation != lastOrientation {
+                lastOrientation = orientation
+                orientationChanged?(CameraOrientation.capture(orientation))
+            }
             updateOverlays()
         }
         func updateOverlays() {
@@ -83,6 +91,9 @@ struct CameraPreview: UIViewRepresentable {
     }
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
+        view.orientationChanged = { [weak engine, weak view] orientation in
+            engine?.setInterfaceOrientation(orientation) { view?.updateOverlays() }
+        }
         view.clipsToBounds = true
         view.previewLayer.videoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if allowsFocus {
@@ -114,5 +125,34 @@ enum PreviewGeometry {
         !rect.isNull && !rect.isInfinite && !rect.isEmpty &&
         rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite &&
         rect.width > 0 && rect.height > 0
+    }
+}
+
+enum CameraOrientation {
+    static func capture(_ orientation: UIInterfaceOrientation) -> AVCaptureVideoOrientation {
+        switch orientation {
+        case .landscapeLeft: return .landscapeLeft
+        case .landscapeRight: return .landscapeRight
+        case .portraitUpsideDown: return .portraitUpsideDown
+        default: return .portrait
+        }
+    }
+
+    static func vision(_ orientation: AVCaptureVideoOrientation) -> CGImagePropertyOrientation {
+        switch orientation {
+        case .landscapeRight: return .up
+        case .landscapeLeft: return .down
+        case .portraitUpsideDown: return .left
+        default: return .right
+        }
+    }
+
+    static func sensorPoint(x: CGFloat, y: CGFloat, orientation: AVCaptureVideoOrientation) -> CGPoint {
+        switch orientation {
+        case .landscapeRight: return CGPoint(x: x, y: 1 - y)
+        case .landscapeLeft: return CGPoint(x: 1 - x, y: y)
+        case .portraitUpsideDown: return CGPoint(x: y, y: x)
+        default: return CGPoint(x: 1 - y, y: 1 - x)
+        }
     }
 }
