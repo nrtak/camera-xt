@@ -4,6 +4,39 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testLaunchDefaultsResetCameraSettingsButPreservePolicyAndOtherData() throws {
+        let name = "CameraXT.launch-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(false, forKey: CameraLaunchPreferences.policyKey)
+        defaults.set(true, forKey: "camera.showsGrid")
+        defaults.set(Data([1, 2]), forKey: CameraLaunchPreferences.setupKey)
+        defaults.set("keep", forKey: "unrelated")
+        CameraLaunchPreferences.prepare(defaults)
+        XCTAssertNil(defaults.object(forKey: "camera.showsGrid"))
+        XCTAssertNil(defaults.data(forKey: CameraLaunchPreferences.setupKey))
+        XCTAssertEqual(defaults.object(forKey: CameraLaunchPreferences.policyKey) as? Bool, false)
+        XCTAssertEqual(defaults.string(forKey: "unrelated"), "keep")
+    }
+    func testRememberPolicyPreservesSettings() throws {
+        let name = "CameraXT.remember-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(true, forKey: CameraLaunchPreferences.policyKey)
+        defaults.set("Night", forKey: "camera.testStyle")
+        CameraLaunchPreferences.prepare(defaults)
+        XCTAssertEqual(defaults.string(forKey: "camera.testStyle"), "Night")
+    }
+    func testManualControlsRoundTripIncludesFlash() throws {
+        var controls = CameraControls()
+        controls.automaticExposure = false; controls.iso = 640; controls.shutterSeconds = 0.02
+        controls.automaticFocus = false; controls.lensPosition = 0.7
+        controls.automaticWhiteBalance = false; controls.temperature = 4200
+        controls.flash = .auto
+        let decoded = try JSONDecoder().decode(CameraControls.self, from: JSONEncoder().encode(controls))
+        XCTAssertEqual(decoded, controls)
+        XCTAssertEqual(decoded.flash, .auto)
+    }
     func testNightDimensionsRespectBothMemoryAndOutputLimits() {
         let small = CMVideoDimensions(width: 4032, height: 3024)
         let large = CMVideoDimensions(width: 8064, height: 6048)
