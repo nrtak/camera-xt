@@ -68,7 +68,7 @@ struct CameraPreview: UIViewRepresentable {
             marker.textAlignment = .center; marker.textColor = .white
             marker.backgroundColor = UIColor.black.withAlphaComponent(0.35)
             marker.isUserInteractionEnabled = false
-            marker.layer.borderColor = exposureOnly ? UIColor.white.cgColor : UIColor.systemYellow.cgColor
+            marker.layer.borderColor = exposureOnly ? UIColor.white.cgColor : UIColor(CameraAppearance.selection).cgColor
             marker.layer.borderWidth = 1
             view.addSubview(marker); self.marker = marker
             if !locked || exposureOnly {
