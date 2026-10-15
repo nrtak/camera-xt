@@ -3,7 +3,7 @@ import Vision
 import CoreImage
 import UIKit
 
-struct CameraControls: Equatable {
+struct CameraControls: Equatable, Codable {
     var automaticExposure = true
     var iso: Float = 100
     var shutterSeconds = 1.0 / 250
@@ -13,7 +13,11 @@ struct CameraControls: Equatable {
     var automaticFocus = true
     var lensPosition: Float = 0.5
     var facePriority = true
-    var flash: AVCaptureDevice.FlashMode = .off
+    private var flashValue = AVCaptureDevice.FlashMode.off.rawValue
+    var flash: AVCaptureDevice.FlashMode {
+        get { AVCaptureDevice.FlashMode(rawValue: flashValue) ?? .off }
+        set { flashValue = newValue.rawValue }
+    }
 }
 
 enum ZoomLimits {
@@ -23,7 +27,7 @@ enum ZoomLimits {
     }
 }
 
-struct CameraZoom {
+struct CameraZoom: Codable {
     var deviceID = ""
     var value: Double = 1
     var minimum: Double = 1
@@ -162,6 +166,8 @@ final class CaptureSessionManager {
                 if self.input == nil { try self.configure() }
                 else if !self.snapshot.dualEnabled { try self.restoreSingleCamera() }
                 self.connectPreview()
+                if let analyzer = self.analyzer { self.analysisOutput.setSampleBufferDelegate(analyzer, queue: analyzer.queue) }
+                if let tracker = self.eyeTracker { self.eyeOutput.setSampleBufferDelegate(tracker, queue: tracker.queue) }
                 if !self.activeSession.isRunning { self.activeSession.startRunning() }
                 self.startMetering()
                 self.publish(message: self.activeSession.isRunning ? nil : "Camera unavailable. Tap Retry camera.")
@@ -172,6 +178,10 @@ final class CaptureSessionManager {
     func stop() {
         queue.async {
             self.wantsRunning = false
+            self.analysisOutput.setSampleBufferDelegate(nil, queue: nil)
+            self.eyeOutput.setSampleBufferDelegate(nil, queue: nil)
+            self.analyzer?.releaseBuffers()
+            self.onAnalysis?(nil, [])
             self.dual.cancelRemainingCapture()
             self.meterTimer?.cancel()
             self.meterTimer = nil
@@ -411,7 +421,7 @@ final class CaptureSessionManager {
             }
             let analyzer = ViewfinderAnalyzer(mode: mode) { [weak self] image, bins in
                 self?.queue.async { [weak self] in
-                    guard let self, self.snapshot.analysisMode == mode else { return }
+                    guard let self, self.wantsRunning, self.session.isRunning, self.snapshot.analysisMode == mode else { return }
                     self.onAnalysis?(image, bins)
                 }
             }
@@ -1323,6 +1333,11 @@ private final class DualPhotoCamera {
 
 /// Optional, low-resolution guides. These never modify a captured photo.
 private final class ViewfinderAnalyzer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    func releaseBuffers() {
+        queue.async { [weak self] in
+            self?.pixels = []; self?.luma = []; self?.context.clearCaches()
+        }
+    }
     let queue = DispatchQueue(label: "CameraXT.viewfinderGuides", qos: .utility)
     let mode: String
     let report: (UIImage?, [Double]) -> Void
