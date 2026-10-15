@@ -3,6 +3,41 @@ import SwiftUI
 import UIKit
 import ImageIO
 import PhotosUI
+import Combine
+
+enum CameraLaunchPreferences {
+    static let policyKey = "camera.rememberSetup"
+    static let setupKey = "camera.savedSetup"
+    static func prepare(_ defaults: UserDefaults) {
+        guard defaults.object(forKey: policyKey) as? Bool == false else { return }
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix("camera.") && key != policyKey {
+            defaults.removeObject(forKey: key)
+        }
+    }
+    private static let prepared: Void = prepare(.standard)
+    static func prepareOnce() { _ = prepared }
+}
+
+struct SavedCameraSetup: Codable {
+    var lensID: String?
+    var video: Bool
+    var dual: Bool
+    var dualMode: String
+    var style: String
+    var controls: CameraControls
+    var bias: Float
+    var dualBrightness: [Float]
+    var zooms: [CameraZoom]
+    var timer: Int
+    var burst: Bool
+    var videoWidth: Int32
+    var videoFPS: Int32
+    var stabilization: Bool
+    var depth: Bool
+    var eye: Bool
+    var analysis: String
+    var exposurePointOnly: Bool
+}
 
 @MainActor
 final class PhotoRescueModel: ObservableObject {
@@ -97,6 +132,67 @@ enum CapturePreviewDecoder {
 
 @MainActor
 final class CameraViewModel: ObservableObject {
+    private var settingsObservation: AnyCancellable?
+    private var launchSetup: SavedCameraSetup?
+    private var launchStage = 0
+    private var lastSavedSetup: Data?
+
+    private func saveSetup() {
+        guard launchSetup == nil, camera.running, !configuring, !restoring,
+              UserDefaults.standard.object(forKey: CameraLaunchPreferences.policyKey) as? Bool != false else { return }
+        let setup = SavedCameraSetup(lensID: camera.selectedID, video: camera.videoMode,
+            dual: camera.dualEnabled, dualMode: camera.dualMode.rawValue, style: captureStyle,
+            controls: controls, bias: exposureBias, dualBrightness: dualBrightness, zooms: camera.zooms,
+            timer: timerSeconds, burst: burstEnabled, videoWidth: videoWidth, videoFPS: videoFPS,
+            stabilization: stabilization, depth: camera.depthEnabled, eye: camera.eyeFocusEnabled,
+            analysis: camera.analysisMode, exposurePointOnly: exposurePointOnly)
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        if let data = try? encoder.encode(setup), data != lastSavedSetup {
+            lastSavedSetup = data
+            UserDefaults.standard.set(data, forKey: CameraLaunchPreferences.setupKey)
+        }
+    }
+
+    private func restoreSetupIfReady() {
+        guard let saved = launchSetup, camera.running, canConfigure else { return }
+        if launchStage == 0 {
+            launchStage = 1
+            if let id = saved.lensID, camera.lenses.contains(where: { $0.id == id }), camera.selectedID != id {
+                configuring = true; engine.select(id); return
+            }
+        }
+        if launchStage == 1 {
+            launchStage = 2
+            videoWidth = saved.videoWidth; videoFPS = saved.videoFPS; stabilization = saved.stabilization
+            if saved.dual && camera.dualAvailable {
+                configuring = true
+                engine.setDualEnabled(true, mode: saved.style == "Night" ? .detail : DualShotMode(rawValue: saved.dualMode) ?? .fast)
+                return
+            } else if saved.video {
+                configuring = true
+                engine.setVideoMode(true, width: videoWidth, fps: videoFPS, stabilized: stabilization)
+                return
+            }
+        }
+        launchSetup = nil
+        controls = saved.controls; exposureBias = saved.bias
+        exposurePointOnly = saved.exposurePointOnly
+        captureStyle = saved.style; timerSeconds = saved.timer; burstEnabled = saved.burst && !camera.dualEnabled
+        if camera.dualEnabled {
+            dualBrightness = saved.dualBrightness.count == 2 ? saved.dualBrightness : [0, 0]
+            for index in 0..<2 { engine.setExposureBias(dualBrightness[index], dualIndex: index) }
+        } else {
+            engine.setControls(controls)
+            engine.setDepthEnabled(saved.depth)
+            if saved.eye { engine.setEyeFocus(true) }
+            else { engine.setAnalysis(saved.analysis) }
+        }
+        for (index, zoom) in saved.zooms.enumerated() {
+            if camera.zooms.indices.contains(index), camera.zooms[index].deviceID == zoom.deviceID {
+                engine.setZoom(zoom.value, deviceID: zoom.deviceID, dualIndex: camera.dualEnabled ? index : nil)
+            }
+        }
+    }
     @Published private(set) var camera = CameraSnapshot()
     @Published private(set) var permission = AVCaptureDevice.authorizationStatus(for: .video)
     @Published private(set) var busy = false
@@ -247,7 +343,7 @@ final class CameraViewModel: ObservableObject {
         guard !busy, !configuring, !hasPendingCapture, mode == .photo, enabled != camera.dualEnabled else { return }
         configuring = true
         if enabled { burstEnabled = false }
-        engine.setDualEnabled(enabled)
+        engine.setDualEnabled(enabled, mode: enabled && captureStyle == "Night" ? .detail : nil)
     }
     func setDualMode(_ mode: DualShotMode) {
         guard canConfigure, camera.dualEnabled, mode != camera.dualMode else { return }
@@ -394,10 +490,19 @@ final class CameraViewModel: ObservableObject {
         engine.setDepthEnabled(false)
     }
 
-    func enteredBackground() { resetOnReturn = true; nightWork?.cancel() }
+    func enteredBackground() { saveSetup(); nightWork?.cancel() }
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
+        CameraLaunchPreferences.prepareOnce()
         self.saver = saver
+        haptics = UserDefaults.standard.bool(forKey: "camera.haptics")
+        if let data = UserDefaults.standard.data(forKey: CameraLaunchPreferences.setupKey) {
+            launchSetup = try? JSONDecoder().decode(SavedCameraSetup.self, from: data)
+        }
+        restoredLens = launchSetup != nil
+        settingsObservation = objectWillChange.sink { [weak self] _ in
+            Task { @MainActor [weak self] in self?.saveSetup() }
+        }
         engine.onCaptureProgress = { [weak self] progress in
             Task { @MainActor [weak self] in
                 guard let self, self.expectingCaptureProgress else { return }
@@ -406,7 +511,10 @@ final class CameraViewModel: ObservableObject {
         }
         engine.onWarning = { [weak self] warning in Task { @MainActor [weak self] in self?.message = warning } }
         engine.onAnalysis = { [weak self] image, bins in
-            Task { @MainActor [weak self] in self?.guides.image = image; self?.guides.histogram = bins }
+            Task { @MainActor [weak self] in
+                guard let self, self.active else { return }
+                self.guides.image = image; self.guides.histogram = bins
+            }
         }
         Task { await restoreCaptures() }
         engine.onMeter = { [weak self] meter in
@@ -421,6 +529,7 @@ final class CameraViewModel: ObservableObject {
                 updated.focusStates = meter.focusStates
                 updated.cooling = meter.cooling
                 self.camera = updated
+                self.restoreSetupIfReady()
                 if self.resetOnReturn, self.active, self.canConfigure {
                     self.resetOnReturn = false
                     self.resetTemporarySettings()
@@ -473,6 +582,7 @@ final class CameraViewModel: ObservableObject {
                         self.pendingTool = nil
                         self.message = failure
                     } else { self.continueTool() }
+                    self.restoreSetupIfReady()
                 }
                 if snapshot.recording && self?.recordingRequested == true {
                     self?.busy = false
@@ -502,6 +612,13 @@ final class CameraViewModel: ObservableObject {
     }
 
     func setActive(_ value: Bool) {
+        if !value {
+            saveSetup()
+            nightWork?.cancel()
+            controlsTask?.cancel(); controlsTask = nil
+            messageTask?.cancel(); messageTask = nil
+            guides.image = nil; guides.histogram = []
+        }
         active = value
         storageTask?.cancel()
         if value {
