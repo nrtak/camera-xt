@@ -311,11 +311,11 @@ final class CaptureSessionManager {
         }
     }
 
-    func capture(speed: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+    func capture(speed: Bool = false, night: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         queue.async {
             if self.snapshot.dualEnabled {
                 self.dual.onProgress = self.onCaptureProgress
-                self.dual.capture { [weak self] result in
+                self.dual.capture(night: night) { [weak self] result in
                     if let self, self.pendingMemoryFallback {
                         self.pendingMemoryFallback = false
                         self.setDualEnabled(false, reason: "Memory is low · returned to Single Photo. Your capture can still be saved.")
@@ -330,11 +330,18 @@ final class CaptureSessionManager {
             }
             let codec: AVVideoCodecType = self.output.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
-            settings.maxPhotoDimensions = self.output.maxPhotoDimensions
-            settings.photoQualityPrioritization = speed || self.input?.device.exposureMode == .custom ? .speed : .quality
-            settings.isDepthDataDeliveryEnabled = self.snapshot.depthEnabled && self.output.isDepthDataDeliveryEnabled
+            if night {
+                guard let device = self.input?.device,
+                      let size = NightCapturePolicy.photoSize(device.activeFormat.supportedMaxPhotoDimensions,
+                                                             maximum: self.output.maxPhotoDimensions) else {
+                    completion(.failure(CameraFailure.unavailable)); return
+                }
+                settings.maxPhotoDimensions = size
+            } else { settings.maxPhotoDimensions = self.output.maxPhotoDimensions }
+            settings.photoQualityPrioritization = night ? .quality : speed || self.input?.device.exposureMode == .custom ? .speed : .quality
+            settings.isDepthDataDeliveryEnabled = !night && self.snapshot.depthEnabled && self.output.isDepthDataDeliveryEnabled
             settings.embedsDepthDataInPhoto = settings.isDepthDataDeliveryEnabled
-            if self.input?.device.isFlashAvailable == true && self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
+            if !night && self.input?.device.isFlashAvailable == true && self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
             let lensLabel = self.snapshot.lenses.first(where: { $0.id == self.snapshot.selectedID })?.name ?? "Camera"
             let processor = PhotoCaptureProcessor(expectsDepth: settings.isDepthDataDeliveryEnabled) { [weak self] result in
                 guard let self = self else { return }
@@ -922,6 +929,65 @@ final class CaptureSessionManager {
         snapshot.flashAvailable = device.hasFlash && device.isFlashAvailable
     }
 
+    func captureNight(cancellation: NightWorkCancellation, completion: @escaping (Result<[CapturedPhoto], Error>) -> Void) {
+        queue.async {
+            guard !self.burstRunning, self.processor == nil, !self.dual.busy,
+                  !self.snapshot.videoMode, self.wantsRunning else {
+                completion(.failure(CameraFailure.unavailable)); return
+            }
+            self.burstRunning = true
+            let paired = self.snapshot.dualEnabled
+            self.nightFrame(photos: [], remaining: paired ? 3 : 4, paired: paired, cancellation: cancellation) { result in
+                self.burstRunning = false
+                completion(result)
+            }
+        }
+    }
+
+    private func nightFrame(photos: [CapturedPhoto], remaining: Int, paired: Bool, cancellation: NightWorkCancellation,
+                            focusWindow: FocusSettlingWindow? = nil,
+                            completion: @escaping (Result<[CapturedPhoto], Error>) -> Void) {
+        let bytes = photos.reduce(0) { $0 + $1.data.count }
+        guard !cancellation.cancelled, wantsRunning, activeSession.isRunning, !activeSession.isInterrupted,
+              snapshot.dualEnabled == paired, bytes < NightCapturePolicy.byteLimit,
+              ![.serious, .critical].contains(ProcessInfo.processInfo.thermalState) else {
+            completion(photos.isEmpty ? .failure(CameraFailure.unavailable) : .success(photos)); return
+        }
+        if !paired, let device = input?.device {
+            guard ![.serious, .critical, .shutdown].contains(device.systemPressureState.level) else {
+                completion(photos.isEmpty ? .failure(CameraFailure.unavailable) : .success(photos)); return
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            var window = focusWindow ?? FocusSettlingWindow(startedAt: now)
+            switch window.update(adjusting: device.isAdjustingFocus || device.isAdjustingExposure, now: now) {
+            case .wait:
+                queue.asyncAfter(deadline: .now() + 0.05) { [weak self, window] in
+                    self?.nightFrame(photos: photos, remaining: remaining, paired: paired, cancellation: cancellation,
+                                     focusWindow: window, completion: completion)
+                }
+                return
+            case .timedOut:
+                completion(photos.isEmpty ? .failure(CameraFailure.unavailable) : .success(photos)); return
+            case .ready: break
+            }
+        }
+        onCaptureProgress?("Night · hold still · capture \((paired ? 3 : 4) - remaining + 1) of \(paired ? 3 : 4)")
+        capture(night: true) { result in
+            switch result {
+            case .success(var photo):
+                let companions = photo.companions
+                photo.companions = []
+                let collected = photos + [photo] + companions
+                let partialPair = paired && companions.count != 1
+                if remaining > 1 && !partialPair {
+                    self.nightFrame(photos: collected, remaining: remaining - 1, paired: paired, cancellation: cancellation, completion: completion)
+                } else { completion(.success(collected)) }
+            case .failure(let error):
+                completion(photos.isEmpty ? .failure(error) : .success(photos))
+            }
+        }
+    }
+
     func captureBurst(completion: @escaping (Result<[CapturedPhoto], Error>) -> Void) {
         queue.async {
             guard !self.burstRunning, !self.snapshot.dualEnabled, !self.snapshot.videoMode,
@@ -1041,6 +1107,8 @@ private final class DualPhotoCamera {
     private var results: [Int: Result<CapturedPhoto, Error>] = [:]
     private(set) var busy = false
     private var mode: DualShotMode = .fast
+    private var nightCapture = false
+    private var captureMode: DualShotMode { nightCapture ? .detail : mode }
     var onProgress: ((String) -> Void)?
     private var cancelRemaining = false
     private(set) var resolution = "—"
@@ -1136,7 +1204,7 @@ private final class DualPhotoCamera {
         originals.removeAll()
     }
 
-    func capture(completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+    func capture(night: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         guard session.isRunning, !session.isInterrupted, !busy, outputs.count == 2 else {
             completion(.failure(CameraFailure.unavailable)); return
         }
@@ -1148,6 +1216,7 @@ private final class DualPhotoCamera {
         guard inputs.count == outputs.count, session.hardwareCost <= 1 else {
             completion(.failure(Failure.overloaded)); return
         }
+        nightCapture = night
         var requests: [AVCapturePhotoSettings] = []
         for (index, output) in outputs.enumerated() {
             let device = inputs[index].device
@@ -1158,15 +1227,21 @@ private final class DualPhotoCamera {
                 completion(.failure(Failure.unsupported)); return
             }
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
-            settings.maxPhotoDimensions = output.maxPhotoDimensions
-            settings.photoQualityPrioritization = mode == .detail ? .quality : .speed
+            if night {
+                guard let size = NightCapturePolicy.photoSize(device.activeFormat.supportedMaxPhotoDimensions,
+                                                             maximum: output.maxPhotoDimensions) else {
+                    completion(.failure(Failure.unsupported)); return
+                }
+                settings.maxPhotoDimensions = size
+            } else { settings.maxPhotoDimensions = output.maxPhotoDimensions }
+            settings.photoQualityPrioritization = night ? output.maxPhotoQualityPrioritization : captureMode == .detail ? .quality : .speed
             requests.append(settings)
         }
         results.removeAll()
         busy = true
         cancelRemaining = false
-        onProgress?(mode == .detail ? "Hold still · focusing photo 1 of 2" : "Capturing both views…")
-        for index in mode.initialCaptureIndices {
+        onProgress?(captureMode == .detail ? "Hold still · focusing photo 1 of 2" : "Capturing both views…")
+        for index in captureMode.initialCaptureIndices {
             submit(index, requests: requests, completion: completion)
         }
     }
@@ -1186,7 +1261,7 @@ private final class DualPhotoCamera {
             receive(.failure(Failure.overloaded), index: index, requests: requests, completion: completion)
             return
         }
-        if mode == .detail {
+        if captureMode == .detail {
             let now = ProcessInfo.processInfo.systemUptime
             var window = focusWindow ?? FocusSettlingWindow(startedAt: now)
             switch window.update(adjusting: inputs[index].device.isAdjustingFocus, now: now) {
@@ -1209,7 +1284,7 @@ private final class DualPhotoCamera {
             }
         }
         processors[index] = processor
-        if mode == .detail { onProgress?("Hold still · photo \(index + 1) of 2") }
+        if captureMode == .detail { onProgress?("Hold still · photo \(index + 1) of 2") }
         outputs[index].capturePhoto(with: requests[index], delegate: processor)
     }
 
@@ -1217,7 +1292,7 @@ private final class DualPhotoCamera {
                          requests: [AVCapturePhotoSettings],
                          completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         results[index] = result
-        if let next = mode.nextCaptureIndex(after: index) {
+        if let next = captureMode.nextCaptureIndex(after: index) {
             onProgress?("Hold still · focusing photo 2 of 2")
             submit(next, requests: requests, completion: completion)
             return
