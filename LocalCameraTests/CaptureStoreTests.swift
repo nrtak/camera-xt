@@ -4,6 +4,61 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testNightDimensionsRespectBothMemoryAndOutputLimits() {
+        let small = CMVideoDimensions(width: 4032, height: 3024)
+        let large = CMVideoDimensions(width: 8064, height: 6048)
+        let choice = NightCapturePolicy.photoSize([large, small], maximum: large)
+        XCTAssertEqual(choice?.width, small.width)
+        XCTAssertNil(NightCapturePolicy.photoSize([large], maximum: large))
+        XCTAssertNil(NightCapturePolicy.photoSize([small], maximum: CMVideoDimensions(width: 1920, height: 1080)))
+    }
+    func testNightRejectsMotionAndInvalidMeasurements() {
+        XCTAssertTrue(NightCapturePolicy.acceptsMotion(meanDifference: 0.01, changedFraction: 0.01))
+        XCTAssertFalse(NightCapturePolicy.acceptsMotion(meanDifference: 0.05, changedFraction: 0))
+        XCTAssertFalse(NightCapturePolicy.acceptsMotion(meanDifference: 0.01, changedFraction: 0.10))
+        XCTAssertFalse(NightCapturePolicy.acceptsMotion(meanDifference: .nan, changedFraction: 0))
+        XCTAssertFalse(NightCapturePolicy.acceptsMotion(meanDifference: 0, changedFraction: -.infinity))
+    }
+    func testCancelledNightPreservesBothLensOriginals() async throws {
+        let main = CapturedPhoto(data: Data([1]), dimensions: CMVideoDimensions(width: 1, height: 1), lensLabel: "Main")
+        let wide = CapturedPhoto(data: Data([2]), dimensions: CMVideoDimensions(width: 1, height: 1), lensLabel: "Ultra Wide")
+        let cancellation = NightWorkCancellation(); cancellation.cancel()
+        let result = await NightPhotoProcessor.process([main, wide, main, wide], cancellation: cancellation)
+        let photo = try XCTUnwrap(result)
+        XCTAssertEqual(photo.data, main.data)
+        XCTAssertEqual(photo.companions.count, 1)
+        XCTAssertEqual(photo.companions.first?.data, wide.data)
+        XCTAssertTrue(photo.warning?.contains("original") == true)
+    }
+    @MainActor func testNightMergesMatchingFramesAndRetainsReference() async throws {
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 256, height: 256), format: format).image { renderer in
+            for y in 0..<32 {
+                for x in 0..<32 {
+                    let shade = CGFloat((x * 73 + y * 131 + x * y * 17) % 200 + 20) / 255
+                    UIColor(white: shade, alpha: 1).setFill()
+                    renderer.fill(CGRect(x: x * 8, y: y * 8, width: 8, height: 8))
+                }
+            }
+        }
+        let data = try XCTUnwrap(image.jpegData(compressionQuality: 0.98))
+        let frame = CapturedPhoto(data: data, dimensions: CMVideoDimensions(width: 256, height: 256), lensLabel: "Main")
+        let result = await NightPhotoProcessor.process([frame, frame, frame], cancellation: NightWorkCancellation())
+        let photo = try XCTUnwrap(result)
+        XCTAssertEqual(photo.dimensions.width, 256)
+        XCTAssertEqual(photo.companions.count, 1)
+        XCTAssertEqual(photo.companions.first?.data, data)
+        XCTAssertTrue(photo.lensLabel?.contains("3 frames") == true)
+        XCTAssertNotNil(UIImage(data: photo.data))
+    }
+
+    func testNightDecodeFailureKeepsReference() async throws {
+        let frame = CapturedPhoto(data: Data([9, 8, 7]), dimensions: CMVideoDimensions(width: 1, height: 1), lensLabel: "Main")
+        let result = await NightPhotoProcessor.process([frame, frame], cancellation: NightWorkCancellation())
+        XCTAssertEqual(result?.data, frame.data)
+        XCTAssertEqual(result?.companions.count, 0)
+    }
+
     func testRoutineStatusDismissalPreservesWarnings() {
         XCTAssertTrue(CameraViewModel.isBriefStatus("Saved"))
         XCTAssertTrue(CameraViewModel.isBriefStatus("Saved 2 photos"))
