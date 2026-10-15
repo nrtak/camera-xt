@@ -34,7 +34,6 @@ struct CameraView: View {
     @State private var diagnosticsPeak: UInt64 = 0
     @State private var diagnosticsBatteryBaseline: Float?
     @State private var confirmDiscard = false
-    @AppStorage("camera.fullFrame") private var fullFrame = false
     @AppStorage("camera.showsGrid") private var showsGrid = true
     @State private var toolPath: [CameraToolPage] = []
     @State private var showsCaptureInfo = false
@@ -97,7 +96,7 @@ struct CameraView: View {
                     .allowsHitTesting(!panelOpen)
                     .accessibilityHidden(panelOpen)
                 } else {
-                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: !fullFrame, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen)
+                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: false, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen)
                         .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
@@ -180,7 +179,7 @@ struct CameraView: View {
             selectedDualIndex = index
             showsDualAdjustments = true
             model.focusDual(at: point, index: index, locked: locked)
-        }, fillView: !fullFrame, secondary: index == 1, showsFocusFeedback: !panelOpen && model.canConfigure &&
+        }, fillView: false, secondary: index == 1, showsFocusFeedback: !panelOpen && model.canConfigure &&
             model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
             focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
             exposureOnly: model.exposurePointOnly)
@@ -265,12 +264,6 @@ struct CameraView: View {
                 Button("Video") { openTool(.details) }.frame(minHeight: 44)
             }
             Spacer(minLength: 8)
-            Button { fullFrame.toggle() } label: {
-                Image(systemName: fullFrame ? "viewfinder" : "arrow.up.left.and.arrow.down.right")
-                    .foregroundStyle(fullFrame ? selection : ink).frame(width: 44, height: 44)
-            }
-            .accessibilityLabel(fullFrame ? "Fill preview area" : "Show full camera frame")
-            .accessibilityValue(fullFrame ? "Full frame" : "Fill screen")
             Button { openTool() } label: {
                 Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44)
             }.accessibilityLabel("Camera tools")
@@ -845,8 +838,7 @@ struct CameraView: View {
                 Text("Camera").tag(0); Text("Controls").tag(1); Text("App").tag(2)
             }.pickerStyle(.segmented)
             if preferencesSection == 0 {
-                Toggle("Show full camera frame", isOn: $fullFrame)
-                Text("See the entire photo, or turn off to fill the preview.").font(.caption).foregroundStyle(.secondary)
+                Text("The preview always shows the entire camera frame.").font(.caption).foregroundStyle(.secondary)
                 Toggle("Rotate camera layout", isOn: $adaptiveLayout)
                 Toggle("Composition grid", isOn: $showsGrid)
                 Toggle("Low-light suggestions", isOn: $sceneHints)
@@ -888,7 +880,7 @@ struct CameraView: View {
                 Text("Clearing the preview keeps Photos and unsaved captures.").font(.caption).foregroundStyle(.secondary)
             }
         case .details:
-            Text(fullFrame ? "Full frame shows the camera preview boundaries. Still photos and video can have different aspect ratios." : "Fill screen crops the preview to fit. Tap the framing button at the top to see the full camera frame; saved photos are not cropped by this setting.").font(.caption)
+            Text("The preview shows the entire camera frame without cropping it to fill the screen. Space around it preserves the photo or video’s proportions.").font(.caption)
             Text("Zoom shortcuts follow this phone’s lenses and reported sensor-crop capabilities. Intermediate zoom can crop or enlarge the image; greater magnification does not always mean more detail.").font(.caption)
             LabeledContent("Capture status", value: model.shutterStatus)
             LabeledContent("Mode", value: model.mode.rawValue)
@@ -950,7 +942,7 @@ struct CameraView: View {
         "Accessibility: use VoiceOver and the largest text sizes in portrait and both landscapes. Check the Single/Dual switch, shutter, timer, each lens, focus lock, all menus and saved-photo comparison. Check Increase Contrast and Reduce Transparency too.",
         "Night: compare fine text, faces, highlights and moving subjects against Single Auto and Apple Camera. Check the saved reference for each lens. Reject results with blur, ghosting or color shifts.",
         "Night: test Single and Dual, interrupt during capture, deny Photos access, and repeat pairs. Verify originals survive interruption and each saved view is correctly labeled.",
-        "Switch Fill / Full Frame in Photo, Video and both Dual Shot layouts. Tap near each visible corner and verify focus follows the tap. Compare the preview with the saved photo.",
+        "In Photo, Video and both Dual Shot layouts, verify the entire camera frame is visible. Tap near each visible corner and verify focus follows the tap. Compare the preview edges with the saved capture.",
         "Take repeated photos with guides off, then Histogram, Highlights and Focus Peaking. Check responsiveness, warmth and memory in a device profiling session.",
         "Rotate both ways in Single, Dual Fast, Dual Detail, Night and Video. Check upright previews, saved photos/videos, focus targets and guides. Rotate during a Night sequence or recording: its saved orientation must stay fixed. Check rotation lock, larger text and the fixed-layout setting.",
         "Check the zoom row against this phone’s native lens and sensor-crop choices. Test larger text and landscape without clipped controls.",
