@@ -32,10 +32,14 @@ final class CaptureStoreTests: XCTestCase {
     }
     @MainActor func testNightMergesMatchingFramesAndRetainsReference() async throws {
         let format = UIGraphicsImageRendererFormat(); format.scale = 1
-        let image = UIGraphicsImageRenderer(size: CGSize(width: 256, height: 256), format: format).image { renderer in
+        let image: UIImage = UIGraphicsImageRenderer(size: CGSize(width: 256, height: 256), format: format).image { renderer in
             for y in 0..<32 {
                 for x in 0..<32 {
-                    let shade = CGFloat((x * 73 + y * 131 + x * y * 17) % 200 + 20) / 255
+                    let horizontal: Int = x * 73
+                    let vertical: Int = y * 131
+                    let mixed: Int = x * y * 17
+                    let value: Int = (horizontal + vertical + mixed) % 200 + 20
+                    let shade: CGFloat = CGFloat(value) / 255.0
                     UIColor(white: shade, alpha: 1).setFill()
                     renderer.fill(CGRect(x: x * 8, y: y * 8, width: 8, height: 8))
                 }
