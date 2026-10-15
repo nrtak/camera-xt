@@ -5,7 +5,7 @@ import UIKit
 struct CameraPreview: UIViewRepresentable {
     let engine: CaptureSessionManager
     var onFocus: (CGPoint, Bool) -> Void
-    var fillView = false
+    var fillView = true
     var allowsFocus = true
     var secondary = false
     var showsFocusFeedback = true
@@ -83,6 +83,7 @@ struct CameraPreview: UIViewRepresentable {
     }
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
+        view.clipsToBounds = true
         view.previewLayer.videoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if allowsFocus {
             let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:)))
@@ -94,6 +95,8 @@ struct CameraPreview: UIViewRepresentable {
         return view
     }
     func updateUIView(_ view: PreviewView, context: Context) {
+        let gravity: AVLayerVideoGravity = fillView ? .resizeAspectFill : .resizeAspect
+        if view.previewLayer.videoGravity != gravity { view.previewLayer.videoGravity = gravity }
         context.coordinator.onFocus = onFocus
         context.coordinator.showsFocusFeedback = showsFocusFeedback
         context.coordinator.exposureOnly = exposureOnly
