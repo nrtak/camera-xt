@@ -191,7 +191,7 @@ struct CameraView: View {
     private var captureHUD: some View {
         HStack(spacing: 8) {
             Button { openTool(.details) } label: {
-                Text(model.camera.dualEnabled ? "Dual · \(model.camera.dualMode.rawValue)" : model.mode.rawValue)
+                Text(model.camera.dualEnabled ? "Dual · \(model.camera.dualMode.rawValue)" : model.captureStyle == "Night" ? "Low-light" : model.mode.rawValue)
                     .font(.subheadline.weight(.semibold)).lineLimit(1)
                     .frame(minHeight: 44)
             }
@@ -463,6 +463,7 @@ struct CameraView: View {
                     .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
                 }
                 .accessibilityLabel(model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
+                .accessibilityValue(model.shutterStatus)
                 .disabled(!model.canShutter)
                 .opacity(model.canShutter ? 1 : 0.4)
 
@@ -621,7 +622,7 @@ struct CameraView: View {
                 Picker("Dual Shot capture", selection: Binding(get: { model.camera.dualMode }, set: { model.setDualMode($0) })) {
                     ForEach(DualShotMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.segmented).disabled(!model.canConfigure)
-                Text(model.camera.dualMode == .fast ? "Fast · Up to 12 MP per view. Best for movement." : "Detail · Beta. Hold still for both photos. Up to 48 MP where supported; a pause is expected.")
+                Text(model.camera.dualMode == .fast ? "Fast · Choose for moving subjects or unexpected moments. Up to 12 MP per view." : "Detail · Choose for still scenes. Hold still until both photos finish; they are taken in sequence. Up to 48 MP where supported.")
                     .font(.footnote)
                 Text(model.camera.resolution).font(.caption).monospacedDigit()
                 featureButton("Single Photo", icon: "camera", detail: "Return to one camera") { useTool(.automatic) }
@@ -631,7 +632,7 @@ struct CameraView: View {
             }
             featureButton("Automatic", icon: "camera", detail: "Everyday photos with automatic settings") { useTool(.automatic) }
             featureButton("Action burst", icon: "figure.run", detail: "Fast shutter and 3 photos. Needs good light.") { useTool(.action) }
-            featureButton("Low-light burst · Beta", icon: "moon", detail: "Experimental. Hold still; timer and 3 slow exposures.") { useTool(.night) }
+            featureButton("Low-light burst · Beta", icon: "moon", detail: "Timer, then 3 slow exposures. Choose one photo; frames are not combined.") { useTool(.night) }
             featureButton("Best Shot", icon: "square.stack", detail: "Take 3 photos, then choose your favorite") { useTool(.burst) }
             if model.camera.dualAvailable {
                 featureButton("Dual Shot", icon: "camera.on.rectangle", detail: "Main and ultra-wide photos from one press") { useTool(.dual) }
@@ -712,7 +713,9 @@ struct CameraView: View {
         case .details:
             Text(fullFrame ? "Full frame shows the camera preview boundaries. Still photos and video can have different aspect ratios." : "Fill screen crops the preview to fit. Tap the framing button at the top to see the full camera frame; saved photos are not cropped by this setting.").font(.caption)
             Text("Zoom shortcuts follow this phone’s lenses and reported sensor-crop capabilities. Intermediate zoom can crop or enlarge the image; greater magnification does not always mean more detail.").font(.caption)
+            LabeledContent("Capture status", value: model.shutterStatus)
             LabeledContent("Mode", value: model.mode.rawValue)
+            if model.captureStyle == "Night" { Text("Low-light burst is experimental: three separate slow exposures, not a merged Night-mode photo. Support the phone and avoid moving subjects.").font(.caption) }
             LabeledContent("Lens", value: model.selectedLens?.name ?? "Unavailable")
             LabeledContent("Resolution", value: model.mode == .photo ? model.camera.resolution : model.camera.videoLabel)
             if let recent = model.recent, !recent.photos.isEmpty {
