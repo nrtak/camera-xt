@@ -15,17 +15,18 @@ enum PhotoLook: String, CaseIterable { case natural = "Natural", warm = "Warm", 
 
 enum PhotoRescueProcessor {
     private static let queue = DispatchQueue(label: "CameraXT.photoRescue", qos: .userInitiated)
-    static func process(_ data: Data, strength: Double, look: PhotoLook = .natural) async throws -> RescuedPhoto {
+    static func process(_ data: Data, strength: Double, look: PhotoLook = .natural, cancellation: NightWorkCancellation? = nil) async throws -> RescuedPhoto {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 let result: Result<RescuedPhoto, Error> = Result {
-                    try autoreleasepool { try render(data, strength: strength, look: look) }
+                    try autoreleasepool { try render(data, strength: strength, look: look, cancellation: cancellation) }
                 }
                 continuation.resume(with: result)
             }
         }
     }
-    private static func render(_ data: Data, strength: Double, look: PhotoLook) throws -> RescuedPhoto {
+    private static func render(_ data: Data, strength: Double, look: PhotoLook, cancellation: NightWorkCancellation?) throws -> RescuedPhoto {
+        if cancellation?.cancelled == true { throw CancellationError() }
         guard data.count <= 100_000_000,
               let source = CGImageSourceCreateWithData(data as CFData, nil),
               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [
@@ -35,6 +36,7 @@ enum PhotoRescueProcessor {
                 kCGImageSourceShouldCacheImmediately: false
               ] as CFDictionary) else { throw CameraFailure.noPhoto }
         var original = CIImage(cgImage: cg)
+        if cancellation?.cancelled == true { throw CancellationError() }
         let pixels = original.extent.width * original.extent.height
         let scale = min(1, sqrt(12_000_000 / max(1, pixels)))
         original = original.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
@@ -54,12 +56,16 @@ enum PhotoRescueProcessor {
         }
         let blended = original.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: adjusted, kCIInputTimeKey: amount]).cropped(to: bounds)
         let context = CIContext(options: [.cacheIntermediates: false])
+        defer { context.clearCaches() }
+        if cancellation?.cancelled == true { throw CancellationError() }
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         guard let rendered = context.createCGImage(blended, from: bounds, format: .RGBA8, colorSpace: colorSpace) else { throw CameraFailure.noPhoto }
+        if cancellation?.cancelled == true { throw CancellationError() }
         let output = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(output, UTType.jpeg.identifier as CFString, 1, nil) else { throw CameraFailure.noPhoto }
         CGImageDestinationAddImage(destination, rendered, [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw CameraFailure.noPhoto }
+        if cancellation?.cancelled == true { throw CancellationError() }
         let previewScale = min(1, 1400 / max(bounds.width, bounds.height))
         let transform = CGAffineTransform(scaleX: previewScale, y: previewScale)
         let before = original.transformed(by: transform)
