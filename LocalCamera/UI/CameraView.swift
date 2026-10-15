@@ -3,6 +3,7 @@ import AVFoundation
 import PhotosUI
 import CoreImage
 import ImageIO
+import Darwin
 
 enum CameraAppearance {
     static let selection = Color(red: 0.48, green: 0.80, blue: 1)
@@ -19,6 +20,7 @@ struct CameraView: View {
     @AppStorage("camera.quickAccess") private var quickAccess = false
     @AppStorage("camera.showQuickControls") private var showQuickControls = true
     @AppStorage("camera.adaptiveLayout") private var adaptiveLayout = true
+    @AppStorage("camera.sceneHints") private var sceneHints = true
     @AppStorage("camera.advancedTools") private var advancedTools = false
     @AppStorage("camera.rememberSetup") private var rememberSetup = true
     @AppStorage("camera.pin1") private var pin1 = "Exposure"
@@ -28,6 +30,9 @@ struct CameraView: View {
     @State private var preferencesSection = 0
     @State private var checkIndex = 0
     @State private var passedChecks: Set<Int> = []
+    @State private var diagnosticsBaseline: UInt64?
+    @State private var diagnosticsPeak: UInt64 = 0
+    @State private var diagnosticsBatteryBaseline: Float?
     @State private var confirmDiscard = false
     @AppStorage("camera.fullFrame") private var fullFrame = false
     @AppStorage("camera.showsGrid") private var showsGrid = true
@@ -173,10 +178,15 @@ struct CameraView: View {
                         showsDualAdjustments = selectedDualIndex != index || !showsDualAdjustments
                         selectedDualIndex = index
                     } label: {
-                        Text(title).font(.caption.weight(.semibold)).foregroundStyle(selectedDualIndex == index ? selection : .white)
-                            .frame(minHeight: 44).padding(.horizontal, 8)
+                        HStack(spacing: 4) {
+                            Text(title)
+                            if selectedDualIndex == index { Image(systemName: "checkmark.circle.fill").accessibilityHidden(true) }
+                        }
+                        .font(.caption.weight(.semibold)).foregroundStyle(selectedDualIndex == index ? selection : .white)
+                        .frame(minHeight: 44).padding(.horizontal, 8)
                     }
                     .accessibilityLabel("Adjust camera \(index + 1), \(title)")
+                    .accessibilityValue(model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Fixed focus")
                     .accessibilityAddTraits(selectedDualIndex == index ? .isSelected : [])
                     Button {
                         enlargedDualIndex = enlargedDualIndex == index ? nil : index
@@ -185,6 +195,11 @@ struct CameraView: View {
                             .frame(width: 44, height: 44)
                     }
                     .accessibilityLabel(enlargedDualIndex == index ? "Show both cameras equally" : "Enlarge \(title)")
+                }
+                if model.camera.focusStates.indices.contains(index),
+                   model.camera.focusStates[index] == "Focus locked" || model.camera.focusStates[index] == "Focusing…" {
+                    Label(model.camera.focusStates[index], systemImage: model.camera.focusStates[index] == "Focus locked" ? "lock.fill" : "viewfinder")
+                        .font(.caption2).foregroundStyle(selection)
                 }
                 if showsDualAdjustments && selectedDualIndex == index {
                     let sizes = model.camera.resolution.components(separatedBy: " + ")
@@ -258,16 +273,32 @@ struct CameraView: View {
 
     private var captureStatus: some View {
         VStack(spacing: 12) {
+            if let preparing = model.preparingMode {
+                HStack { ProgressView(); Text("Preparing \(preparing.rawValue)…") }
+                    .font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+            }
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
                 if showQuickControls { viewfinderQuickControls }
+                if sceneHints, model.canConfigure, model.mode == .photo, model.message == nil, let advice = model.sceneAdvice {
+                    Button { openTool(.shoot) } label: {
+                        Label(advice, systemImage: "moon").font(.caption).padding(8).frame(minHeight: 44)
+                    }
+                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityHint("Opens shot styles. Your camera settings are not changed automatically.")
+                }
                 LiveHistogram(guides: model.guides, overlayColor: overlayColor)
             }
             if model.camera.recording, let started = model.recordingStarted {
-                HStack {
-                    Image(systemName: "record.circle").foregroundStyle(.red)
-                    Text(started, style: .timer).monospacedDigit()
-                    Image(systemName: model.camera.audioRecording ? "mic.fill" : "mic.slash.fill")
-                }.padding(8).background(overlayColor)
+                VStack(spacing: 3) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "record.circle.fill").foregroundStyle(.red)
+                        Text(model.busy ? "FINISHING" : "REC").fontWeight(.bold)
+                        Text(started, style: .timer).monospacedDigit().fixedSize()
+                    }
+                    Label(model.camera.audioRecording ? "Sound on" : "No sound", systemImage: model.camera.audioRecording ? "mic.fill" : "mic.slash.fill")
+                        .font(.caption)
+                }.padding(10).background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityElement(children: .combine)
             }
             if model.countdown > 0 {
                 Text("\(model.countdown)").font(.system(size: 64, weight: .bold))
@@ -277,8 +308,9 @@ struct CameraView: View {
                 if model.lowStorage { Text("Low storage · free space before recording").font(.caption) }
                 if model.camera.cooling { Text("iPhone is warm · processing reduced").font(.caption) }
                 if let message = model.message {
-                    Label(message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
+                    Label(model.busy ? model.captureActivity.rawValue : message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
                         .font(.callout).accessibilityLabel(message)
+                    if model.busy && showHelp { Text(message).font(.caption) }
                 }
                 if model.hasPendingCapture && !model.busy {
                     ViewThatFits(in: .horizontal) {
@@ -303,6 +335,7 @@ struct CameraView: View {
                     }
                 }
             } else {
+                quickControl("Brightness", icon: "sun.max", value: model.camera.dualEnabled ? "Both views" : String(format: "%+.1f EV", model.exposureBias)) { openTool(.exposure) }
                 if model.mode == .photo {
                     quickControl("Night", icon: model.captureStyle == "Night" ? "moon.fill" : "moon", value: model.captureStyle == "Night" ? "On · Beta" : "Off", active: model.captureStyle == "Night") {
                         model.setNightEnabled(model.captureStyle != "Night")
@@ -322,7 +355,6 @@ struct CameraView: View {
                     quickControl("Video", icon: "video", value: model.camera.videoLabel) { openTool(.video) }
                     quickControl("Grid", icon: "grid", value: showsGrid ? "On" : "Off", active: showsGrid) { showsGrid.toggle() }
                 }
-                quickControl("Brightness", icon: "sun.max", value: model.camera.dualEnabled ? "Both views" : String(format: "%+.1f EV", model.exposureBias)) { openTool(.exposure) }
             }
         }
         .padding(4)
@@ -537,14 +569,19 @@ struct CameraView: View {
                 .frame(maxWidth: .infinity)
 
                 Button { showsCaptureInfo = false; showsRecent = false; model.shutter() } label: {
+                    VStack(spacing: 4) {
                     ZStack {
                         Circle().fill(model.mode == .video ? Color.red : Color.white)
                         Circle().strokeBorder(Color.black.opacity(0.65), lineWidth: 2).padding(5)
                         if model.camera.recording { RoundedRectangle(cornerRadius: 4).fill(.white).frame(width: 28, height: 28) }
-                        else if model.busy { ProgressView().tint(.black) }
+                        else if model.busy || model.configuring { ProgressView().tint(.black) }
                     }
                     .frame(width: 76, height: 76)
                     .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
+                    if model.mode == .video {
+                        Text(model.videoButtonTitle).font(.caption.weight(.semibold))
+                    }
+                    }
                 }
                 .accessibilityLabel(model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
                 .accessibilityValue(model.shutterStatus)
@@ -642,11 +679,11 @@ struct CameraView: View {
     }
 
     private func toolGrid(_ pages: [CameraToolPage]) -> some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: textSize.isAccessibilitySize ? 1 : 3), spacing: 8) {
             ForEach(pages, id: \.self) { page in
                 Button { toolPath.append(page) } label: {
                     Label(page.rawValue, systemImage: page.icon)
-                        .font(.caption.weight(.semibold)).lineLimit(2)
+                        .font(.caption.weight(.semibold)).lineLimit(textSize.isAccessibilitySize ? nil : 2)
                         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).padding(4)
 
                 }.buttonStyle(.plain)
@@ -713,13 +750,15 @@ struct CameraView: View {
                 Toggle("Night · Beta", isOn: Binding(get: { model.captureStyle == "Night" }, set: model.setNightEnabled))
                     .disabled(!model.canConfigure)
                 if model.captureStyle == "Night" {
-                    Text("Three sequential pairs, aligned separately per lens. Up to 12 MP per frame. Hold still; reference originals are saved too.").font(.footnote)
+                    Text("Hold still. Reference originals are saved too.").font(.footnote)
+                    if showHelp { Text("Three sequential pairs, aligned separately per lens. Up to 12 MP per frame.").font(.footnote) }
                 } else {
                 Picker("Dual Shot capture", selection: Binding(get: { model.camera.dualMode }, set: { model.setDualMode($0) })) {
                     ForEach(DualShotMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.segmented).disabled(!model.canConfigure)
-                Text(model.camera.dualMode == .fast ? "Fast · Choose for moving subjects or unexpected moments. Up to 12 MP per view." : "Detail · Choose for still scenes. Hold still until both photos finish; they are taken in sequence. Up to 48 MP where supported.")
+                Text(model.camera.dualMode == .fast ? "For moving subjects and quick moments." : "For still scenes. Hold still until both photos finish.")
                     .font(.footnote)
+                if showHelp { Text(model.camera.dualMode == .fast ? "Up to 12 MP per view." : "Photos are taken in sequence. Up to 48 MP where supported.").font(.footnote) }
                 Text(model.camera.resolution).font(.caption).monospacedDigit()
                 }
             } else {
@@ -769,6 +808,7 @@ struct CameraView: View {
             Text("Standard controls adapt to Photo, Dual Shot and Video. Custom shortcuts replace that row with your three chosen tools. Controls hide while a menu is open.").font(.footnote)
         case .checks:
             Text("iPhone beta checks").font(.headline)
+            DeviceDiagnosticsView(peak: $diagnosticsPeak, baseline: $diagnosticsBaseline, batteryBaseline: $diagnosticsBatteryBaseline)
             if let value = model.lastCaptureMilliseconds { Text("Last capture processing: \(value) ms").font(.caption) }
             if let value = model.lastSaveMilliseconds { Text("Last save: \(value) ms").font(.caption) }
             Text("Timings stay on this device for this session. Capture processing is not shutter lag; memory and responsiveness need device profiling.").font(.caption)
@@ -798,6 +838,7 @@ struct CameraView: View {
                 Toggle("Adapt layout to orientation", isOn: $adaptiveLayout)
                 Text("Landscape places Dual Shot views side by side and compacts the shutter controls. Turn off to keep the stacked layout. Follows iPhone rotation lock.").font(.caption)
                 Toggle("Composition grid", isOn: $showsGrid)
+                Toggle("Low-light suggestions", isOn: $sceneHints)
                 Toggle("Capture vibrations", isOn: $model.haptics)
                 Picker("Dual Shot inset", selection: $dualCorner) {
                     Text("Top left").tag(0); Text("Top right").tag(1)
@@ -869,6 +910,9 @@ struct CameraView: View {
         }.pickerStyle(.menu)
     }
     private let deviceChecks = [
+        "Stability: take 20 Single photos, 20 Fast pairs and 10 Detail pairs; switch modes between groups. Rotate both ways and review each pair. Check for missed captures, mismatched lenses, freezes and save failures.",
+        "Resources: open this panel for a baseline, close it, take repeated captures, then reopen it. Compare memory after processing settles. Repeat unplugged for battery/heat checks. Background the app: the camera indicator should turn off, with no active analysis. Use device profiling for capture-time peaks.",
+        "Accessibility: use VoiceOver and the largest text sizes in portrait and both landscapes. Check the Single/Dual switch, shutter, timer, each lens, focus lock, all menus and saved-photo comparison. Check Increase Contrast and Reduce Transparency too.",
         "Night: compare fine text, faces, highlights and moving subjects against Single Auto and Apple Camera. Check the saved reference for each lens. Reject results with blur, ghosting or color shifts.",
         "Night: test Single and Dual, interrupt during capture, deny Photos access, and repeat pairs. Verify originals survive interruption and each saved view is correctly labeled.",
         "Switch Fill / Full Frame in Photo, Video and both Dual Shot layouts. Tap near each visible corner and verify focus follows the tap. Compare the preview with the saved photo.",
@@ -1237,6 +1281,8 @@ private struct RecentCaptureView: View {
     @Environment(\.openURL) private var openURL
     @State private var selection = 0
     @State private var comparing = true
+    @State private var comparisonFirst = 0
+    @State private var comparisonSecond = 1
     @AppStorage("camera.captureDetails") private var showDetails = false
     var body: some View {
         VStack(spacing: 8) {
@@ -1250,38 +1296,43 @@ private struct RecentCaptureView: View {
                 Image(uiImage: image).resizable().scaledToFit()
                 Text("Video saved in Photos").font(.caption)
             } else if record.photos.indices.contains(selection) {
-                if comparing && record.photos.count == 2 {
+                if comparing && record.photos.count >= 2 {
                     HStack(spacing: 6) {
-                        ForEach(record.photos.indices, id: \.self) { index in
+                        ForEach([comparisonFirst, comparisonSecond], id: \.self) { index in
                             VStack {
-                                ZoomableCapture(data: record.photos[index].data, maxSize: 1500)
+                                ZoomableCapture(data: record.photos[index].data, maxSize: 1500, label: record.photos[index].label)
+                                    .id(index)
                                 Button("Enlarge \(record.photos[index].label)") { selection = index; comparing = false }
                                     .font(.caption).frame(minHeight: 44)
                             }
                         }
                     }
-                } else { ZoomableCapture(data: record.photos[selection].data).id(selection) }
+                } else { ZoomableCapture(data: record.photos[selection].data, label: record.photos[selection].label).id(selection) }
                 let photo = record.photos[selection]
-                Text("\(photo.label) · \(photo.width) × \(photo.height)").font(.caption)
-                if showDetails {
+                if !comparing || record.photos.count < 2 {
+                    Text("\(photo.label) · \(photo.width) × \(photo.height)").font(.caption)
+                }
+                if showDetails && (!comparing || record.photos.count < 2) {
                     Text(photo.details?.summary ?? "Capture details unavailable for this older photo.").font(.caption)
                     if record.photos.count == 2, let gap = CaptureDetails.gap(record.photos[0].details, record.photos[1].details) {
                         Text(String(format: "Photos taken %.3f s apart", gap)).font(.caption).monospacedDigit()
                     }
                     Text("Details stay with this iPhone’s local recent/recovery copy.").font(.caption2)
                 }
-                if record.photos.count == 2 {
+                if record.photos.count >= 2 {
                     Button(comparing ? "Show one photo" : "Compare both") { comparing.toggle() }.frame(minHeight: 44)
                 }
-                if record.photos.count > 1 {
-                    HStack {
-                        ForEach(record.photos.indices, id: \.self) { index in
-                            Button(record.photos[index].label) { selection = index; comparing = false }
-                                .frame(maxWidth: .infinity, minHeight: 44)
-                                .background(selection == index ? CameraAppearance.selection.opacity(0.3) : .clear, in: RoundedRectangle(cornerRadius: 8))
-                                .accessibilityAddTraits(selection == index ? .isSelected : [])
-                        }
+                if record.photos.count > 2 && comparing {
+                    ViewThatFits(in: .horizontal) {
+                        HStack { comparisonPickers }
+                        VStack { comparisonPickers }
                     }
+                } else if record.photos.count > 1 && !comparing {
+                    Picker("Photo", selection: $selection) {
+                        ForEach(record.photos.indices, id: \.self) { index in
+                            Text(record.photos[index].label).tag(index)
+                        }
+                    }.pickerStyle(.menu).frame(minHeight: 44)
                 }
                 Text("Pinch or double-tap to inspect. Preview is reduced to protect memory.").font(.caption)
             } else { Text("Open Photos to review this video.") }
@@ -1289,12 +1340,103 @@ private struct RecentCaptureView: View {
                 if let url = URL(string: "photos-redirect://") { openURL(url) }
             }.frame(minHeight: 44)
         }.padding(12)
+        .onAppear {
+            comparisonSecond = RecentComparison.secondIndex(labels: record.photos.map(\.label))
+        }
+    }
+
+    @ViewBuilder private var comparisonPickers: some View {
+        Picker("First photo", selection: $comparisonFirst) {
+            ForEach(record.photos.indices.filter { $0 != comparisonSecond }, id: \.self) { index in
+                Text(record.photos[index].label).tag(index)
+            }
+        }.pickerStyle(.menu).frame(minHeight: 44)
+        Picker("Second photo", selection: $comparisonSecond) {
+            ForEach(record.photos.indices.filter { $0 != comparisonFirst }, id: \.self) { index in
+                Text(record.photos[index].label).tag(index)
+            }
+        }.pickerStyle(.menu).frame(minHeight: 44)
+    }
+}
+
+enum RecentComparison {
+    static func secondIndex(labels: [String]) -> Int {
+        guard labels.count > 1 else { return 0 }
+        let firstLens = labels[0].components(separatedBy: " · ")[0]
+        return labels.indices.dropFirst().first { labels[$0].components(separatedBy: " · ")[0] != firstLens } ?? 1
+    }
+}
+
+private struct DeviceDiagnosticsView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var memory: UInt64?
+    @Binding var peak: UInt64
+    @Binding var baseline: UInt64?
+    @State private var thermal = "Normal"
+    @State private var battery: Float = -1
+    @Binding var batteryBaseline: Float?
+    @State private var previouslyMonitoring = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Local device check").font(.subheadline.weight(.semibold))
+            Text("Thermal state: \(thermal)")
+            if let memory {
+                Text("App memory: \(memory / 1_048_576) MB · highest sampled \(peak / 1_048_576) MB")
+                if let baseline { Text("Change since first check: \(Int64(memory / 1_048_576) - Int64(baseline / 1_048_576)) MB") }
+            } else { Text("App memory unavailable") }
+            if battery >= 0 {
+                Text("Battery: \(Int((battery * 100).rounded()))%")
+                if let batteryBaseline { Text("Battery change: \(Int(((battery - batteryBaseline) * 100).rounded())) percentage points") }
+            }
+            Text("Open before and after repeated captures to compare this session. Samples only while this panel is active; capture-time peaks can be missed. Battery readings are coarse and can rise while charging. These readings do not prove a memory leak.")
+                .foregroundStyle(.secondary)
+        }
+        .font(.caption).monospacedDigit()
+        .onAppear {
+            previouslyMonitoring = UIDevice.current.isBatteryMonitoringEnabled
+            UIDevice.current.isBatteryMonitoringEnabled = true
+        }
+        .onDisappear { UIDevice.current.isBatteryMonitoringEnabled = previouslyMonitoring }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else {
+                UIDevice.current.isBatteryMonitoringEnabled = previouslyMonitoring
+                return
+            }
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            while !Task.isCancelled {
+                memory = Self.memoryFootprint()
+                if let memory { peak = max(peak, memory); if baseline == nil { baseline = memory } }
+                battery = UIDevice.current.batteryLevel
+                if batteryBaseline == nil && battery >= 0 { batteryBaseline = battery }
+                switch ProcessInfo.processInfo.thermalState {
+                case .nominal: thermal = "Normal"
+                case .fair: thermal = "Warm"
+                case .serious: thermal = "Hot"
+                case .critical: thermal = "Critical"
+                @unknown default: thermal = "Unknown"
+                }
+                do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
+            }
+        }
+    }
+
+    private static func memoryFootprint() -> UInt64? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? info.phys_footprint : nil
     }
 }
 
 private struct ZoomableCapture: UIViewRepresentable {
     let data: Data
     var maxSize: Int = 3000
+    var label = "Saved photo"
     final class Coordinator: NSObject, UIScrollViewDelegate {
         let imageView = UIImageView()
         weak var scrollView: UIScrollView?
@@ -1316,9 +1458,15 @@ private struct ZoomableCapture: UIViewRepresentable {
     }
     final class ZoomView: UIScrollView {
         weak var picture: UIImageView?
+        private var previousSize = CGSize.zero
         override func layoutSubviews() {
             super.layoutSubviews()
-            if zoomScale == 1 { picture?.frame = bounds; contentSize = bounds.size }
+            if previousSize != bounds.size {
+                previousSize = bounds.size
+                setZoomScale(1, animated: false)
+                contentOffset = .zero
+            }
+            if zoomScale == 1 { picture?.frame = CGRect(origin: .zero, size: bounds.size); contentSize = bounds.size }
         }
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -1336,7 +1484,7 @@ private struct ZoomableCapture: UIViewRepresentable {
         image.contentMode = .scaleAspectFit
         image.isUserInteractionEnabled = true
         image.isAccessibilityElement = true
-        image.accessibilityLabel = "Saved photo"
+        image.accessibilityLabel = label
         image.accessibilityCustomActions = [
             UIAccessibilityCustomAction(name: "Zoom in", target: context.coordinator, selector: #selector(Coordinator.zoomIn(_:))),
             UIAccessibilityCustomAction(name: "Fit photo", target: context.coordinator, selector: #selector(Coordinator.zoomOut(_:)))
