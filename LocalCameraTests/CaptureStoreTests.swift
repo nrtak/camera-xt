@@ -4,6 +4,35 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testSceneAdviceRejectsInvalidReadingsAndDoesNotSuggestNightInBrightLight() {
+        XCTAssertNil(SceneAdvice.text(shutter: .nan, iso: 100, dual: true, night: false))
+        XCTAssertNil(SceneAdvice.text(shutter: 0, iso: 100, dual: false, night: false))
+        XCTAssertNil(SceneAdvice.text(shutter: 1.0 / 500, iso: 100, dual: false, night: false))
+        XCTAssertNotNil(SceneAdvice.text(shutter: 1.0 / 15, iso: 100, dual: true, night: false))
+        XCTAssertNotNil(SceneAdvice.text(shutter: 1.0 / 125, iso: 1600, dual: false, night: false))
+    }
+
+    func testNightComparisonPrefersDifferentLensesBeforeReferenceOriginals() {
+        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main · Night 3 frames", "Main · Reference", "Ultra Wide · Night 3 frames", "Ultra Wide · Reference"]), 2)
+        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main · Night 3 frames", "Main · Reference"]), 1)
+        XCTAssertEqual(RecentComparison.secondIndex(labels: []), 0)
+    }
+
+    func testRepeatedPairsLeaveOnlyLatestRecentAndNoPendingCapture() async throws {
+        let store = CaptureStore(root: root)
+        for value in UInt8(0)..<20 {
+            var pair = photo("Main", bytes: [value])
+            pair.companions = [photo("Ultra Wide", bytes: [value, 1])]
+            try await store.stage(pair)
+            _ = try await store.finish(thumbnail: nil)
+            let pending = try await store.load("pending.plist")
+            XCTAssertNil(pending)
+        }
+        let recent = try await CaptureStore(root: root).load("recent.plist")
+        XCTAssertEqual(recent?.photos.map(\.data), [Data([19]), Data([19, 1])])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).sorted(), ["recent.plist"])
+    }
+
     func testEyeFocusCoordinatesReturnToSensorSpaceForEveryOrientation() {
         // Same off-center sensor location viewed with each supported rotation.
         let samples: [(AVCaptureVideoOrientation, CGPoint)] = [
