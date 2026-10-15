@@ -4,6 +4,16 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testRoutineStatusDismissalPreservesWarnings() {
+        XCTAssertTrue(CameraViewModel.isBriefStatus("Saved"))
+        XCTAssertTrue(CameraViewModel.isBriefStatus("Saved 2 photos"))
+        XCTAssertTrue(CameraViewModel.isBriefStatus("Depth capture ready"))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("Saved to Photos, but local history could not be updated."))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("Only Main photo saved. The other camera did not capture a photo."))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("Not saved to Photos. A recovery copy is on this iPhone."))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("Saving to Photos…"))
+    }
+
     func testZoomRestorationClampsToChangedFormatLimits() {
         XCTAssertEqual(ZoomLimits.clamp(8, minimum: 1, maximum: 4), 4)
         XCTAssertEqual(ZoomLimits.clamp(0.5, minimum: 1, maximum: 4), 1)
