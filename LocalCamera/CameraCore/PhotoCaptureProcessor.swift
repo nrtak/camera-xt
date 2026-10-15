@@ -209,7 +209,8 @@ enum NightCapturePolicy {
     }
 }
 
-final class NightWorkCancellation {
+// Cancellation state is lock-protected; the observer is owned for the instance lifetime.
+final class NightWorkCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
     private var observer: NSObjectProtocol?
@@ -283,9 +284,15 @@ enum NightPhotoProcessor {
                            bounds: CGRect(x: 0, y: 0, width: side, height: side), format: .RGBA8,
                            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
         }
-        return (0..<(side * side)).map { i in
-            (Double(pixels[i * 4]) * 0.2126 + Double(pixels[i * 4 + 1]) * 0.7152 + Double(pixels[i * 4 + 2]) * 0.0722) / 255
+        var values = [Double](repeating: 0, count: side * side)
+        for i in values.indices {
+            let offset = i * 4
+            let red = Double(pixels[offset]) * 0.2126
+            let green = Double(pixels[offset + 1]) * 0.7152
+            let blue = Double(pixels[offset + 2]) * 0.0722
+            values[i] = (red + green + blue) / 255.0
         }
+        return values
     }
     private static func sharpness(_ pixels: [Double], side: Int = 96) -> Double {
         guard pixels.count == side * side else { return 0 }
