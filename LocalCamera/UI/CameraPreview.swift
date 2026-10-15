@@ -70,17 +70,18 @@ struct CameraPreview: UIViewRepresentable {
             guard showsFocusFeedback else { return }
             onFocus(devicePoint, locked)
             marker?.removeFromSuperview()
-            let marker = UILabel(frame: CGRect(x: min(max(0, point.x - 46), max(0, view.bounds.width - 92)), y: min(max(0, point.y - 30), max(0, view.bounds.height - 60)), width: 92, height: 60))
-            marker.text = exposureOnly ? "Brightness" : locked ? "Lock requested" : "Focus requested"
+            let marker = UILabel(frame: CGRect(x: min(max(0, point.x - 32), max(0, view.bounds.width - 64)), y: min(max(0, point.y - 32), max(0, view.bounds.height - 64)), width: 64, height: 64))
+            marker.text = exposureOnly ? "EV" : nil
             marker.font = .preferredFont(forTextStyle: .caption2)
             marker.textAlignment = .center; marker.textColor = .white
-            marker.backgroundColor = UIColor.black.withAlphaComponent(0.35)
+            marker.backgroundColor = .clear
             marker.isUserInteractionEnabled = false
             marker.layer.borderColor = exposureOnly ? UIColor.white.cgColor : UIColor(CameraAppearance.selection).cgColor
             marker.layer.borderWidth = 1
             view.addSubview(marker); self.marker = marker
-            if !locked || exposureOnly {
-                UIView.animate(withDuration: 0.2, delay: 1.5, options: []) { marker.alpha = 0 } completion: { _ in marker.removeFromSuperview() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak marker] in
+                guard let marker, marker.text != "Locked" else { return }
+                UIView.animate(withDuration: 0.2) { marker.alpha = 0 } completion: { _ in marker.removeFromSuperview() }
             }
 
         }
@@ -111,8 +112,9 @@ struct CameraPreview: UIViewRepresentable {
         context.coordinator.onFocus = onFocus
         context.coordinator.showsFocusFeedback = showsFocusFeedback
         context.coordinator.exposureOnly = exposureOnly
-        if focusState == "Focus locked" { context.coordinator.marker?.text = "Focus locked" }
-        else if focusState == "Auto focus", context.coordinator.marker?.text == "Focus locked" { context.coordinator.marker?.removeFromSuperview() }
+        context.coordinator.marker?.isHidden = !showsFocusFeedback
+        if focusState == "Focus locked" { context.coordinator.marker?.text = "Locked" }
+        else if focusState == "Auto focus", context.coordinator.marker?.text == "Locked" { context.coordinator.marker?.removeFromSuperview() }
         if view.guide.image !== guideImage { view.guide.image = guideImage }
         view.grid.isHidden = !showsGrid
         view.updateOverlays()
