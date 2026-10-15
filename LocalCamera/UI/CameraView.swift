@@ -867,6 +867,7 @@ private struct CompactToolLayout<Content: View>: View {
 // The original reference is bundled locally so design review works offline.
 // These images are illustrations, never representations of active camera settings.
 private struct PhotoRescueView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = PhotoRescueModel()
     @State private var selection: PhotosPickerItem?
     @State private var showsOriginal = false
@@ -905,6 +906,8 @@ private struct PhotoRescueView: View {
             }
         }
         .navigationTitle("Photo Rescue")
+        .onDisappear { model.suspendProcessing() }
+        .onChange(of: scenePhase) { _, phase in if phase != .active { model.suspendProcessing() } }
         .onChange(of: selection) { _, item in
             guard let item else { return }
             showsOriginal = false
