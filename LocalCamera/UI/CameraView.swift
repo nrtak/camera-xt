@@ -4,8 +4,8 @@ import PhotosUI
 import CoreImage
 import ImageIO
 
-private enum CameraAppearance {
-    static let selection = Color(red: 1, green: 0.94, blue: 0.36)
+enum CameraAppearance {
+    static let selection = Color(red: 0.48, green: 0.80, blue: 1)
 }
 
 struct CameraView: View {
