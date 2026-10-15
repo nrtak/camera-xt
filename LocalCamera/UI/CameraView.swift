@@ -17,6 +17,7 @@ struct CameraView: View {
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.dynamicTypeSize) private var textSize
     @AppStorage("camera.quickAccess") private var quickAccess = false
+    @AppStorage("camera.showQuickControls") private var showQuickControls = true
     @AppStorage("camera.advancedTools") private var advancedTools = false
     @AppStorage("camera.rememberSetup") private var rememberSetup = true
     @AppStorage("camera.pin1") private var pin1 = "Exposure"
@@ -251,18 +252,7 @@ struct CameraView: View {
     private var captureStatus: some View {
         VStack(spacing: 12) {
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
-                if quickAccess {
-                    HStack(spacing: 0) {
-                        ForEach(Array([pin1, pin2, pin3].enumerated()), id: \.offset) { _, name in
-                            if let page = CameraToolPage(rawValue: name) {
-                                Button { openTool(page) } label: {
-                                    Image(systemName: page.icon).frame(maxWidth: .infinity, minHeight: 44)
-                                }.accessibilityLabel(page.rawValue).disabled(!model.canConfigure)
-                            }
-                        }
-                    }.frame(maxWidth: 220)
-                        .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
-                }
+                if showQuickControls { viewfinderQuickControls }
                 LiveHistogram(guides: model.guides, overlayColor: overlayColor)
             }
             if model.camera.recording, let started = model.recordingStarted {
@@ -295,6 +285,61 @@ struct CameraView: View {
             .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
         }
         .padding(.horizontal, 14)
+    }
+
+    private var viewfinderQuickControls: some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: textSize.isAccessibilitySize ? 2 : (quickAccess || model.mode == .video ? 3 : 4)), spacing: 4) {
+            if quickAccess {
+                ForEach(Array([pin1, pin2, pin3].enumerated()), id: \.offset) { _, name in
+                    if let page = CameraToolPage(rawValue: name) {
+                        quickControl(page.rawValue, icon: page.icon, value: "Open") { openTool(page) }
+                    }
+                }
+            } else {
+                if model.mode == .photo {
+                    quickControl("Night", icon: model.captureStyle == "Night" ? "moon.fill" : "moon", value: model.captureStyle == "Night" ? "On · Beta" : "Off", active: model.captureStyle == "Night") {
+                        model.setNightEnabled(model.captureStyle != "Night")
+                    }
+                    quickControl("Timer", icon: "timer", value: model.timerSeconds == 0 ? "Off" : "\(model.timerSeconds)s", active: model.timerSeconds > 0) {
+                        model.timerSeconds = model.timerSeconds == 0 ? 3 : model.timerSeconds == 3 ? 10 : 0
+                    }
+                    if model.camera.dualEnabled {
+                        quickControl("Dual style", icon: "camera.on.rectangle", value: model.captureStyle == "Night" ? "Night" : model.camera.dualMode.rawValue) {
+                            if model.captureStyle == "Night" { openTool(.shoot) }
+                            else { model.setDualMode(model.camera.dualMode == .fast ? .detail : .fast) }
+                        }
+                    } else {
+                        quickControl("Style", icon: "camera", value: model.burstEnabled && model.captureStyle == "Auto" ? "Burst" : model.captureStyle) { openTool(.shoot) }
+                    }
+                } else {
+                    quickControl("Video", icon: "video", value: model.camera.videoLabel) { openTool(.video) }
+                    quickControl("Grid", icon: "grid", value: showsGrid ? "On" : "Off", active: showsGrid) { showsGrid.toggle() }
+                }
+                quickControl("Brightness", icon: "sun.max", value: model.camera.dualEnabled ? "Both views" : String(format: "%+.1f EV", model.exposureBias)) { openTool(.exposure) }
+            }
+        }
+        .padding(4)
+        .frame(maxWidth: 420)
+        .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+        .disabled(!model.canConfigure)
+    }
+
+    private func quickControl(_ title: String, icon: String, value: String, active: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: icon).font(.body)
+                Text(title).font(.caption2.weight(.semibold))
+                Text(value).font(.caption2).foregroundStyle(active ? selection : .white.opacity(0.8))
+            }
+            .frame(maxWidth: .infinity, minHeight: 56)
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(active ? selection : .white)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(value)
     }
 
     private func zoomState(_ index: Int? = nil) -> CameraZoom {
@@ -703,11 +748,14 @@ struct CameraView: View {
             Text("The selected lens determines which formats are available.").font(.footnote)
             Button("Apply video settings") { model.applyVideoSettings(); showsCaptureInfo = false }.buttonStyle(.borderedProminent).foregroundStyle(.black)
         case .shortcuts:
-            Toggle("Show quick controls", isOn: $quickAccess)
+            Toggle("Show quick controls", isOn: $showQuickControls)
+            Toggle("Use custom shortcuts", isOn: $quickAccess)
+            if quickAccess {
             shortcutPicker("First", selection: $pin1, excluding: [pin2, pin3])
             shortcutPicker("Second", selection: $pin2, excluding: [pin1, pin3])
             shortcutPicker("Third", selection: $pin3, excluding: [pin1, pin2])
-            Text("Three optional controls above the viewfinder. All tools remain available in Tools.").font(.footnote)
+            }
+            Text("Standard controls adapt to Photo, Dual Shot and Video. Custom shortcuts replace that row with your three chosen tools. Controls hide while a menu is open.").font(.footnote)
         case .checks:
             Text("iPhone beta checks").font(.headline)
             if let value = model.lastCaptureMilliseconds { Text("Last capture processing: \(value) ms").font(.caption) }
