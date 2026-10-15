@@ -98,7 +98,6 @@ struct CameraView: View {
                     .accessibilityHidden(panelOpen)
                 } else {
                     GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: !fullFrame, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen)
-                        .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
                         .allowsHitTesting(!panelOpen)
@@ -138,7 +137,17 @@ struct CameraView: View {
                 .padding(.bottom, 8)
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) { captureHUD }
+        .overlay(alignment: .top) {
+            if !panelOpen { captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 8) }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                captureHUD
+                if !panelOpen && showQuickControls {
+                    viewfinderQuickControls.padding(.horizontal, 12).padding(.bottom, 6)
+                }
+            }.background(Color.black)
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls(landscape: landscape) }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
         .onChange(of: panelOpen) { _, open in
@@ -264,10 +273,7 @@ struct CameraView: View {
         }
         .disabled(!model.canConfigure)
         .padding(.horizontal, 14)
-        .background(overlayColor)
-        .overlay(alignment: .top) {
-            if !panelOpen { captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 48) }
-        }
+        .background(Color.black)
         .buttonStyle(.plain)
     }
 
@@ -278,7 +284,6 @@ struct CameraView: View {
                     .font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
             }
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
-                if showQuickControls { viewfinderQuickControls }
                 if sceneHints, model.canConfigure, model.mode == .photo, model.message == nil, let advice = model.sceneAdvice {
                     Button { openTool(.shoot) } label: {
                         Label(advice, systemImage: "moon").font(.caption).padding(8).frame(minHeight: 44)
@@ -359,18 +364,19 @@ struct CameraView: View {
         }
         .padding(4)
         .frame(maxWidth: 420)
-        .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
         .disabled(!model.canConfigure)
     }
 
     private func quickControl(_ title: String, icon: String, value: String, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: 3) {
-                Image(systemName: icon).font(.body)
-                Text(title).font(.caption2.weight(.semibold))
-                Text(value).font(.caption2).foregroundStyle(active ? selection : .white.opacity(0.8))
+                HStack(spacing: 5) {
+                    Image(systemName: icon).font(.body)
+                    if value != "Open" { Text(value).font(.caption.monospacedDigit()) }
+                }
+                Text(title).font(.caption2).foregroundStyle(.white.opacity(0.75))
             }
-            .frame(maxWidth: .infinity, minHeight: 56)
+            .frame(maxWidth: .infinity, minHeight: 48)
             .padding(.vertical, 3)
             .contentShape(Rectangle())
         }
@@ -518,7 +524,7 @@ struct CameraView: View {
     }
 
     private func captureControls(landscape: Bool) -> some View {
-        let layout = landscape ? AnyLayout(HStackLayout(spacing: 12)) : AnyLayout(VStackLayout(spacing: 12))
+        let layout = landscape ? AnyLayout(HStackLayout(spacing: 12)) : AnyLayout(VStackLayout(spacing: 6))
         let modeLayout = landscape ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 12))
         return layout {
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst && !model.camera.dualEnabled {
@@ -603,7 +609,7 @@ struct CameraView: View {
             .frame(minWidth: landscape ? 200 : nil)
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 18).padding(.top, 10).padding(.bottom, 14)
+        .padding(.horizontal, 18).padding(.top, 6).padding(.bottom, 8)
         .frame(maxWidth: .infinity)
         .overlay(alignment: .top) {
             if showsZoom && !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
@@ -612,10 +618,7 @@ struct CameraView: View {
                     .alignmentGuide(.top) { dimensions in dimensions[.bottom] + 8 }
             }
         }
-        .background {
-            UnevenRoundedRectangle(topLeadingRadius: 12, topTrailingRadius: 12)
-                .fill(overlayColor).ignoresSafeArea(edges: .bottom)
-        }
+        .background(Color.black.ignoresSafeArea(edges: .bottom))
     }
 
     @ViewBuilder private var saveRecovery: some View {
@@ -630,7 +633,7 @@ struct CameraView: View {
         switch toolPath.last {
         case nil: return (advancedTools ? 560 : 290) + (hasAdjustments ? 44 : 0)
         case .shoot: base = model.camera.dualEnabled ? 370 : 350
-        case .preferences: base = preferencesSection == 0 ? 470 : 470
+        case .preferences: base = 480
         case .timer: base = 260
         case .video: base = 350
         case .gallery, .rescue: return .infinity
@@ -642,10 +645,10 @@ struct CameraView: View {
     private var captureInfo: some View {
         VStack(spacing: 0) {
             HStack {
-                if !toolPath.isEmpty {
-                    Button { toolPath = [] } label: {
+                if !toolPath.isEmpty && toolPath != [.preferences] {
+                    Button { toolPath.removeLast() } label: {
                         Image(systemName: "chevron.left").frame(width: 44, height: 44)
-                    }.accessibilityLabel("All camera tools")
+                    }.accessibilityLabel("Back")
                 }
                 Text(toolPath.last?.rawValue ?? "Camera Tools").font(.headline)
                 Spacer()
@@ -826,33 +829,50 @@ struct CameraView: View {
             Text("Mark a check only after testing it. No results are uploaded.").font(.footnote)
         case .preferences:
             Picker("Preferences section", selection: $preferencesSection) {
-                Text("Camera").tag(0); Text("Review & setup").tag(1)
+                Text("Camera").tag(0); Text("Controls").tag(1); Text("App").tag(2)
             }.pickerStyle(.segmented)
             if preferencesSection == 0 {
-                Text("When the app opens").font(.subheadline.weight(.semibold))
-                Picker("When the app opens", selection: $rememberSetup) {
-                    Text("Remember settings").tag(true); Text("Start with defaults").tag(false)
-                }.pickerStyle(.segmented)
-                Text("Applies after a full relaunch. Recording, countdowns and capture progress never resume automatically.").font(.caption)
                 Toggle("Show full camera frame", isOn: $fullFrame)
-                Toggle("Adapt layout to orientation", isOn: $adaptiveLayout)
-                Text("Landscape places Dual Shot views side by side and compacts the shutter controls. Turn off to keep the stacked layout. Follows iPhone rotation lock.").font(.caption)
+                Text("See the entire photo, or turn off to fill the preview.").font(.caption).foregroundStyle(.secondary)
+                Toggle("Rotate camera layout", isOn: $adaptiveLayout)
                 Toggle("Composition grid", isOn: $showsGrid)
                 Toggle("Low-light suggestions", isOn: $sceneHints)
-                Toggle("Capture vibrations", isOn: $model.haptics)
-                Picker("Dual Shot inset", selection: $dualCorner) {
-                    Text("Top left").tag(0); Text("Top right").tag(1)
-                    Text("Bottom left").tag(2); Text("Bottom right").tag(3)
+            } else if preferencesSection == 1 {
+                Toggle("Show camera shortcuts", isOn: $showQuickControls)
+                Text("Brightness, Night, timer and shot style above the preview. Video shows its own controls.").font(.caption).foregroundStyle(.secondary)
+                if showQuickControls {
+                    Toggle("Choose my own shortcuts", isOn: $quickAccess)
+                    if quickAccess {
+                        shortcutPicker("First shortcut", selection: $pin1, excluding: [pin2, pin3])
+                        shortcutPicker("Second shortcut", selection: $pin2, excluding: [pin1, pin3])
+                        shortcutPicker("Third shortcut", selection: $pin3, excluding: [pin1, pin2])
+                    }
                 }
-                Button("Viewfinder guides") { toolPath = [.guides] }.buttonStyle(.bordered)
+                Divider()
+                LabeledContent("Small preview position") {
+                    Picker("Small preview position", selection: $dualCorner) {
+                        Text("Top left").tag(0); Text("Top right").tag(1)
+                        Text("Bottom left").tag(2); Text("Bottom right").tag(3)
+                    }.labelsHidden().pickerStyle(.menu)
+                }
+                Text("Where the smaller view sits when one Dual Shot camera is enlarged.").font(.caption).foregroundStyle(.secondary)
+                Toggle("Capture vibrations", isOn: $model.haptics)
             } else {
-                Button { toolPath = [.shortcuts] } label: { Label("Quick controls", systemImage: "chevron.right").frame(minHeight: 44) }
-                Button { toolPath = [.checks] } label: { Label("Beta device checks", systemImage: "chevron.right").frame(minHeight: 44) }
-                Toggle("Show local photo details", isOn: $showCaptureDetails)
-                Button("Clear recent preview") { Task { await model.clearRecent() } }.buttonStyle(.bordered)
-                if showHelp { Text("Clears only the local recent copy and its details, never your Photos library or unsaved recovery copy.").font(.footnote) }
-                Button("Design Preview") { toolPath.append(.gallery) }.buttonStyle(.bordered)
-                Button("Reset capture settings") { model.activate(.automatic); showsCaptureInfo = false }.buttonStyle(.bordered)
+                Toggle("Remember camera settings", isOn: $rememberSetup)
+                Text("Turn off to use defaults on relaunch. Recording never restarts automatically.").font(.caption).foregroundStyle(.secondary)
+                Toggle("Show saved photo details", isOn: $showCaptureDetails)
+                Text("Lens, size and exposure in photo review.").font(.caption).foregroundStyle(.secondary)
+                Divider()
+                Button { toolPath.append(.checks) } label: {
+                    HStack { Label("Device health & testing", systemImage: "heart.text.square"); Spacer(); Image(systemName: "chevron.right").font(.caption) }.frame(minHeight: 44)
+                }.buttonStyle(.plain)
+                Text("Memory, battery, temperature and optional camera tests. Nothing is uploaded.").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Clear preview") { Task { await model.clearRecent() } }
+                    Spacer()
+                    Button("Reset camera") { model.activate(.automatic); showsCaptureInfo = false }
+                }.font(.callout).frame(minHeight: 44)
+                Text("Clearing the preview keeps Photos and unsaved captures.").font(.caption).foregroundStyle(.secondary)
             }
         case .details:
             Text(fullFrame ? "Full frame shows the camera preview boundaries. Still photos and video can have different aspect ratios." : "Fill screen crops the preview to fit. Tap the framing button at the top to see the full camera frame; saved photos are not cropped by this setting.").font(.caption)
@@ -903,11 +923,13 @@ struct CameraView: View {
         }
     }
     private func shortcutPicker(_ title: String, selection: Binding<String>, excluding: [String]) -> some View {
-        Picker(title, selection: selection) {
-            ForEach([CameraToolPage.shoot, .focus, .timer, .exposure, .color, .manualFocus, .details, .preferences].filter {
-                !excluding.contains($0.rawValue) || $0.rawValue == selection.wrappedValue
-            }, id: \.self) { Text($0.rawValue).tag($0.rawValue) }
-        }.pickerStyle(.menu)
+        LabeledContent(title) {
+            Picker(title, selection: selection) {
+                ForEach([CameraToolPage.shoot, .focus, .timer, .exposure, .color, .manualFocus, .details, .preferences].filter {
+                    !excluding.contains($0.rawValue) || $0.rawValue == selection.wrappedValue
+                }, id: \.self) { Text($0.rawValue).tag($0.rawValue) }
+            }.pickerStyle(.menu).labelsHidden()
+        }
     }
     private let deviceChecks = [
         "Stability: take 20 Single photos, 20 Fast pairs and 10 Detail pairs; switch modes between groups. Rotate both ways and review each pair. Check for missed captures, mismatched lenses, freezes and save failures.",
@@ -944,7 +966,7 @@ struct CameraView: View {
 }
 
 private enum CameraToolPage: String, Hashable {
-    case shortcuts = "Quick controls", checks = "Beta device checks"
+    case shortcuts = "Camera shortcuts", checks = "Device health & testing"
     case guides = "Viewfinder guides"
     case shoot = "Shot styles", focus = "Focus & depth", timer = "Timer", video = "Video quality"
     case rescue = "Photo Rescue", advanced = "Advanced", preferences = "Preferences"
@@ -981,7 +1003,7 @@ private struct CompactToolLayout<Content: View>: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }.padding(12).frame(maxHeight: .infinity, alignment: .top)
-            .controlSize(.large)
+            .controlSize(.regular)
     }
 }
 
