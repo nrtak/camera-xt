@@ -18,6 +18,7 @@ struct CameraView: View {
     @Environment(\.dynamicTypeSize) private var textSize
     @AppStorage("camera.quickAccess") private var quickAccess = false
     @AppStorage("camera.showQuickControls") private var showQuickControls = true
+    @AppStorage("camera.adaptiveLayout") private var adaptiveLayout = true
     @AppStorage("camera.advancedTools") private var advancedTools = false
     @AppStorage("camera.rememberSetup") private var rememberSetup = true
     @AppStorage("camera.pin1") private var pin1 = "Exposure"
@@ -61,6 +62,12 @@ struct CameraView: View {
     private let selection = CameraAppearance.selection
 
     var body: some View {
+        GeometryReader { geometry in
+            cameraScreen(landscape: adaptiveLayout && geometry.size.width > geometry.size.height)
+        }
+    }
+
+    private func cameraScreen(landscape: Bool) -> some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if model.permission == .authorized {
@@ -69,15 +76,15 @@ struct CameraView: View {
                         ZStack(alignment: .topLeading) {
                             ForEach(0..<2, id: \.self) { index in
                                 let inset = enlargedDualIndex != nil && enlargedDualIndex != index
-                                let width = inset ? geometry.size.width * 0.38 : geometry.size.width
-                                let height = enlargedDualIndex == nil ? (geometry.size.height - 4) / 2 :
+                                let width = inset ? geometry.size.width * 0.38 : enlargedDualIndex == nil && landscape ? (geometry.size.width - 4) / 2 : geometry.size.width
+                                let height = enlargedDualIndex == nil ? (landscape ? geometry.size.height : (geometry.size.height - 4) / 2) :
                                     inset ? geometry.size.height * 0.32 : geometry.size.height
                                 dualViewfinder(zoomText(zoomState(index).value), index: index)
                                     .frame(width: width, height: height)
                                     .clipShape(RoundedRectangle(cornerRadius: inset ? 12 : 0))
                                     .overlay { RoundedRectangle(cornerRadius: inset ? 12 : 0).strokeBorder(.white.opacity(inset ? 0.25 : 0), lineWidth: 2).allowsHitTesting(false) }
-                                    .offset(x: inset ? (dualCorner % 2 == 0 ? 8 : geometry.size.width - width - 8) : 0,
-                                            y: enlargedDualIndex == nil ? CGFloat(index) * (height + 4) : inset ? (dualCorner < 2 ? 8 : geometry.size.height - height - 8) : 0)
+                                    .offset(x: inset ? (dualCorner % 2 == 0 ? 8 : geometry.size.width - width - 8) : enlargedDualIndex == nil && landscape ? CGFloat(index) * (width + 4) : 0,
+                                            y: enlargedDualIndex == nil ? (landscape ? 0 : CGFloat(index) * (height + 4)) : inset ? (dualCorner < 2 ? 8 : geometry.size.height - height - 8) : 0)
                                     .zIndex(inset ? 1 : 0)
                             }
                         }
@@ -127,7 +134,7 @@ struct CameraView: View {
             }
         }
         .safeAreaInset(edge: .top, spacing: 0) { captureHUD }
-        .safeAreaInset(edge: .bottom, spacing: 0) { captureControls }
+        .safeAreaInset(edge: .bottom, spacing: 0) { captureControls(landscape: landscape) }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
         .onChange(of: panelOpen) { _, open in
             if open { showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
@@ -478,12 +485,14 @@ struct CameraView: View {
         .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private var captureControls: some View {
-        VStack(spacing: 12) {
+    private func captureControls(landscape: Bool) -> some View {
+        let layout = landscape ? AnyLayout(HStackLayout(spacing: 12)) : AnyLayout(VStackLayout(spacing: 12))
+        let modeLayout = landscape ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 12))
+        return layout {
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst && !model.camera.dualEnabled {
                 lensSelector
             }
-            HStack(spacing: 12) {
+            modeLayout {
                 ForEach(CaptureMode.allCases, id: \.self) { mode in
                     Button { model.selectMode(mode) } label: {
                         Text(mode.rawValue.uppercased())
@@ -496,6 +505,7 @@ struct CameraView: View {
                 }
 
             }
+            .fixedSize(horizontal: landscape, vertical: false)
             .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.recording)
 
             HStack {
@@ -553,6 +563,7 @@ struct CameraView: View {
                 .accessibilityLabel("Switch front and rear camera")
                 .disabled(!model.canSwitch || !model.camera.lenses.contains { $0.isFront != model.selectedLens?.isFront })
             }
+            .frame(minWidth: landscape ? 200 : nil)
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 18).padding(.top, 10).padding(.bottom, 14)
@@ -784,6 +795,8 @@ struct CameraView: View {
                 }.pickerStyle(.segmented)
                 Text("Applies after a full relaunch. Recording, countdowns and capture progress never resume automatically.").font(.caption)
                 Toggle("Show full camera frame", isOn: $fullFrame)
+                Toggle("Adapt layout to orientation", isOn: $adaptiveLayout)
+                Text("Landscape places Dual Shot views side by side and compacts the shutter controls. Turn off to keep the stacked layout. Follows iPhone rotation lock.").font(.caption)
                 Toggle("Composition grid", isOn: $showsGrid)
                 Toggle("Capture vibrations", isOn: $model.haptics)
                 Picker("Dual Shot inset", selection: $dualCorner) {
@@ -860,6 +873,7 @@ struct CameraView: View {
         "Night: test Single and Dual, interrupt during capture, deny Photos access, and repeat pairs. Verify originals survive interruption and each saved view is correctly labeled.",
         "Switch Fill / Full Frame in Photo, Video and both Dual Shot layouts. Tap near each visible corner and verify focus follows the tap. Compare the preview with the saved photo.",
         "Take repeated photos with guides off, then Histogram, Highlights and Focus Peaking. Check responsiveness, warmth and memory in a device profiling session.",
+        "Rotate both ways in Single, Dual Fast, Dual Detail, Night and Video. Check upright previews, saved photos/videos, focus targets and guides. Rotate during a Night sequence or recording: its saved orientation must stay fixed. Check rotation lock, larger text and the fixed-layout setting.",
         "Check the zoom row against this phone’s native lens and sensor-crop choices. Test larger text and landscape without clipped controls.",
         "Pinch both Dual Shot previews separately. Confirm the selected border and slider identify the same camera, and hold-versus-tap does not change lenses unexpectedly.",
         "In good light, photograph the same distant subject in Single Photo, Dual Fast, and Dual Detail. Compare main-camera sharpness in Photos at the same scale.",
