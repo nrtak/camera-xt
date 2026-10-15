@@ -88,6 +88,8 @@ final class CaptureSessionManager {
     private lazy var dual = DualPhotoCamera(queue: queue)
     private weak var preview: AVCaptureVideoPreviewLayer?
     private weak var secondaryPreview: AVCaptureVideoPreviewLayer?
+    private var interfaceOrientation: AVCaptureVideoOrientation = .portrait
+    private var sequenceOrientation: AVCaptureVideoOrientation = .portrait
     private final class PreviewReference {
         weak var layer: AVCaptureVideoPreviewLayer?
         init(_ layer: AVCaptureVideoPreviewLayer) { self.layer = layer }
@@ -313,7 +315,7 @@ final class CaptureSessionManager {
             snapshot.resolution = "Up to \(size.width) × \(size.height)"
         }
         if let connection = output.connection(with: .video) {
-            if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+            if connection.isVideoOrientationSupported { connection.videoOrientation = interfaceOrientation }
             if connection.isVideoMirroringSupported {
                 connection.automaticallyAdjustsVideoMirroring = false
                 connection.isVideoMirrored = false
@@ -323,7 +325,9 @@ final class CaptureSessionManager {
 
     func capture(speed: Bool = false, night: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         queue.async {
+            let orientation = self.burstRunning ? self.sequenceOrientation : self.interfaceOrientation
             if self.snapshot.dualEnabled {
+                self.dual.setOrientation(orientation)
                 self.dual.onProgress = self.onCaptureProgress
                 self.dual.capture(night: night) { [weak self] result in
                     if let self, self.pendingMemoryFallback {
@@ -337,6 +341,9 @@ final class CaptureSessionManager {
             guard self.session.isRunning, !self.session.isInterrupted, !self.snapshot.videoMode, self.processor == nil else {
                 completion(.failure(CameraFailure.unavailable))
                 return
+            }
+            if let connection = self.output.connection(with: .video), connection.isVideoOrientationSupported {
+                connection.videoOrientation = orientation
             }
             let codec: AVVideoCodecType = self.output.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
@@ -414,7 +421,7 @@ final class CaptureSessionManager {
             self.analysisOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
             self.session.addOutput(self.analysisOutput)
             if let connection = self.analysisOutput.connection(with: .video) {
-                if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+                if connection.isVideoOrientationSupported { connection.videoOrientation = self.interfaceOrientation }
                 if connection.isVideoMirroringSupported {
                     connection.automaticallyAdjustsVideoMirroring = false; connection.isVideoMirrored = false
                 }
@@ -481,6 +488,7 @@ final class CaptureSessionManager {
                     } catch { self.eyeStatus = "Eye AF · unavailable" }
                 }
             }
+            tracker.setOrientation(self.interfaceOrientation)
             self.eyeTracker = tracker
             self.eyeOutput.setSampleBufferDelegate(tracker, queue: tracker.queue)
             self.session.commitConfiguration()
@@ -564,11 +572,30 @@ final class CaptureSessionManager {
             let connection = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
             guard activeSession.canAddConnection(connection) else { continue }
             activeSession.addConnection(connection)
-            if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+            if connection.isVideoOrientationSupported { connection.videoOrientation = interfaceOrientation }
             if connection.isVideoMirroringSupported {
                 connection.automaticallyAdjustsVideoMirroring = false
                 connection.isVideoMirrored = false
             }
+        }
+    }
+
+    func setInterfaceOrientation(_ orientation: AVCaptureVideoOrientation, completion: @escaping () -> Void) {
+        queue.async {
+            defer { DispatchQueue.main.async(execute: completion) }
+            guard self.interfaceOrientation != orientation else { return }
+            self.interfaceOrientation = orientation
+            for layer in [self.preview, self.secondaryPreview].compactMap({ $0 }) {
+                if let connection = layer.connection, connection.isVideoOrientationSupported {
+                    connection.videoOrientation = orientation
+                }
+            }
+            if let connection = self.analysisOutput.connection(with: .video), connection.isVideoOrientationSupported {
+                connection.videoOrientation = orientation
+                self.onAnalysis?(nil, [])
+            }
+            self.eyeTracker?.setOrientation(orientation)
+            // Capture outputs change only at the start of a shot/sequence/recording.
         }
     }
 
@@ -757,7 +784,7 @@ final class CaptureSessionManager {
                     self.snapshot.videoLabel = "\(width == 3840 ? "4K" : "1080p") · \(fps) fps"
                     self.snapshot.stabilized = false
                     if let connection = self.movie.connection(with: .video) {
-                        if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+                        if connection.isVideoOrientationSupported { connection.videoOrientation = self.interfaceOrientation }
                         if connection.isVideoStabilizationSupported {
                             connection.preferredVideoStabilizationMode = stabilized ? .auto : .off
                             self.snapshot.stabilized = stabilized
@@ -810,6 +837,9 @@ final class CaptureSessionManager {
                 } catch { self.onMovie?(.failure(error)); return }
             }
             let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("mov")
+            if let connection = self.movie.connection(with: .video), connection.isVideoOrientationSupported {
+                connection.videoOrientation = self.interfaceOrientation
+            }
             self.stopMovieWhenStarted = false
             let processor = MovieCaptureProcessor(started: { [weak self] in
                 guard let self else { return }
@@ -945,6 +975,7 @@ final class CaptureSessionManager {
                   !self.snapshot.videoMode, self.wantsRunning else {
                 completion(.failure(CameraFailure.unavailable)); return
             }
+            self.sequenceOrientation = self.interfaceOrientation
             self.burstRunning = true
             let paired = self.snapshot.dualEnabled
             self.nightFrame(photos: [], remaining: paired ? 3 : 4, paired: paired, cancellation: cancellation) { result in
@@ -1002,6 +1033,7 @@ final class CaptureSessionManager {
         queue.async {
             guard !self.burstRunning, !self.snapshot.dualEnabled, !self.snapshot.videoMode,
                   self.processor == nil, self.session.isRunning else { completion(.failure(CameraFailure.unavailable)); return }
+            self.sequenceOrientation = self.interfaceOrientation
             self.burstRunning = true
             let flash = self.controls.flash
             self.controls.flash = .off
@@ -1035,6 +1067,10 @@ private final class EyeFocusTracker: NSObject, AVCaptureVideoDataOutputSampleBuf
     private let report: (CGPoint?, Bool) -> Void
     private var lastTime = -Double.infinity
     private var misses = 0
+    private var orientation: AVCaptureVideoOrientation = .portrait
+    func setOrientation(_ value: AVCaptureVideoOrientation) {
+        queue.async { self.orientation = value; self.misses = 0 }
+    }
     init(report: @escaping (CGPoint?, Bool) -> Void) { self.report = report }
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         let time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
@@ -1049,7 +1085,7 @@ private final class EyeFocusTracker: NSObject, AVCaptureVideoDataOutputSampleBuf
             let image = raw.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             let request = VNDetectFaceLandmarksRequest()
             do {
-                try VNImageRequestHandler(ciImage: image, orientation: .right, options: [:]).perform([request])
+                try VNImageRequestHandler(ciImage: image, orientation: CameraOrientation.vision(orientation), options: [:]).perform([request])
                 guard let face = request.results?.filter({ $0.confidence >= 0.6 }).max(by: {
                     $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
                 }), let eye = face.landmarks?.leftEye ?? face.landmarks?.rightEye,
@@ -1059,8 +1095,7 @@ private final class EyeFocusTracker: NSObject, AVCaptureVideoDataOutputSampleBuf
                 let y = points.reduce(CGFloat(0)) { $0 + $1.y } / CGFloat(points.count)
                 let uprightX = face.boundingBox.minX + x * face.boundingBox.width
                 let uprightY = face.boundingBox.minY + y * face.boundingBox.height
-                // Undo Vision's clockwise portrait orientation and bottom-left origin.
-                let point = CGPoint(x: 1 - uprightY, y: 1 - uprightX)
+                let point = CameraOrientation.sensorPoint(x: uprightX, y: uprightY, orientation: orientation)
                 guard (0...1).contains(point.x), (0...1).contains(point.y) else { missed(); return }
                 misses = 0
                 report(point, false)
@@ -1124,6 +1159,15 @@ private final class DualPhotoCamera {
     private(set) var resolution = "—"
 
     init(queue: DispatchQueue) { self.queue = queue }
+
+    func setOrientation(_ orientation: AVCaptureVideoOrientation) {
+        guard !busy else { return }
+        for output in outputs {
+            if let connection = output.connection(with: .video), connection.isVideoOrientationSupported {
+                connection.videoOrientation = orientation
+            }
+        }
+    }
 
     private static var pair: [AVCaptureDevice]? {
         guard AVCaptureMultiCamSession.isMultiCamSupported else { return nil }
