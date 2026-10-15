@@ -4,6 +4,27 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testEyeFocusCoordinatesReturnToSensorSpaceForEveryOrientation() {
+        // Same off-center sensor location viewed with each supported rotation.
+        let samples: [(AVCaptureVideoOrientation, CGPoint)] = [
+            (.landscapeRight, CGPoint(x: 0.2, y: 0.7)),
+            (.landscapeLeft, CGPoint(x: 0.8, y: 0.3)),
+            (.portrait, CGPoint(x: 0.7, y: 0.8)),
+            (.portraitUpsideDown, CGPoint(x: 0.3, y: 0.2))
+        ]
+        for (orientation, eye) in samples {
+            let point = CameraOrientation.sensorPoint(x: eye.x, y: eye.y, orientation: orientation)
+            XCTAssertEqual(point.x, 0.2, accuracy: 0.0001)
+            XCTAssertEqual(point.y, 0.3, accuracy: 0.0001)
+        }
+    }
+
+    func testInterfaceOrientationKeepsLandscapeDirectionsAndUnknownUsesPortrait() {
+        XCTAssertEqual(CameraOrientation.capture(.landscapeLeft), .landscapeLeft)
+        XCTAssertEqual(CameraOrientation.capture(.landscapeRight), .landscapeRight)
+        XCTAssertEqual(CameraOrientation.capture(.unknown), .portrait)
+    }
+
     func testPhotoRescueStopsBeforeDecodingWhenCancelled() async {
         let work = NightWorkCancellation(); work.cancel()
         do {
