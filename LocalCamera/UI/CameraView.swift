@@ -9,6 +9,7 @@ enum CameraAppearance {
 }
 
 struct CameraView: View {
+    init() { CameraLaunchPreferences.prepareOnce() }
     @StateObject private var model = CameraViewModel()
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
@@ -16,6 +17,8 @@ struct CameraView: View {
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.dynamicTypeSize) private var textSize
     @AppStorage("camera.quickAccess") private var quickAccess = false
+    @AppStorage("camera.advancedTools") private var advancedTools = false
+    @AppStorage("camera.rememberSetup") private var rememberSetup = true
     @AppStorage("camera.pin1") private var pin1 = "Exposure"
     @AppStorage("camera.pin2") private var pin2 = "Timer"
     @AppStorage("camera.pin3") private var pin3 = "Shot styles"
@@ -107,7 +110,7 @@ struct CameraView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                         } else { captureInfo }
                     }
-                        .frame(height: min(geometry.size.height * 0.82, toolPanelHeight))
+                        .frame(height: min(geometry.size.height * (toolPath.isEmpty && advancedTools ? 0.96 : 0.82), toolPanelHeight))
                         .contentShape(Rectangle())
                         .background { Rectangle().fill(Color.clear).contentShape(Rectangle()).onTapGesture {} }
                         .frame(maxHeight: .infinity, alignment: .bottom)
@@ -120,7 +123,7 @@ struct CameraView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
         .onChange(of: showsCaptureInfo) { _, open in if open { showsZoom = false; zoomDismissTask?.cancel() } }
-        .onDisappear { zoomDismissTask?.cancel() }
+        .onDisappear { zoomDismissTask?.cancel(); model.setActive(false) }
         .foregroundStyle(ink)
         .tint(selection)
         .preferredColorScheme(.dark)
@@ -190,12 +193,23 @@ struct CameraView: View {
 
     private var captureHUD: some View {
         HStack(spacing: 8) {
-            Button { openTool(.details) } label: {
-                Text(model.camera.dualEnabled ? (model.captureStyle == "Night" ? "Dual · Night" : "Dual · \(model.camera.dualMode.rawValue)") : model.captureStyle == "Night" ? "Night" : model.mode.rawValue)
-                    .font(.subheadline.weight(.semibold)).lineLimit(1)
-                    .frame(minHeight: 44)
+            if model.mode == .photo {
+                Button {
+                    showsCaptureInfo = false; showsRecent = false
+                    model.setDualEnabled(!model.camera.dualEnabled)
+                } label: {
+                    Label(model.camera.dualEnabled ? "Dual" : "Single", systemImage: model.camera.dualEnabled ? "camera.on.rectangle.fill" : "camera")
+                        .font(.subheadline.weight(.semibold)).lineLimit(1)
+                        .foregroundStyle(model.camera.dualEnabled ? selection : ink)
+                        .frame(minHeight: 44)
+                }
+                .disabled(!model.camera.dualAvailable && !model.camera.dualEnabled)
+                .accessibilityLabel(model.camera.dualEnabled ? "Switch to Single Shot" : "Switch to Dual Shot")
+                .accessibilityValue(model.camera.dualEnabled ? "Dual Shot" : "Single Shot")
+                .accessibilityHint(model.camera.dualAvailable ? "Changes camera mode with one tap" : "Dual Shot is unavailable on this device")
+            } else {
+                Button("Video") { openTool(.details) }.frame(minHeight: 44)
             }
-            .accessibilityLabel("Capture details")
             Spacer(minLength: 8)
             Button { fullFrame.toggle() } label: {
                 Image(systemName: fullFrame ? "viewfinder" : "arrow.up.left.and.arrow.down.right")
@@ -506,9 +520,9 @@ struct CameraView: View {
         if showsRecent || model.reviewingBurst || textSize.isAccessibilitySize { return .infinity }
         let base: CGFloat
         switch toolPath.last {
-        case nil: return hasAdjustments ? 314 : 270
+        case nil: return (advancedTools ? 560 : 290) + (hasAdjustments ? 44 : 0)
         case .shoot: base = model.camera.dualEnabled ? 370 : 350
-        case .preferences: base = preferencesSection == 0 ? 394 : 470
+        case .preferences: base = preferencesSection == 0 ? 470 : 470
         case .timer: base = 260
         case .video: base = 350
         case .gallery, .rescue: return .infinity
@@ -538,8 +552,16 @@ struct CameraView: View {
                 toolPage(page)
             } else {
                 CompactToolLayout {
+                    Picker("Tool complexity", selection: $advancedTools) {
+                        Text("Simple").tag(false); Text("Advanced").tag(true)
+                    }.pickerStyle(.segmented)
                     if hasAdjustments { Button("Reset to Auto") { useTool(.automatic) }.frame(minHeight: 44) }
-                    toolGrid([.shoot, .focus, model.mode == .photo ? .timer : .video, .exposure, .color, .manualFocus, .details, .rescue, .preferences])
+                    toolGrid([.shoot, model.mode == .photo ? .timer : .video, .preferences])
+                    Toggle("Composition grid", isOn: $showsGrid)
+                    if advancedTools {
+                        Divider()
+                        toolGrid([.exposure, .color, .manualFocus, .focus, .guides, .details, .rescue])
+                    }
                 }
             }
         }
@@ -552,11 +574,9 @@ struct CameraView: View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
             ForEach(pages, id: \.self) { page in
                 Button { toolPath.append(page) } label: {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Image(systemName: page.icon).font(.title3)
-                        Text(page.rawValue).font(.caption.weight(.semibold)).lineLimit(2)
-                    }
-                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).padding(8)
+                    Label(page.rawValue, systemImage: page.icon)
+                        .font(.caption.weight(.semibold)).lineLimit(2)
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).padding(4)
 
                 }.buttonStyle(.plain)
             }
@@ -631,7 +651,6 @@ struct CameraView: View {
                     .font(.footnote)
                 Text(model.camera.resolution).font(.caption).monospacedDigit()
                 }
-                featureButton("Single Photo", icon: "camera", detail: "Return to one camera") { useTool(.automatic) }
             } else {
             if model.mode == .video {
                 Text("Selecting a style switches to its compatible Photo setup.").font(.footnote)
@@ -640,9 +659,6 @@ struct CameraView: View {
             featureButton("Action burst", icon: "figure.run", detail: "Fast shutter and 3 photos. Needs good light.") { useTool(.action) }
             featureButton("Night · Beta", icon: "moon", detail: "Align matching frames; preserve a reference original. Best for still scenes.") { useTool(.night) }
             featureButton("Best Shot", icon: "square.stack", detail: "Take 3 photos, then choose your favorite") { useTool(.burst) }
-            if model.camera.dualAvailable {
-                featureButton("Dual Shot", icon: "camera.on.rectangle", detail: "Main and ultra-wide photos from one press") { useTool(.dual) }
-            }
             }
         case .focus:
             Picker("Tap adjusts", selection: $model.exposurePointOnly) {
@@ -663,7 +679,7 @@ struct CameraView: View {
             Picker("Shutter delay", selection: $model.timerSeconds) {
                 Text("Off").tag(0); Text("3 sec").tag(3); Text("10 sec").tag(10)
             }.pickerStyle(.segmented)
-            Text("The timer turns off after use or when you return from the background.").font(.footnote)
+            Text("The timer turns off after use. Leaving the app cancels an active countdown.").font(.footnote)
             Button("Ready") { showsCaptureInfo = false }.buttonStyle(.borderedProminent).foregroundStyle(.black)
         case .video:
             Picker("Resolution", selection: $model.videoWidth) { Text("1080p").tag(Int32(1920)); Text("4K").tag(Int32(3840)) }.pickerStyle(.segmented)
@@ -699,6 +715,11 @@ struct CameraView: View {
                 Text("Camera").tag(0); Text("Review & setup").tag(1)
             }.pickerStyle(.segmented)
             if preferencesSection == 0 {
+                Text("When the app opens").font(.subheadline.weight(.semibold))
+                Picker("When the app opens", selection: $rememberSetup) {
+                    Text("Remember settings").tag(true); Text("Start with defaults").tag(false)
+                }.pickerStyle(.segmented)
+                Text("Applies after a full relaunch. Recording, countdowns and capture progress never resume automatically.").font(.caption)
                 Toggle("Show full camera frame", isOn: $fullFrame)
                 Toggle("Composition grid", isOn: $showsGrid)
                 Toggle("Capture vibrations", isOn: $model.haptics)
