@@ -122,6 +122,7 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var lastSavedThumbnail: UIImage?
     @Published private(set) var lastSavedPhotoCount = 0
     private var messageTask: Task<Void, Never>?
+    private var nightWork: NightWorkCancellation?
     @Published var message: String? {
         didSet {
             messageTask?.cancel()
@@ -307,26 +308,30 @@ final class CameraViewModel: ObservableObject {
         message = "Action · 3 shots at 1/500 s. Dim light may look noisy or dark."
     }
 
-    func nightPreset() {
-        guard mode == .photo, camera.customExposureAvailable, !camera.dualEnabled,
-              !busy, !configuring, !hasPendingCapture else { return }
-        controls.iso = min(camera.maxISO, max(camera.minISO, camera.currentISO * Float(camera.currentShutter * 4)))
-        controls.shutterSeconds = 0.25
-        controls.automaticExposure = false
-        controls.automaticFocus = true
-        controls.facePriority = true
-        controls.flash = .off
-        timerSeconds = 3
-        burstEnabled = true
-        applyControls()
-        captureStyle = "Night"
-        message = "Low-light burst · Hold still for 3 slow exposures after the timer, then choose one. Frames are not combined."
+    func nightPreset() { setNightEnabled(true) }
+
+    func setNightEnabled(_ enabled: Bool) {
+        guard canConfigure, mode == .photo else { return }
+        timerSeconds = 0
+        burstEnabled = false
+        if !camera.dualEnabled {
+            controls = CameraControls()
+            exposureBias = 0
+            engine.setControls(controls)
+            engine.setDepthEnabled(false)
+            engine.setAnalysis("Off")
+            setEyeFocus(false)
+        }
+        if enabled && camera.dualEnabled { setDualMode(.detail) }
+        captureStyle = enabled ? "Night" : "Auto"
+        message = enabled ? "Night · Beta. Hold still. Matching frames are combined; a reference original is retained." : nil
     }
 
     var canConfigure: Bool { !busy && !configuring && !hasPendingCapture && !camera.recording }
 
     func activate(_ tool: QuickCaptureTool) {
         guard canConfigure else { return }
+        if tool == .night && camera.dualEnabled { setNightEnabled(true); return }
         if camera.dualEnabled && tool != .dual { message = "Switching from Dual Shot to single-camera Photo for this feature." }
         else if camera.videoMode { message = "Switching from Video to Photo for this feature." }
         else if tool == .dual && (burstEnabled || camera.eyeFocusEnabled || camera.analysisMode != "Off") {
@@ -351,7 +356,7 @@ final class CameraViewModel: ObservableObject {
         var requiredLens: CameraLens?
         if tool == .depth && !camera.depthAvailable {
             requiredLens = camera.lenses.first { $0.name == "Depth" } ?? camera.lenses.first { $0.name == "Front Depth" }
-        } else if (tool == .action || tool == .night) && !camera.customExposureAvailable || tool == .eye && !camera.eyeFocusAvailable {
+        } else if tool == .action && !camera.customExposureAvailable || tool == .eye && !camera.eyeFocusAvailable {
             requiredLens = camera.lenses.first { !$0.isFront && $0.name == "Wide" }
         }
         if let lens = requiredLens, lens.id != camera.selectedID {
@@ -366,9 +371,7 @@ final class CameraViewModel: ObservableObject {
         case .action:
             if camera.customExposureAvailable { actionPreset() }
             else { message = "Action needs a camera with manual exposure support." }
-        case .night:
-            if camera.customExposureAvailable { nightPreset() }
-            else { message = "Night needs a camera with manual exposure support." }
+        case .night: nightPreset()
         case .dual:
             if camera.dualAvailable { setDualEnabled(true) }
             else { message = "Dual Shot is unavailable on this device." }
@@ -391,7 +394,7 @@ final class CameraViewModel: ObservableObject {
         engine.setDepthEnabled(false)
     }
 
-    func enteredBackground() { resetOnReturn = true }
+    func enteredBackground() { resetOnReturn = true; nightWork?.cancel() }
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         self.saver = saver
@@ -562,6 +565,7 @@ final class CameraViewModel: ObservableObject {
     func capture() {
         guard canCapture else { return }
         busy = true
+        if captureStyle == "Night" { captureNight(); return }
         if burstEnabled && !camera.dualEnabled {
             message = "Capturing burst…"
             engine.captureBurst { [weak self] result in
@@ -612,6 +616,52 @@ final class CameraViewModel: ObservableObject {
                     self.expectingCaptureProgress = false
                     self.message = error.localizedDescription
                     self.busy = false
+                }
+            }
+        }
+    }
+
+    private func captureNight() {
+        let started = ProcessInfo.processInfo.systemUptime
+        let work = NightWorkCancellation()
+        nightWork = work
+        expectingCaptureProgress = true
+        message = "Night · hold still"
+        engine.captureNight(cancellation: work) { [weak self] result in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.expectingCaptureProgress = false
+                defer { self.nightWork = nil }
+                switch result {
+                case .failure(let error):
+                    self.busy = false
+                    self.message = error.localizedDescription
+                case .success(let frames):
+                    let references = NightPhotoProcessor.references(frames)
+                    guard var protected = references.first else {
+                        self.busy = false; self.message = "Night did not return a photo."; return
+                    }
+                    protected.companions = Array(references.dropFirst())
+                    protected.warning = "Night reference original(s) recovered."
+                    self.pendingPhoto = protected
+                    do {
+                        try await self.store.stage(protected)
+                        self.recoveryProtected = true
+                    } catch {
+                        self.busy = false
+                        self.message = "Night originals could not be protected. Keep the app open and retry saving."
+                        return
+                    }
+                    // Release live camera work while the bounded image merge runs.
+                    self.engine.stop()
+                    if !self.active { work.cancel() }
+                    self.message = "Night · checking alignment and preserving detail…"
+                    if let photo = await NightPhotoProcessor.process(frames, cancellation: work) {
+                        self.pendingPhoto = photo
+                    }
+                    self.lastCaptureMilliseconds = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+                    await self.savePending()
+                    if self.active { self.engine.start() }
                 }
             }
         }
