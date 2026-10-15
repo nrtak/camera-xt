@@ -4,6 +4,10 @@ import PhotosUI
 import CoreImage
 import ImageIO
 
+private enum CameraAppearance {
+    static let selection = Color(red: 1, green: 0.94, blue: 0.36)
+}
+
 struct CameraView: View {
     @StateObject private var model = CameraViewModel()
     @Environment(\.scenePhase) private var scenePhase
@@ -20,6 +24,7 @@ struct CameraView: View {
     @State private var checkIndex = 0
     @State private var passedChecks: Set<Int> = []
     @State private var confirmDiscard = false
+    @AppStorage("camera.fullFrame") private var fullFrame = false
     @AppStorage("camera.showsGrid") private var showsGrid = true
     @State private var toolPath: [CameraToolPage] = []
     @State private var showsCaptureInfo = false
@@ -47,7 +52,7 @@ struct CameraView: View {
 
     private let ink = Color.white
     private var overlayColor: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.75 : 0.55) }
-    private let selection = Color(red: 1, green: 0.94, blue: 0.36)
+    private let selection = CameraAppearance.selection
 
     var body: some View {
         ZStack {
@@ -72,7 +77,7 @@ struct CameraView: View {
                         }
                     }
                 } else {
-                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, showsFocusFeedback: model.canConfigure, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid, hidesGuides: false)
+                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: !fullFrame, showsFocusFeedback: model.canConfigure, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid, hidesGuides: false)
                         .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
@@ -117,7 +122,7 @@ struct CameraView: View {
         .onChange(of: showsCaptureInfo) { _, open in if open { showsZoom = false; zoomDismissTask?.cancel() } }
         .onDisappear { zoomDismissTask?.cancel() }
         .foregroundStyle(ink)
-        .tint(ink)
+        .tint(selection)
         .preferredColorScheme(.dark)
         .task { model.setActive(scenePhase == .active) }
         .onChange(of: scenePhase) {
@@ -134,7 +139,7 @@ struct CameraView: View {
             selectedDualIndex = index
             showsDualAdjustments = true
             model.focusDual(at: point, index: index, locked: locked)
-        }, secondary: index == 1, showsFocusFeedback: model.canConfigure &&
+        }, fillView: !fullFrame, secondary: index == 1, showsFocusFeedback: model.canConfigure &&
             model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
             focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
             exposureOnly: model.exposurePointOnly)
@@ -192,6 +197,12 @@ struct CameraView: View {
             }
             .accessibilityLabel("Capture details")
             Spacer(minLength: 8)
+            Button { fullFrame.toggle() } label: {
+                Image(systemName: fullFrame ? "viewfinder" : "arrow.up.left.and.arrow.down.right")
+                    .foregroundStyle(fullFrame ? selection : ink).frame(width: 44, height: 44)
+            }
+            .accessibilityLabel(fullFrame ? "Fill preview area" : "Show full camera frame")
+            .accessibilityValue(fullFrame ? "Full frame" : "Fill screen")
             Button { openTool() } label: {
                 Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44)
             }.accessibilityLabel("Camera tools")
@@ -496,7 +507,7 @@ struct CameraView: View {
         switch toolPath.last {
         case nil: return hasAdjustments ? 314 : 270
         case .shoot: base = model.camera.dualEnabled ? 290 : 350
-        case .preferences: base = preferencesSection == 0 ? 350 : 470
+        case .preferences: base = preferencesSection == 0 ? 394 : 470
         case .timer: base = 260
         case .video: base = 350
         case .gallery, .rescue: return .infinity
@@ -681,6 +692,7 @@ struct CameraView: View {
                 Text("Camera").tag(0); Text("Review & setup").tag(1)
             }.pickerStyle(.segmented)
             if preferencesSection == 0 {
+                Toggle("Show full camera frame", isOn: $fullFrame)
                 Toggle("Composition grid", isOn: $showsGrid)
                 Toggle("Capture vibrations", isOn: $model.haptics)
                 Picker("Dual Shot inset", selection: $dualCorner) {
@@ -698,6 +710,7 @@ struct CameraView: View {
                 Button("Reset capture settings") { model.activate(.automatic); showsCaptureInfo = false }.buttonStyle(.bordered)
             }
         case .details:
+            Text(fullFrame ? "Full frame shows the camera preview boundaries. Still photos and video can have different aspect ratios." : "Fill screen crops the preview to fit. Tap the framing button at the top to see the full camera frame; saved photos are not cropped by this setting.").font(.caption)
             Text("Zoom shortcuts follow this phone’s lenses and reported sensor-crop capabilities. Intermediate zoom can crop or enlarge the image; greater magnification does not always mean more detail.").font(.caption)
             LabeledContent("Mode", value: model.mode.rawValue)
             LabeledContent("Lens", value: model.selectedLens?.name ?? "Unavailable")
@@ -750,6 +763,8 @@ struct CameraView: View {
         }.pickerStyle(.menu)
     }
     private let deviceChecks = [
+        "Switch Fill / Full Frame in Photo, Video and both Dual Shot layouts. Tap near each visible corner and verify focus follows the tap. Compare the preview with the saved photo.",
+        "Take repeated photos with guides off, then Histogram, Highlights and Focus Peaking. Check responsiveness, warmth and memory in a device profiling session.",
         "Check the zoom row against this phone’s native lens and sensor-crop choices. Test larger text and landscape without clipped controls.",
         "Pinch both Dual Shot previews separately. Confirm the selected border and slider identify the same camera, and hold-versus-tap does not change lenses unexpectedly.",
         "In good light, photograph the same distant subject in Single Photo, Dual Fast, and Dual Detail. Compare main-camera sharpness in Photos at the same scale.",
@@ -952,7 +967,7 @@ private struct BurstReview: View {
                                 Text(index == model.recommendedBurstIndex ? "Suggested" : "Frame \(index + 1)").font(.caption)
                             }
                             .padding(5)
-                            .background(model.selectedBurstIndex == index ? Color.yellow.opacity(0.35) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                            .background(model.selectedBurstIndex == index ? CameraAppearance.selection.opacity(0.35) : .clear, in: RoundedRectangle(cornerRadius: 8))
                         }
                         .accessibilityLabel("Frame \(index + 1)\(index == model.recommendedBurstIndex ? ", suggested" : "")")
                     }
@@ -1070,7 +1085,7 @@ private struct CameraDesignDetail: View {
             Text("DESIGN PREVIEW · NOT LIVE")
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 14).padding(.vertical, 8)
-                .background(Color.yellow.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+                .background(CameraAppearance.selection.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
             TabView(selection: $selection) {
                 ForEach(CameraDesignScreen.all) { screen in
                     ScrollView {
@@ -1151,7 +1166,7 @@ private struct RecentCaptureView: View {
                         ForEach(record.photos.indices, id: \.self) { index in
                             Button(record.photos[index].label) { selection = index; comparing = false }
                                 .frame(maxWidth: .infinity, minHeight: 44)
-                                .background(selection == index ? Color.yellow.opacity(0.3) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                                .background(selection == index ? CameraAppearance.selection.opacity(0.3) : .clear, in: RoundedRectangle(cornerRadius: 8))
                                 .accessibilityAddTraits(selection == index ? .isSelected : [])
                         }
                     }
@@ -1247,13 +1262,14 @@ private struct GuidedCameraPreview: View {
     @ObservedObject var guides: ViewfinderGuideState
     let engine: CaptureSessionManager
     var onFocus: (CGPoint, Bool) -> Void
+    var fillView: Bool
     var showsFocusFeedback: Bool
     var focusState: String
     var exposureOnly: Bool
     var showsGrid: Bool
     var hidesGuides: Bool
     var body: some View {
-        CameraPreview(engine: engine, onFocus: onFocus, showsFocusFeedback: showsFocusFeedback,
+        CameraPreview(engine: engine, onFocus: onFocus, fillView: fillView, showsFocusFeedback: showsFocusFeedback,
                       focusState: focusState, exposureOnly: exposureOnly, showsGrid: showsGrid,
                       guideImage: hidesGuides ? nil : guides.image)
     }
