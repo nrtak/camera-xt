@@ -191,7 +191,7 @@ struct CameraView: View {
     private var captureHUD: some View {
         HStack(spacing: 8) {
             Button { openTool(.details) } label: {
-                Text(model.camera.dualEnabled ? "Dual · \(model.camera.dualMode.rawValue)" : model.captureStyle == "Night" ? "Low-light" : model.mode.rawValue)
+                Text(model.camera.dualEnabled ? (model.captureStyle == "Night" ? "Dual · Night" : "Dual · \(model.camera.dualMode.rawValue)") : model.captureStyle == "Night" ? "Night" : model.mode.rawValue)
                     .font(.subheadline.weight(.semibold)).lineLimit(1)
                     .frame(minHeight: 44)
             }
@@ -507,7 +507,7 @@ struct CameraView: View {
         let base: CGFloat
         switch toolPath.last {
         case nil: return hasAdjustments ? 314 : 270
-        case .shoot: base = model.camera.dualEnabled ? 290 : 350
+        case .shoot: base = model.camera.dualEnabled ? 370 : 350
         case .preferences: base = preferencesSection == 0 ? 394 : 470
         case .timer: base = 260
         case .video: base = 350
@@ -619,12 +619,18 @@ struct CameraView: View {
                 Text("Fast takes both views close together. Detail waits for the main photo to finish before taking the ultra-wide photo. Moving subjects may change position between photos.").font(.footnote)
             }
             if model.camera.dualEnabled {
+                Toggle("Night · Beta", isOn: Binding(get: { model.captureStyle == "Night" }, set: model.setNightEnabled))
+                    .disabled(!model.canConfigure)
+                if model.captureStyle == "Night" {
+                    Text("Three sequential pairs, aligned separately per lens. Up to 12 MP per frame. Hold still; reference originals are saved too.").font(.footnote)
+                } else {
                 Picker("Dual Shot capture", selection: Binding(get: { model.camera.dualMode }, set: { model.setDualMode($0) })) {
                     ForEach(DualShotMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.segmented).disabled(!model.canConfigure)
                 Text(model.camera.dualMode == .fast ? "Fast · Choose for moving subjects or unexpected moments. Up to 12 MP per view." : "Detail · Choose for still scenes. Hold still until both photos finish; they are taken in sequence. Up to 48 MP where supported.")
                     .font(.footnote)
                 Text(model.camera.resolution).font(.caption).monospacedDigit()
+                }
                 featureButton("Single Photo", icon: "camera", detail: "Return to one camera") { useTool(.automatic) }
             } else {
             if model.mode == .video {
@@ -632,7 +638,7 @@ struct CameraView: View {
             }
             featureButton("Automatic", icon: "camera", detail: "Everyday photos with automatic settings") { useTool(.automatic) }
             featureButton("Action burst", icon: "figure.run", detail: "Fast shutter and 3 photos. Needs good light.") { useTool(.action) }
-            featureButton("Low-light burst · Beta", icon: "moon", detail: "Timer, then 3 slow exposures. Choose one photo; frames are not combined.") { useTool(.night) }
+            featureButton("Night · Beta", icon: "moon", detail: "Align matching frames; preserve a reference original. Best for still scenes.") { useTool(.night) }
             featureButton("Best Shot", icon: "square.stack", detail: "Take 3 photos, then choose your favorite") { useTool(.burst) }
             if model.camera.dualAvailable {
                 featureButton("Dual Shot", icon: "camera.on.rectangle", detail: "Main and ultra-wide photos from one press") { useTool(.dual) }
@@ -715,7 +721,7 @@ struct CameraView: View {
             Text("Zoom shortcuts follow this phone’s lenses and reported sensor-crop capabilities. Intermediate zoom can crop or enlarge the image; greater magnification does not always mean more detail.").font(.caption)
             LabeledContent("Capture status", value: model.shutterStatus)
             LabeledContent("Mode", value: model.mode.rawValue)
-            if model.captureStyle == "Night" { Text("Low-light burst is experimental: three separate slow exposures, not a merged Night-mode photo. Support the phone and avoid moving subjects.").font(.caption) }
+            if model.captureStyle == "Night" { Text("Night is experimental: up to four frames for Single Photo or three pairs for Dual Shot, at up to 12 MP per frame. Changed or blurred frames are rejected. Merged views and reference originals are saved; unsuitable sequences keep originals.").font(.caption) }
             LabeledContent("Lens", value: model.selectedLens?.name ?? "Unavailable")
             LabeledContent("Resolution", value: model.mode == .photo ? model.camera.resolution : model.camera.videoLabel)
             if let recent = model.recent, !recent.photos.isEmpty {
@@ -752,7 +758,7 @@ struct CameraView: View {
         switch title {
         case "Automatic": return !model.camera.dualEnabled && model.mode == .photo && model.captureStyle == "Auto" && !model.burstEnabled
         case "Action burst": return model.captureStyle == "Action"
-        case "Low-light burst · Beta": return model.captureStyle == "Night"
+        case "Night · Beta": return model.captureStyle == "Night"
         case "Best Shot": return model.burstEnabled && model.captureStyle == "Auto"
         case "Dual Shot": return model.camera.dualEnabled
         default: return title.hasPrefix("Turn off")
@@ -766,6 +772,8 @@ struct CameraView: View {
         }.pickerStyle(.menu)
     }
     private let deviceChecks = [
+        "Night: compare fine text, faces, highlights and moving subjects against Single Auto and Apple Camera. Check the saved reference for each lens. Reject results with blur, ghosting or color shifts.",
+        "Night: test Single and Dual, interrupt during capture, deny Photos access, and repeat pairs. Verify originals survive interruption and each saved view is correctly labeled.",
         "Switch Fill / Full Frame in Photo, Video and both Dual Shot layouts. Tap near each visible corner and verify focus follows the tap. Compare the preview with the saved photo.",
         "Take repeated photos with guides off, then Histogram, Highlights and Focus Peaking. Check responsiveness, warmth and memory in a device profiling session.",
         "Check the zoom row against this phone’s native lens and sensor-crop choices. Test larger text and landscape without clipped controls.",
