@@ -4,6 +4,14 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testPhotoRescueStopsBeforeDecodingWhenCancelled() async {
+        let work = NightWorkCancellation(); work.cancel()
+        do {
+            _ = try await PhotoRescueProcessor.process(Data([1]), strength: 0.5, cancellation: work)
+            XCTFail("Cancelled processing must not continue")
+        } catch is CancellationError { }
+        catch { XCTFail("Expected cancellation, received \(error)") }
+    }
     func testLaunchDefaultsResetCameraSettingsButPreservePolicyAndOtherData() throws {
         let name = "CameraXT.launch-tests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
