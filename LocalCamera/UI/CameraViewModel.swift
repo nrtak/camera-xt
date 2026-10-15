@@ -98,6 +98,16 @@ final class PhotoRescueModel: ObservableObject {
 
 enum CaptureMode: String, CaseIterable { case photo = "Photo", video = "Video" }
 enum QuickCaptureTool: Equatable { case action, night, dual, depth, eye, burst, automatic }
+enum CaptureActivity: String { case preparing = "Preparing", taking = "Taking photos", processing = "Processing", saving = "Saving" }
+
+enum SceneAdvice {
+    static func text(shutter: Double, iso: Float, dual: Bool, night: Bool) -> String? {
+        guard shutter.isFinite, iso.isFinite, shutter > 0, iso > 0,
+              shutter >= 1.0 / 30 || iso >= 800 else { return nil }
+        if night { return "Night: hold still until capture finishes." }
+        return dual ? "Low light: Night for still scenes; Fast for moving subjects." : "Low light: try Night for a still scene."
+    }
+}
 
 @MainActor
 final class ViewfinderGuideState: ObservableObject {
@@ -202,6 +212,16 @@ final class CameraViewModel: ObservableObject {
         }
     }
     @Published private(set) var camera = CameraSnapshot()
+    @Published private(set) var captureActivity: CaptureActivity = .preparing {
+        didSet {
+            if oldValue != captureActivity && UIAccessibility.isVoiceOverRunning {
+                UIAccessibility.post(notification: .announcement, argument: captureActivity.rawValue)
+            }
+        }
+    }
+    @Published private(set) var sceneAdvice: String?
+    private var adviceCandidate: String?
+    private var adviceSamples = 0
     @Published private(set) var permission = AVCaptureDevice.authorizationStatus(for: .video)
     @Published private(set) var busy = false
     @Published private(set) var restoring = true
@@ -245,6 +265,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     @Published private(set) var mode: CaptureMode = .photo
+    @Published private(set) var preparingMode: CaptureMode?
     @Published private(set) var pendingVideo: URL?
     @Published var videoWidth: Int32 = 1920
     @Published var videoFPS: Int32 = 30
@@ -263,12 +284,18 @@ final class CameraViewModel: ObservableObject {
     @Published var selectedBurstIndex = 0
     @Published private(set) var recommendedBurstIndex = 0
     var hasPendingCapture: Bool { restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
-    var canShutter: Bool { camera.recording || (camera.running && !busy && !configuring && !hasPendingCapture && !resetOnReturn) }
+    var canShutter: Bool { camera.recording ? !busy : (camera.running && !busy && !configuring && preparingMode == nil && !hasPendingCapture && !resetOnReturn) }
+
+    var videoButtonTitle: String {
+        if busy { return captureActivity == .saving ? "Saving…" : camera.recording || captureActivity == .processing ? "Finishing…" : "Starting…" }
+        if configuring || preparingMode != nil { return "Preparing…" }
+        return camera.recording ? "Stop recording" : "Start video"
+    }
 
     var shutterStatus: String {
         if camera.recording { return "Recording" }
         if countdown > 0 { return "Timer: \(countdown) seconds" }
-        if busy { return "Capture in progress" }
+        if busy { return captureActivity.rawValue }
         if hasPendingCapture { return "Finish saving or reviewing this capture" }
         if configuring { return "Preparing camera" }
         return canShutter ? "Ready" : "Camera unavailable"
@@ -281,9 +308,19 @@ final class CameraViewModel: ObservableObject {
             setDualEnabled(false)
             return
         }
+        preparingMode = selected
         if selected != mode { resetTemporarySettings() }
         configuring = true
-        engine.setVideoMode(selected == .video, width: videoWidth, fps: videoFPS, stabilized: stabilization)
+        engine.setVideoMode(selected == .video, width: videoWidth, fps: videoFPS, stabilized: stabilization) { [weak self] snapshot in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.camera = snapshot
+                self.mode = snapshot.videoMode ? .video : .photo
+                self.preparingMode = nil
+                self.configuring = false
+                if let failure = snapshot.message { self.message = failure }
+            }
+        }
     }
     func applyVideoSettings() { selectMode(.video) }
     func shutter() {
@@ -295,17 +332,19 @@ final class CameraViewModel: ObservableObject {
             applyControls()
         }
         if camera.recording {
+            captureActivity = .processing
             busy = true
             engine.stopRecording()
         } else if mode == .video {
             guard canShutter else { return }
+            captureActivity = .preparing
             busy = true
             recordingRequested = true
             Task {
                 let status = AVCaptureDevice.authorizationStatus(for: .audio)
                 if status == .notDetermined { _ = await AVCaptureDevice.requestAccess(for: .audio) }
                 guard active else { busy = false; recordingRequested = false; return }
-                message = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized ? "Recording…" : "Recording without sound · microphone access is off"
+                message = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized ? "Starting recording…" : "Starting without sound · microphone access is off"
                 backgroundTask = UIApplication.shared.beginBackgroundTask { [weak self] in
                     self?.engine.stopRecording()
                     self?.endBackgroundTask()
@@ -314,6 +353,8 @@ final class CameraViewModel: ObservableObject {
             }
         } else if timerSeconds > 0 {
             guard canCapture else { return }
+            captureActivity = .preparing
+            message = nil
             busy = true
             countdown = timerSeconds
             timerSeconds = 0
@@ -537,6 +578,12 @@ final class CameraViewModel: ObservableObject {
                 updated.focusStates = meter.focusStates
                 updated.cooling = meter.cooling
                 self.camera = updated
+                let advice = self.mode == .photo && self.camera.running
+                    ? SceneAdvice.text(shutter: meter.currentShutter, iso: meter.currentISO,
+                                       dual: self.camera.dualEnabled, night: self.captureStyle == "Night") : nil
+                if advice == self.adviceCandidate { self.adviceSamples += 1 }
+                else { self.adviceCandidate = advice; self.adviceSamples = 1 }
+                if self.adviceSamples >= 3 { self.sceneAdvice = advice }
                 self.restoreSetupIfReady()
                 if self.resetOnReturn, self.active, self.canConfigure {
                     self.resetOnReturn = false
@@ -565,7 +612,7 @@ final class CameraViewModel: ObservableObject {
                     if !snapshot.recording { self.recordingStarted = nil }
                 }
                 self?.camera = snapshot
-                self?.configuring = false
+                if self?.preparingMode == nil { self?.configuring = false }
                 self?.mode = snapshot.videoMode ? .video : .photo
                 if let self {
                     if let failure = snapshot.message, self.modeAfterDual != nil {
@@ -595,6 +642,8 @@ final class CameraViewModel: ObservableObject {
                 if snapshot.recording && self?.recordingRequested == true {
                     self?.busy = false
                     self?.recordingRequested = false
+                    self?.message = nil
+                    UIAccessibility.post(notification: .announcement, argument: snapshot.audioRecording ? "Recording started" : "Recording started without sound")
                 }
             }
         }
@@ -625,7 +674,9 @@ final class CameraViewModel: ObservableObject {
             nightWork?.cancel()
             controlsTask?.cancel(); controlsTask = nil
             messageTask?.cancel(); messageTask = nil
+            if let message, Self.isBriefStatus(message) { self.message = nil }
             guides.image = nil; guides.histogram = []
+            sceneAdvice = nil; adviceCandidate = nil; adviceSamples = 0
         }
         active = value
         storageTask?.cancel()
@@ -645,7 +696,9 @@ final class CameraViewModel: ObservableObject {
             timerTask?.cancel(); timerTask = nil; countdown = 0; busy = false
         }
         permission = AVCaptureDevice.authorizationStatus(for: .video)
-        if active && permission == .authorized && !editingPhoto { engine.start() } else { engine.stop() }
+        if active && permission == .authorized && !editingPhoto && !(nightWork != nil && captureActivity == .processing) {
+            engine.start()
+        } else { engine.stop() }
     }
 
     private func refreshStorage() async {
@@ -689,6 +742,7 @@ final class CameraViewModel: ObservableObject {
 
     func capture() {
         guard canCapture else { return }
+        captureActivity = .taking
         busy = true
         if captureStyle == "Night" { captureNight(); return }
         if burstEnabled && !camera.dualEnabled {
@@ -699,7 +753,11 @@ final class CameraViewModel: ObservableObject {
                     Task { @MainActor [weak self] in self?.busy = false; self?.message = error.localizedDescription }
                 case .success(let photos):
                     Task { @MainActor [weak self] in
-                        guard let self, var recovery = photos.first else { return }
+                        guard let self else { return }
+                        guard var recovery = photos.first else {
+                            self.busy = false; self.message = "No burst photos were returned. Try again."; return
+                        }
+                        self.captureActivity = .processing
                         recovery.companions = Array(photos.dropFirst())
                         recovery.warning = "Recovered burst: saving keeps every frame."
                         do { try await self.store.stage(recovery); self.recoveryProtected = true }
@@ -781,6 +839,7 @@ final class CameraViewModel: ObservableObject {
                     self.engine.stop()
                     if !self.active { work.cancel() }
                     self.message = "Night · checking alignment and preserving detail…"
+                    self.captureActivity = .processing
                     if let photo = await NightPhotoProcessor.process(frames, cancellation: work) {
                         self.pendingPhoto = photo
                     }
@@ -815,6 +874,7 @@ final class CameraViewModel: ObservableObject {
 
     private func savePending() async {
         guard pendingVideo != nil || pendingPhoto != nil else { return }
+        captureActivity = .saving
         busy = true
         message = "Saving · protecting a local recovery copy…"
         defer { busy = false }
@@ -856,6 +916,7 @@ final class CameraViewModel: ObservableObject {
             }
             recoveryProtected = false
             if haptics { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+            if UIAccessibility.isVoiceOverRunning { UIAccessibility.post(notification: .announcement, argument: "Saved to Photos") }
         } catch {
             message = "Not saved to Photos. A recovery copy is on this iPhone. \(error.localizedDescription)"
             if haptics { UINotificationFeedbackGenerator().notificationOccurred(.error) }
