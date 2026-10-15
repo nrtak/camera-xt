@@ -1252,6 +1252,10 @@ private final class ViewfinderAnalyzer: NSObject, AVCaptureVideoDataOutputSample
     let mode: String
     let report: (UIImage?, [Double]) -> Void
     private let context = CIContext(options: [.cacheIntermediates: false])
+    private let colorSpace = CGColorSpaceCreateDeviceRGB()
+    // Accessed only on the serial guide queue; reuse scratch storage between frames.
+    private var pixels: [UInt8] = []
+    private var luma: [Int] = []
     private var lastTime = -Double.infinity
     init(mode: String, report: @escaping (UIImage?, [Double]) -> Void) { self.mode = mode; self.report = report }
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -1265,18 +1269,18 @@ private final class ViewfinderAnalyzer: NSObject, AVCaptureVideoDataOutputSample
             let scale = 180 / max(source.extent.width, source.extent.height)
             let image = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             let width = max(1, Int(image.extent.width)), height = max(1, Int(image.extent.height))
-            var pixels = [UInt8](repeating: 0, count: width * height * 4)
+            if pixels.count != width * height * 4 { pixels = [UInt8](repeating: 0, count: width * height * 4) }
             pixels.withUnsafeMutableBytes { bytes in
                 context.render(image, toBitmap: bytes.baseAddress!, rowBytes: width * 4,
                                bounds: CGRect(x: 0, y: 0, width: width, height: height), format: .RGBA8,
-                               colorSpace: CGColorSpaceCreateDeviceRGB())
+                               colorSpace: colorSpace)
             }
-            var luma = [Int](repeating: 0, count: width * height)
-            var bins = [Double](repeating: 0, count: 32)
+            if luma.count != width * height { luma = [Int](repeating: 0, count: width * height) }
+            var bins = mode == "Histogram" ? [Double](repeating: 0, count: 32) : []
             for index in luma.indices {
                 let p = index * 4
                 luma[index] = (Int(pixels[p]) * 54 + Int(pixels[p + 1]) * 183 + Int(pixels[p + 2]) * 19) / 256
-                bins[min(31, luma[index] / 8)] += 1
+                if mode == "Histogram" { bins[min(31, luma[index] / 8)] += 1 }
             }
             if mode == "Histogram" {
                 let peak = max(1, bins.max() ?? 1)
@@ -1287,8 +1291,8 @@ private final class ViewfinderAnalyzer: NSObject, AVCaptureVideoDataOutputSample
             for y in 1..<(height - 1) {
                 for x in 1..<(width - 1) {
                     let index = y * width + x, p = index * 4
-                    let edge = abs(luma[index + 1] - luma[index - 1]) + abs(luma[index + width] - luma[index - width])
-                    let show = mode == "Highlights" ? luma[index] >= 245 && (x + y) % 6 < 3 : edge > 95
+                    let show = mode == "Highlights" ? luma[index] >= 245 && (x + y) % 6 < 3 :
+                        abs(luma[index + 1] - luma[index - 1]) + abs(luma[index + width] - luma[index - width]) > 95
                     if show {
                         overlay[p] = mode == "Highlights" ? 255 : 0
                         overlay[p + 1] = mode == "Highlights" ? 60 : 255
@@ -1299,7 +1303,7 @@ private final class ViewfinderAnalyzer: NSObject, AVCaptureVideoDataOutputSample
             }
             guard let provider = CGDataProvider(data: Data(overlay) as CFData),
                   let cg = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
-                                   bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                   bytesPerRow: width * 4, space: colorSpace,
                                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                                    provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { return }
             report(UIImage(cgImage: cg), [])
