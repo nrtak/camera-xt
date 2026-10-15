@@ -42,6 +42,7 @@ struct CameraView: View {
     @State private var showsRecent = false
     @State private var selectedDualIndex = 0
     @State private var showsDualAdjustments = false
+    private var panelOpen: Bool { showsCaptureInfo || showsRecent || model.reviewingBurst }
     private var enlargedDualIndex: Int? {
         get { (0...1).contains(dualLayout) ? dualLayout : nil }
         nonmutating set { dualLayout = newValue ?? -1 }
@@ -55,6 +56,7 @@ struct CameraView: View {
 
     private let ink = Color.white
     private var overlayColor: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.75 : 0.55) }
+    private var menuBackground: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.92 : 0.78) }
     private let selection = CameraAppearance.selection
 
     var body: some View {
@@ -79,18 +81,22 @@ struct CameraView: View {
                             }
                         }
                     }
+                    .allowsHitTesting(!panelOpen)
+                    .accessibilityHidden(panelOpen)
                 } else {
-                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: !fullFrame, showsFocusFeedback: model.canConfigure, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid, hidesGuides: false)
+                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: !fullFrame, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen)
                         .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
+                        .allowsHitTesting(!panelOpen)
+                        .accessibilityHidden(panelOpen)
                 }
             }
 
             VStack(spacing: 12) {
                 ZStack(alignment: .trailing) {
                     Color.clear.allowsHitTesting(false)
-                    if model.permission != .authorized || model.camera.message != nil {
+                    if !panelOpen && (model.permission != .authorized || model.camera.message != nil) {
                         cameraNotice.padding(.horizontal, 24).frame(maxWidth: .infinity)
                     }
                 }
@@ -103,10 +109,10 @@ struct CameraView: View {
                     Group {
                         if showsRecent, let recent = model.recent {
                             RecentCaptureView(record: recent, close: { showsRecent = false })
-                                .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
+                                .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
                         } else if model.reviewingBurst {
                             BurstReview(model: model)
-                                .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
+                                .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                         } else { captureInfo }
                     }
@@ -122,7 +128,9 @@ struct CameraView: View {
         .safeAreaInset(edge: .top, spacing: 0) { captureHUD }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
-        .onChange(of: showsCaptureInfo) { _, open in if open { showsZoom = false; zoomDismissTask?.cancel() } }
+        .onChange(of: panelOpen) { _, open in
+            if open { showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
+        }
         .onDisappear { zoomDismissTask?.cancel(); model.setActive(false) }
         .foregroundStyle(ink)
         .tint(selection)
@@ -139,16 +147,17 @@ struct CameraView: View {
 
     private func dualViewfinder(_ title: String, index: Int) -> some View {
         CameraPreview(engine: model.engine, onFocus: { point, locked in
+            guard !panelOpen else { return }
             selectedDualIndex = index
             showsDualAdjustments = true
             model.focusDual(at: point, index: index, locked: locked)
-        }, fillView: !fullFrame, secondary: index == 1, showsFocusFeedback: model.canConfigure &&
+        }, fillView: !fullFrame, secondary: index == 1, showsFocusFeedback: !panelOpen && model.canConfigure &&
             model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
             focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
             exposureOnly: model.exposurePointOnly)
         .background(.black)
         .simultaneousGesture(zoomGesture(index))
-        .overlay { Rectangle().strokeBorder(selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
+        .overlay { Rectangle().strokeBorder(!panelOpen && selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
         .overlay(alignment: .bottomLeading) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 0) {
@@ -181,11 +190,17 @@ struct CameraView: View {
             }
             .padding(.horizontal, 6)
             .background(overlayColor, in: RoundedRectangle(cornerRadius: 8)).padding(6)
+            .opacity(panelOpen ? 0 : 1)
+            .allowsHitTesting(!panelOpen)
+            .accessibilityHidden(panelOpen)
         }
         .accessibilityLabel("\(title) live viewfinder. Tap to focus this camera.")
     }
 
     private func openTool(_ page: CameraToolPage? = nil) {
+        showsDualAdjustments = false
+        showsZoom = false
+        zoomDismissTask?.cancel()
         toolPath = page.map { [$0] } ?? []
         showsRecent = false
         showsCaptureInfo = true
@@ -228,7 +243,7 @@ struct CameraView: View {
         .padding(.horizontal, 14)
         .background(overlayColor)
         .overlay(alignment: .top) {
-            captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 48)
+            if !panelOpen { captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 48) }
         }
         .buttonStyle(.plain)
     }
@@ -415,7 +430,7 @@ struct CameraView: View {
         }
         .multilineTextAlignment(.center)
         .padding(24)
-        .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
+        .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var captureControls: some View {
@@ -565,7 +580,7 @@ struct CameraView: View {
                 }
             }
         }
-        .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
+        .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
         .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.white.opacity(0.15), lineWidth: 1).allowsHitTesting(false) }
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
