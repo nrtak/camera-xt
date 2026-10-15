@@ -98,6 +98,7 @@ struct CameraView: View {
                     .accessibilityHidden(panelOpen)
                 } else {
                     GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: !fullFrame, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen)
+                        .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
                         .allowsHitTesting(!panelOpen)
@@ -146,7 +147,13 @@ struct CameraView: View {
                 if !panelOpen && showQuickControls {
                     viewfinderQuickControls.padding(.horizontal, 12).padding(.bottom, 6)
                 }
-            }.background(Color.black)
+            }.background {
+                if reduceTransparency { Color.black.ignoresSafeArea(edges: .top) }
+                else {
+                    LinearGradient(colors: [.black.opacity(0.7), .black.opacity(0.18)], startPoint: .top, endPoint: .bottom)
+                        .ignoresSafeArea(edges: .top)
+                }
+            }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls(landscape: landscape) }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
@@ -273,7 +280,6 @@ struct CameraView: View {
         }
         .disabled(!model.canConfigure)
         .padding(.horizontal, 14)
-        .background(Color.black)
         .buttonStyle(.plain)
     }
 
@@ -618,7 +624,13 @@ struct CameraView: View {
                     .alignmentGuide(.top) { dimensions in dimensions[.bottom] + 8 }
             }
         }
-        .background(Color.black.ignoresSafeArea(edges: .bottom))
+        .background {
+            if reduceTransparency { Color.black.ignoresSafeArea(edges: .bottom) }
+            else {
+                LinearGradient(colors: [.black.opacity(0.18), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
+                    .ignoresSafeArea(edges: .bottom)
+            }
+        }
     }
 
     @ViewBuilder private var saveRecovery: some View {
