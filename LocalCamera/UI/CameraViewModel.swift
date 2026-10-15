@@ -48,9 +48,13 @@ final class PhotoRescueModel: ObservableObject {
     @Published var look: PhotoLook = .natural
     @Published var message: String?
     private var source: Data?
+    private var processingWork: NightWorkCancellation?
+    func suspendProcessing() { processingWork?.cancel() }
 
     func load(_ item: PhotosPickerItem) async {
         guard !busy else { return }
+        let work = NightWorkCancellation(); processingWork = work
+        defer { processingWork = nil }
         busy = true
         result = nil
         source = nil
@@ -58,19 +62,23 @@ final class PhotoRescueModel: ObservableObject {
         message = "Loading photo…"
         do {
             guard let data = try await item.loadTransferable(type: Data.self) else { throw CameraFailure.noPhoto }
+            if work.cancelled { throw CancellationError() }
             source = data
             message = "Adjusting on this iPhone…"
-            result = try await PhotoRescueProcessor.process(data, strength: strength, look: look)
+            result = try await PhotoRescueProcessor.process(data, strength: strength, look: look, cancellation: work)
             message = nil
-        } catch { message = "Could not prepare this photo. \(error.localizedDescription)" }
+        } catch is CancellationError { message = "Processing paused. Choose the photo again when ready." }
+        catch { message = "Could not prepare this photo. \(error.localizedDescription)" }
         busy = false
     }
     func apply() async {
         guard !busy, let source else { return }
+        let work = NightWorkCancellation(); processingWork = work
+        defer { processingWork = nil }
         busy = true
         message = "Adjusting on this iPhone…"
         do {
-            result = try await PhotoRescueProcessor.process(source, strength: strength, look: look)
+            result = try await PhotoRescueProcessor.process(source, strength: strength, look: look, cancellation: work)
             saved = false
             message = nil
         } catch { message = error.localizedDescription }
