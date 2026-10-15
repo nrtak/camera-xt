@@ -160,6 +160,15 @@ final class CameraViewModel: ObservableObject {
     var hasPendingCapture: Bool { restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
     var canShutter: Bool { camera.recording || (camera.running && !busy && !configuring && !hasPendingCapture && !resetOnReturn) }
 
+    var shutterStatus: String {
+        if camera.recording { return "Recording" }
+        if countdown > 0 { return "Timer: \(countdown) seconds" }
+        if busy { return "Capture in progress" }
+        if hasPendingCapture { return "Finish saving or reviewing this capture" }
+        if configuring { return "Preparing camera" }
+        return canShutter ? "Ready" : "Camera unavailable"
+    }
+
     func selectMode(_ selected: CaptureMode) {
         guard !busy, !configuring, !hasPendingCapture, !camera.recording else { return }
         if camera.dualEnabled {
@@ -311,7 +320,7 @@ final class CameraViewModel: ObservableObject {
         burstEnabled = true
         applyControls()
         captureStyle = "Night"
-        message = "Night · 3-second timer, then 3 exposures of about ¼ second. Hold still."
+        message = "Low-light burst · Hold still for 3 slow exposures after the timer, then choose one. Frames are not combined."
     }
 
     var canConfigure: Bool { !busy && !configuring && !hasPendingCapture && !camera.recording }
