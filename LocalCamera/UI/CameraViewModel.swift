@@ -125,13 +125,20 @@ final class CameraViewModel: ObservableObject {
     @Published var message: String? {
         didSet {
             messageTask?.cancel()
-            guard let message, message.hasPrefix("Saved") || message == "Video saved" || message == "Both photos saved" else { return }
+            guard let message, Self.isBriefStatus(message) else { return }
             messageTask = Task { [weak self] in
                 do { try await Task.sleep(nanoseconds: 2_500_000_000) } catch { return }
                 self?.message = nil
             }
         }
     }
+    nonisolated static func isBriefStatus(_ message: String) -> Bool {
+        if ["Saved", "Video saved", "Both photos saved", "Depth capture ready", "Eye focus ready",
+            "Ready to aim and shoot", "Unsaved capture discarded."].contains(message) { return true }
+        let words = message.split(separator: " ")
+        return words.count == 3 && words[0] == "Saved" && Int(words[1]).map { $0 > 0 } == true && words[2] == "photos"
+    }
+
     @Published private(set) var mode: CaptureMode = .photo
     @Published private(set) var pendingVideo: URL?
     @Published var videoWidth: Int32 = 1920
