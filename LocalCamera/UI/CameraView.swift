@@ -47,7 +47,6 @@ struct CameraView: View {
     @AppStorage("camera.showHelp") private var showHelp = false
     @State private var showsRecent = false
     @State private var selectedDualIndex = 0
-    @State private var showsDualAdjustments = false
     private var panelOpen: Bool { showsCaptureInfo || showsRecent || model.reviewingBurst }
     private var enlargedDualIndex: Int? {
         get { (0...1).contains(dualLayout) ? dualLayout : nil }
@@ -143,9 +142,9 @@ struct CameraView: View {
             captureHUD.background(Color.black.ignoresSafeArea(edges: .top))
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls(landscape: landscape) }
-        .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
+        .onChange(of: model.camera.dualEnabled) { _, _ in showsZoom = false; zoomDismissTask?.cancel() }
         .onChange(of: panelOpen) { _, open in
-            if open { showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
+            if open { showsZoom = false; zoomDismissTask?.cancel() }
         }
         .onDisappear { zoomDismissTask?.cancel(); model.setActive(false) }
         .foregroundStyle(ink)
@@ -165,7 +164,6 @@ struct CameraView: View {
         CameraPreview(engine: model.engine, onFocus: { point, locked in
             guard !panelOpen else { return }
             selectedDualIndex = index
-            showsDualAdjustments = true
             model.focusDual(at: point, index: index, locked: locked)
         }, fillView: false, secondary: index == 1, showsFocusFeedback: !panelOpen && model.canConfigure &&
             model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
@@ -178,11 +176,11 @@ struct CameraView: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 0) {
                     Button {
-                        showsDualAdjustments = selectedDualIndex != index || !showsDualAdjustments
                         selectedDualIndex = index
                     } label: {
                         HStack(spacing: 4) {
                             Text(title)
+                            if selectedDualIndex == index { Text("Selected").font(.caption2) }
                             if selectedDualIndex == index { Image(systemName: "checkmark.circle.fill").accessibilityHidden(true) }
                         }
                         .font(.caption.weight(.semibold)).foregroundStyle(selectedDualIndex == index ? selection : .white)
@@ -199,20 +197,7 @@ struct CameraView: View {
                     }
                     .accessibilityLabel(enlargedDualIndex == index ? "Show both cameras equally" : "Enlarge \(title)")
                 }
-                if model.camera.focusStates.indices.contains(index),
-                   model.camera.focusStates[index] == "Focus locked" || model.camera.focusStates[index] == "Focusing…" {
-                    Label(model.camera.focusStates[index], systemImage: model.camera.focusStates[index] == "Focus locked" ? "lock.fill" : "viewfinder")
-                        .font(.caption2).foregroundStyle(selection)
-                }
-                if showsDualAdjustments && selectedDualIndex == index {
-                    let sizes = model.camera.resolution.components(separatedBy: " + ")
-                    if sizes.indices.contains(index) { Text(sizes[index]).font(.caption2).monospacedDigit() }
-                    Text(model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index] && model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Fixed focus")
-                        .font(.caption2)
-                    Button("Zoom") { selectedDualIndex = index; zoomDismissTask?.cancel(); showsZoom.toggle() }.frame(minHeight: 44)
-                    Button("Brightness") { openTool(.exposure) }
-                        .font(.caption).frame(minHeight: 44).disabled(!model.canConfigure)
-                }
+
             }
             .padding(.horizontal, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -225,7 +210,6 @@ struct CameraView: View {
     }
 
     private func openTool(_ page: CameraToolPage? = nil) {
-        showsDualAdjustments = false
         showsZoom = false
         zoomDismissTask?.cancel()
         toolPath = page.map { [$0] } ?? []
@@ -360,18 +344,24 @@ struct CameraView: View {
 
     private func quickControl(_ title: String, icon: String, value: String, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: icon).font(.body)
-                .frame(maxWidth: .infinity, minHeight: 44)
-                .overlay(alignment: .bottom) {
-                    if active { Circle().fill(selection).frame(width: 3, height: 3).padding(.bottom, 2) }
-                }
-                .contentShape(Rectangle())
+            VStack(spacing: 2) {
+                Image(systemName: icon).font(.body)
+                Text(value == "Open" ? title : value).font(.caption2)
+                    .lineLimit(1).minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(active ? selection : .white)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)
         .accessibilityValue(value)
+        .accessibilityHint("Touch and hold for the control name and current setting")
+        .contextMenu {
+            Text(title)
+            Text(value == "Open" ? "Opens camera controls" : "Current setting: \(value)")
+        }
     }
 
     private func zoomState(_ index: Int? = nil) -> CameraZoom {
@@ -405,7 +395,7 @@ struct CameraView: View {
         let zoom = zoomState(index)
         return HStack {
             VStack(spacing: 2) {
-                if model.camera.dualEnabled { Text(index == 0 ? "Camera 1" : "Camera 2").font(.caption2) }
+                if model.camera.dualEnabled { Text(index == 0 ? "Main camera" : "Ultra Wide").font(.caption2) }
                 Text(zoomText(zoom.value)).monospacedDigit().font(.callout.weight(.semibold))
             }
             if zoom.maximum > zoom.minimum {
@@ -514,13 +504,26 @@ struct CameraView: View {
         let layout = landscape ? AnyLayout(HStackLayout(spacing: 12)) : AnyLayout(VStackLayout(spacing: 6))
         let modeLayout = landscape ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 12))
         return layout {
-            if !model.camera.dualEnabled {
-                lensSelector.disabled(panelOpen)
-            }
+            Group {
+                if model.camera.dualEnabled {
+                    HStack(spacing: 8) {
+                        Text(selectedDualIndex == 0 ? "Main" : "Ultra Wide").font(.caption.weight(.semibold))
+                        Button { zoomDismissTask?.cancel(); showsZoom.toggle() } label: {
+                            Label("Zoom", systemImage: "magnifyingglass").font(.caption).frame(minHeight: 44)
+                        }
+                        Button { openTool(.exposure) } label: {
+                            Label("Brightness", systemImage: "sun.max").font(.caption).frame(minHeight: 44)
+                        }
+                    }.disabled(!model.canConfigure || panelOpen)
+                } else { lensSelector.disabled(panelOpen) }
+            }.frame(minHeight: 44)
             VStack(spacing: 2) {
                 modeLayout {
                     ForEach(CaptureMode.allCases, id: \.self) { mode in
-                        Button { showsCaptureInfo = false; showsRecent = false; model.selectMode(mode) } label: {
+                        Button {
+                        guard mode != model.mode else { return }
+                        showsCaptureInfo = false; showsRecent = false; model.selectMode(mode)
+                    } label: {
                             Text(mode.rawValue.uppercased())
                                 .font(.caption.weight(.semibold))
                                 .frame(minWidth: 80, minHeight: 44)
@@ -533,7 +536,10 @@ struct CameraView: View {
                 }
                 .fixedSize(horizontal: landscape, vertical: false)
                 .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.recording)
-                if model.mode == .photo { shotModeSelector }
+                shotModeSelector
+                    .opacity(model.mode == .photo ? 1 : 0)
+                    .allowsHitTesting(model.mode == .photo)
+                    .accessibilityHidden(model.mode != .photo)
             }
 
             HStack {
@@ -574,9 +580,9 @@ struct CameraView: View {
                     }
                     .frame(width: 76, height: 76)
                     .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
-                    if model.mode == .video {
-                        Text(model.videoButtonTitle).font(.caption.weight(.semibold))
-                    }
+                    Text(model.mode == .video ? model.videoButtonTitle : " ")
+                        .font(.caption.weight(.semibold)).lineLimit(1)
+                        .accessibilityHidden(model.mode != .video)
                     }
                 }
                 .accessibilityLabel(model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
@@ -655,7 +661,7 @@ struct CameraView: View {
             } else {
                 CompactToolLayout {
                     VStack(alignment: .leading, spacing: 2) {
-                    controlRow("Brightness", icon: "sun.max", value: model.camera.dualEnabled ? "Both views" : String(format: "%+.1f EV", model.exposureBias)) { toolPath.append(.exposure) }
+                    controlRow("Brightness", icon: "sun.max", value: model.camera.dualEnabled ? (selectedDualIndex == 0 ? "Main" : "Ultra Wide") : String(format: "%+.1f EV", model.exposureBias)) { toolPath.append(.exposure) }
                     if model.mode == .photo {
                         controlRow("Timer", icon: "timer", value: model.timerSeconds == 0 ? "Off" : "\(model.timerSeconds)s") { toolPath.append(.timer) }
                         Toggle(isOn: Binding(get: { model.captureStyle == "Night" }, set: { model.setNightEnabled($0) })) {
@@ -960,12 +966,12 @@ struct CameraView: View {
         }
     }
     private let deviceChecks = [
-        "Stability: take 20 Single photos, 20 Fast pairs and 10 Detail pairs; switch modes between groups. Rotate both ways and review each pair. Check for missed captures, mismatched lenses, freezes and save failures.",
+        "Layout: verify the shutter stays in place when switching Single/Dual, Photo/Video and opening menus. Tapping the selected Photo tab must keep Dual Shot active. Then take 20 Single photos, 20 Fast pairs and 10 Detail pairs; switch modes between groups. Rotate both ways and review each pair. Check for missed captures, mismatched lenses, freezes and save failures.",
         "Resources: open this panel for a baseline, close it, take repeated captures, then reopen it. Compare memory after processing settles. Repeat unplugged for battery/heat checks. Background the app: the camera indicator should turn off, with no active analysis. Use device profiling for capture-time peaks.",
         "Accessibility: use VoiceOver and the largest text sizes in portrait and both landscapes. Check the Single/Dual switch, shutter, timer, each lens, focus lock, all menus and saved-photo comparison. Check Increase Contrast and Reduce Transparency too.",
         "Night: compare fine text, faces, highlights and moving subjects against Single Auto and Apple Camera. Check the saved reference for each lens. Reject results with blur, ghosting or color shifts.",
         "Night: test Single and Dual, interrupt during capture, deny Photos access, and repeat pairs. Verify originals survive interruption and each saved view is correctly labeled.",
-        "In Photo, Video and both Dual Shot layouts, verify the entire camera frame is visible. Tap near each visible corner and verify focus follows the tap. Compare the preview edges with the saved capture.",
+        "Framing: place recognizable objects near all four corners. In Photo, Video and both Dual Shot layouts, verify the entire camera frame is visible. Tap near each visible corner and verify focus follows the tap. Compare the preview edges with the saved capture.",
         "Take repeated photos with guides off, then Histogram, Highlights and Focus Peaking. Check responsiveness, warmth and memory in a device profiling session.",
         "Rotate both ways in Single, Dual Fast, Dual Detail, Night and Video. Check upright previews, saved photos/videos, focus targets and guides. Rotate during a Night sequence or recording: its saved orientation must stay fixed. Check rotation lock, larger text and the fixed-layout setting.",
         "Check the zoom row against this phone’s native lens and sensor-crop choices. Test larger text and landscape without clipped controls.",
