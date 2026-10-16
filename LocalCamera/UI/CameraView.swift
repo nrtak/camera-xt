@@ -287,10 +287,17 @@ struct CameraView: View {
                             Button("Off") { model.disablePanorama() }.frame(minHeight: 44)
                         }
                     }
-                    Text(model.message ?? "Tap the shutter and sweep slowly. Tap again to finish.")
+                    Text(model.message ?? model.panoramaMethod.instructions)
                         .font(.caption).fixedSize(horizontal: false, vertical: true)
                     if model.panoramaRunning {
-                        Text("\(model.panoramaFrames) frames · \(model.panoramaElapsed)s / 45s").font(.caption.monospacedDigit())
+                        HStack {
+                            Text("\(model.panoramaFrames) photos · \(model.panoramaElapsed)s / \(model.panoramaMethod.maximumSeconds)s").font(.caption.monospacedDigit())
+                            Spacer()
+                            if model.panoramaMethod == .stitch {
+                                Button("Finish") { model.finishPanorama() }
+                                    .fontWeight(.semibold).frame(minWidth: 60, minHeight: 44)
+                            }
+                        }
                     }
                 }.font(.caption).padding(10).background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 10))
             }
@@ -582,18 +589,18 @@ struct CameraView: View {
                     ZStack {
                         Circle().fill(model.mode == .video ? Color.red : Color.white)
                         Circle().strokeBorder(Color.black.opacity(0.65), lineWidth: 2).padding(5)
-                        if model.panoramaRunning { RoundedRectangle(cornerRadius: 4).fill(.black).frame(width: 28, height: 28) }
+                        if model.panoramaRunning && model.panoramaMethod == .sweep { RoundedRectangle(cornerRadius: 4).fill(.black).frame(width: 28, height: 28) }
                         else if model.camera.recording { RoundedRectangle(cornerRadius: 4).fill(.white).frame(width: 28, height: 28) }
                         else if model.busy || model.configuring { ProgressView().tint(.black) }
                     }
                     .frame(width: 76, height: 76)
                     .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
-                    Text(model.panoramaRunning ? "Finish" : model.mode == .video ? model.videoButtonTitle : " ")
+                    Text(model.panoramaRunning ? (model.panoramaMethod == .sweep ? "Finish" : "Add photo") : model.mode == .video ? model.videoButtonTitle : " ")
                         .font(.caption.weight(.semibold)).lineLimit(1)
                         .accessibilityHidden(model.mode != .video && !model.panoramaRunning)
                     }
                 }
-                .accessibilityLabel(model.panoramaRunning ? "Finish panorama" : model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
+                .accessibilityLabel(model.panoramaRunning ? (model.panoramaMethod == .sweep ? "Finish panorama" : "Add panorama photo") : model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
                 .accessibilityValue(model.shutterStatus)
                 .disabled(!model.canShutter)
                 .opacity(model.canShutter ? 1 : 0.4)
@@ -747,12 +754,15 @@ struct CameraView: View {
             switch page {
             case .panorama:
                 CompactToolLayout {
-                    Text(model.camera.dualEnabled ? "Two panoramas from one sweep" : "One panorama from a guided sweep").font(.headline)
+                    Text(model.camera.dualEnabled ? "Two perspectives, one panorama session" : "Choose how to capture").font(.headline)
+                    Picker("Panorama method", selection: $model.panoramaMethod) {
+                        ForEach(PanoramaMethod.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.segmented)
                     Picker("Sweep direction", selection: $model.panoramaDirection) {
                         ForEach(PanoramaDirection.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                     }.pickerStyle(.segmented)
-                    Text("Tap the shutter, turn slowly in the arrow's direction, then tap again to finish. Keep the phone level and use a still, well-lit scene.")
-                    Text("Beta: saves JPEG panoramas separately for each lens. Capture is limited to 45 seconds or 36 frames; stitching runs one lens at a time afterward. Up to 32 MP per result, depending on sweep and cropping. Not a 360° capture. Moving subjects, close objects and large turns may show seams.").font(.caption)
+                    Text(model.panoramaMethod.instructions)
+                    Text("Beta: saves JPEG panoramas separately for each lens. Capture is limited to 36 photos (45 seconds for Sweep, 3 minutes for Stitch); stitching runs one lens at a time afterward. Up to 32 MP per result, depending on sweep and cropping. Not a 360° capture. Moving subjects, close objects and large turns may show seams.").font(.caption)
                     Text("If stitching fails, the starting photo or pair is saved instead.").font(.caption)
                     Button("Use panorama") { model.enablePanorama(); showsCaptureInfo = false }
                         .buttonStyle(.borderedProminent).foregroundStyle(.black).disabled(!model.canConfigure || model.mode != .photo)
