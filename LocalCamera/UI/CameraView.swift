@@ -97,7 +97,6 @@ struct CameraView: View {
                     .accessibilityHidden(panelOpen)
                 } else {
                     GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: false, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen)
-                        .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
                         .allowsHitTesting(!panelOpen)
@@ -128,7 +127,7 @@ struct CameraView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                         } else { captureInfo }
                     }
-                        .frame(height: min(geometry.size.height * (toolPath.isEmpty && advancedTools ? 0.96 : 0.82), toolPanelHeight))
+                        .frame(height: min(geometry.size.height * (toolPath.isEmpty ? 0.96 : 0.82), toolPanelHeight))
                         .contentShape(Rectangle())
                         .background { Rectangle().fill(Color.clear).contentShape(Rectangle()).onTapGesture {} }
                         .frame(maxHeight: .infinity, alignment: .bottom)
@@ -141,18 +140,7 @@ struct CameraView: View {
             if !panelOpen { captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 8) }
         }
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 0) {
-                captureHUD
-                if !panelOpen && showQuickControls {
-                    viewfinderQuickControls.padding(.horizontal, 12).padding(.bottom, 6)
-                }
-            }.background {
-                if reduceTransparency { Color.black.ignoresSafeArea(edges: .top) }
-                else {
-                    LinearGradient(colors: [.black.opacity(0.7), .black.opacity(0.18)], startPoint: .top, endPoint: .bottom)
-                        .ignoresSafeArea(edges: .top)
-                }
-            }
+            captureHUD.background(Color.black.ignoresSafeArea(edges: .top))
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { captureControls(landscape: landscape) }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsDualAdjustments = false; showsZoom = false; zoomDismissTask?.cancel() }
@@ -186,7 +174,7 @@ struct CameraView: View {
         .background(.black)
         .simultaneousGesture(zoomGesture(index))
         .overlay { Rectangle().strokeBorder(!panelOpen && selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
-        .overlay(alignment: .bottomLeading) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 0) {
                     Button {
@@ -227,7 +215,8 @@ struct CameraView: View {
                 }
             }
             .padding(.horizontal, 6)
-            .background(overlayColor, in: RoundedRectangle(cornerRadius: 8)).padding(6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.black)
             .opacity(panelOpen ? 0 : 1)
             .allowsHitTesting(!panelOpen)
             .accessibilityHidden(panelOpen)
@@ -246,33 +235,39 @@ struct CameraView: View {
 
     private var captureHUD: some View {
         HStack(spacing: 8) {
-            if model.mode == .photo {
-                Button {
-                    showsCaptureInfo = false; showsRecent = false
-                    model.setDualEnabled(!model.camera.dualEnabled)
-                } label: {
-                    Label(model.camera.dualEnabled ? "Dual" : "Single", systemImage: model.camera.dualEnabled ? "camera.on.rectangle.fill" : "camera")
-                        .font(.subheadline.weight(.semibold)).lineLimit(1)
-                        .foregroundStyle(model.camera.dualEnabled ? selection : ink)
-                        .frame(minHeight: 44)
-                }
-                .disabled(!model.camera.dualAvailable && !model.camera.dualEnabled)
-                .accessibilityLabel(model.camera.dualEnabled ? "Switch to Single Shot" : "Switch to Dual Shot")
-                .accessibilityValue(model.camera.dualEnabled ? "Dual Shot" : "Single Shot")
-                .accessibilityHint(model.camera.dualAvailable ? "Changes camera mode with one tap" : "Dual Shot is unavailable on this device")
-            } else {
-                Button("Video") { openTool(.details) }.frame(minHeight: 44)
-            }
-            Spacer(minLength: 8)
-            Button { openTool() } label: {
+            if showQuickControls { viewfinderQuickControls }
+            else { Spacer() }
+            Button { if showsCaptureInfo { showsCaptureInfo = false } else { openTool() } } label: {
                 Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44)
-            }.accessibilityLabel("Camera tools")
-            Button { openTool(.preferences) } label: {
-                Image(systemName: "gearshape").frame(width: 44, height: 44)
-            }.accessibilityLabel("Camera preferences")
+                    .foregroundStyle(showsCaptureInfo ? selection : ink)
+            }.accessibilityLabel(showsCaptureInfo ? "Close camera controls" : "Camera controls")
         }
         .disabled(!model.canConfigure)
         .padding(.horizontal, 14)
+        .buttonStyle(.plain)
+    }
+
+    private var shotModeSelector: some View {
+        HStack(spacing: 0) {
+            ForEach([false, true], id: \.self) { dual in
+                Button {
+                    showsCaptureInfo = false; showsRecent = false
+                    model.setDualEnabled(dual)
+                } label: {
+                    Text(dual ? "Dual" : "Single")
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .foregroundStyle(model.camera.dualEnabled == dual ? .black : .white)
+                        .background(model.camera.dualEnabled == dual ? selection : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: 8))
+                }
+                .disabled(!model.canConfigure || (dual && !model.camera.dualAvailable && !model.camera.dualEnabled))
+                .accessibilityLabel(dual ? "Dual Shot" : "Single Shot")
+                .accessibilityAddTraits(model.camera.dualEnabled == dual ? .isSelected : [])
+            }
+        }
+        .frame(maxWidth: 220)
+        .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
         .buttonStyle(.plain)
     }
 
@@ -331,7 +326,7 @@ struct CameraView: View {
     }
 
     private var viewfinderQuickControls: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: textSize.isAccessibilitySize ? 2 : (quickAccess || model.mode == .video ? 3 : 4)), spacing: 4) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 3), spacing: 4) {
             if quickAccess {
                 ForEach(Array([pin1, pin2, pin3].enumerated()), id: \.offset) { _, name in
                     if let page = CameraToolPage(rawValue: name) {
@@ -339,24 +334,21 @@ struct CameraView: View {
                     }
                 }
             } else {
-                quickControl("Brightness", icon: "sun.max", value: model.camera.dualEnabled ? "Both views" : String(format: "%+.1f EV", model.exposureBias)) { openTool(.exposure) }
                 if model.mode == .photo {
-                    quickControl("Night", icon: model.captureStyle == "Night" ? "moon.fill" : "moon", value: model.captureStyle == "Night" ? "On · Beta" : "Off", active: model.captureStyle == "Night") {
-                        model.setNightEnabled(model.captureStyle != "Night")
-                    }
+                    quickControl("Flash", icon: model.controls.flash == .off ? "bolt.slash" : "bolt.fill",
+                                 value: model.controls.flash == .off ? "Off" : model.controls.flash == .auto ? "Auto" : "On",
+                                 active: model.controls.flash != .off) {
+                        model.controls.flash = model.controls.flash == .off ? .auto : model.controls.flash == .auto ? .on : .off
+                    }.disabled(!model.camera.flashAvailable || model.camera.dualEnabled)
                     quickControl("Timer", icon: "timer", value: model.timerSeconds == 0 ? "Off" : "\(model.timerSeconds)s", active: model.timerSeconds > 0) {
                         model.timerSeconds = model.timerSeconds == 0 ? 3 : model.timerSeconds == 3 ? 10 : 0
                     }
-                    if model.camera.dualEnabled {
-                        quickControl("Dual style", icon: "camera.on.rectangle", value: model.captureStyle == "Night" ? "Night" : model.camera.dualMode.rawValue) {
-                            if model.captureStyle == "Night" { openTool(.shoot) }
-                            else { model.setDualMode(model.camera.dualMode == .fast ? .detail : .fast) }
-                        }
-                    } else {
-                        quickControl("Style", icon: "camera", value: model.burstEnabled && model.captureStyle == "Auto" ? "Burst" : model.captureStyle) { openTool(.shoot) }
+                    quickControl("Night", icon: model.captureStyle == "Night" ? "moon.fill" : "moon", value: model.captureStyle == "Night" ? "On" : "Off", active: model.captureStyle == "Night") {
+                        model.setNightEnabled(model.captureStyle != "Night")
                     }
                 } else {
-                    quickControl("Video", icon: "video", value: model.camera.videoLabel) { openTool(.video) }
+                    quickControl("Brightness", icon: "sun.max", value: String(format: "%+.1f EV", model.exposureBias)) { openTool(.exposure) }
+                    quickControl("Video quality", icon: "video", value: model.camera.videoLabel) { openTool(.video) }
                     quickControl("Grid", icon: "grid", value: showsGrid ? "On" : "Off", active: showsGrid) { showsGrid.toggle() }
                 }
             }
@@ -368,16 +360,12 @@ struct CameraView: View {
 
     private func quickControl(_ title: String, icon: String, value: String, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(spacing: 3) {
-                HStack(spacing: 5) {
-                    Image(systemName: icon).font(.body)
-                    if value != "Open" { Text(value).font(.caption.monospacedDigit()) }
+            Image(systemName: icon).font(.body)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .overlay(alignment: .bottom) {
+                    if active { Circle().fill(selection).frame(width: 3, height: 3).padding(.bottom, 2) }
                 }
-                Text(title).font(.caption2).foregroundStyle(.white.opacity(0.75))
-            }
-            .frame(maxWidth: .infinity, minHeight: 48)
-            .padding(.vertical, 3)
-            .contentShape(Rectangle())
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(active ? selection : .white)
@@ -526,24 +514,27 @@ struct CameraView: View {
         let layout = landscape ? AnyLayout(HStackLayout(spacing: 12)) : AnyLayout(VStackLayout(spacing: 6))
         let modeLayout = landscape ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 12))
         return layout {
-            if !showsCaptureInfo && !showsRecent && !model.reviewingBurst && !model.camera.dualEnabled {
-                lensSelector
+            if !model.camera.dualEnabled {
+                lensSelector.disabled(panelOpen)
             }
-            modeLayout {
-                ForEach(CaptureMode.allCases, id: \.self) { mode in
-                    Button { model.selectMode(mode) } label: {
-                        Text(mode.rawValue.uppercased())
-                            .font(.caption.weight(.semibold))
-                            .frame(minWidth: 80, minHeight: 44)
-                            .foregroundStyle(model.mode == mode ? selection : .white.opacity(0.65))
+            VStack(spacing: 2) {
+                modeLayout {
+                    ForEach(CaptureMode.allCases, id: \.self) { mode in
+                        Button { showsCaptureInfo = false; showsRecent = false; model.selectMode(mode) } label: {
+                            Text(mode.rawValue.uppercased())
+                                .font(.caption.weight(.semibold))
+                                .frame(minWidth: 80, minHeight: 44)
+                                .foregroundStyle(model.mode == mode ? selection : .white.opacity(0.65))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(model.mode == mode ? .isSelected : [])
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(model.mode == mode ? .isSelected : [])
+    
                 }
-
+                .fixedSize(horizontal: landscape, vertical: false)
+                .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.recording)
+                if model.mode == .photo { shotModeSelector }
             }
-            .fixedSize(horizontal: landscape, vertical: false)
-            .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.recording)
 
             HStack {
                 Button {
@@ -617,13 +608,7 @@ struct CameraView: View {
                     .alignmentGuide(.top) { dimensions in dimensions[.bottom] + 8 }
             }
         }
-        .background {
-            if reduceTransparency { Color.black.ignoresSafeArea(edges: .bottom) }
-            else {
-                LinearGradient(colors: [.black.opacity(0.18), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
-                    .ignoresSafeArea(edges: .bottom)
-            }
-        }
+        .background(Color.black.ignoresSafeArea(edges: .bottom))
     }
 
     @ViewBuilder private var saveRecovery: some View {
@@ -636,7 +621,7 @@ struct CameraView: View {
         if showsRecent || model.reviewingBurst || textSize.isAccessibilitySize { return .infinity }
         let base: CGFloat
         switch toolPath.last {
-        case nil: return (advancedTools ? 560 : 290) + (hasAdjustments ? 44 : 0)
+        case nil: return (advancedTools ? 650 : 430) + (hasAdjustments ? 44 : 0)
         case .shoot: base = model.camera.dualEnabled ? 370 : 350
         case .preferences:
             base = preferencesSection == 0 ? 320 : preferencesSection == 1 ? (showQuickControls && quickAccess ? 510 : 360) : 450
@@ -651,12 +636,12 @@ struct CameraView: View {
     private var captureInfo: some View {
         VStack(spacing: 0) {
             HStack {
-                if !toolPath.isEmpty && toolPath != [.preferences] {
+                if !toolPath.isEmpty {
                     Button { toolPath.removeLast() } label: {
                         Image(systemName: "chevron.left").frame(width: 44, height: 44)
                     }.accessibilityLabel("Back")
                 }
-                Text(toolPath.last?.rawValue ?? "Camera Tools").font(.headline)
+                Text(toolPath.last?.rawValue ?? "Camera controls").font(.headline)
                 Spacer()
                 Button { showHelp.toggle() } label: {
                     Image(systemName: showHelp ? "info.circle.fill" : "info.circle").frame(width: 44, height: 44)
@@ -669,15 +654,42 @@ struct CameraView: View {
                 toolPage(page)
             } else {
                 CompactToolLayout {
-                    Picker("Tool complexity", selection: $advancedTools) {
-                        Text("Simple").tag(false); Text("Advanced").tag(true)
-                    }.pickerStyle(.segmented)
-                    if hasAdjustments { Button("Reset to Auto") { useTool(.automatic) }.frame(minHeight: 44) }
-                    toolGrid([.shoot, model.mode == .photo ? .timer : .video, .preferences])
-                    Toggle("Composition grid", isOn: $showsGrid)
+                    VStack(alignment: .leading, spacing: 2) {
+                    controlRow("Brightness", icon: "sun.max", value: model.camera.dualEnabled ? "Both views" : String(format: "%+.1f EV", model.exposureBias)) { toolPath.append(.exposure) }
+                    if model.mode == .photo {
+                        controlRow("Timer", icon: "timer", value: model.timerSeconds == 0 ? "Off" : "\(model.timerSeconds)s") { toolPath.append(.timer) }
+                        Toggle(isOn: Binding(get: { model.captureStyle == "Night" }, set: { model.setNightEnabled($0) })) {
+                            Label("Night", systemImage: "moon")
+                        }.frame(minHeight: 44)
+                        controlRow("Style", icon: "camera", value: model.camera.dualEnabled ? model.camera.dualMode.rawValue : model.captureStyle) { toolPath.append(.shoot) }
+                    } else {
+                        controlRow("Video quality", icon: "video", value: model.camera.videoLabel) { toolPath.append(.video) }
+                    }
+                    Toggle(isOn: $showsGrid) { Label("Grid", systemImage: "grid") }.frame(minHeight: 44)
+                    Divider()
+                    Button { advancedTools.toggle() } label: {
+                        HStack {
+                            Label("Advanced", systemImage: "slider.horizontal.3")
+                            Spacer()
+                            Image(systemName: advancedTools ? "chevron.up" : "chevron.down")
+                        }.frame(minHeight: 44).contentShape(Rectangle())
+                    }.buttonStyle(.plain).accessibilityValue(advancedTools ? "Expanded" : "Collapsed")
                     if advancedTools {
-                        Divider()
-                        toolGrid([.exposure, .color, .manualFocus, .focus, .guides, .details, .rescue])
+                        toolGrid([.color, .manualFocus, .focus, .guides, .details, .rescue])
+                        if hasAdjustments { Button("Reset to Auto") { useTool(.automatic) }.frame(minHeight: 44) }
+                    }
+                    Divider()
+                    Button { toolPath.append(.preferences) } label: {
+                        HStack {
+                            Image(systemName: "gearshape")
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("App settings")
+                                Text("Memory, layout & vibrations").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption)
+                        }.frame(minHeight: 44).contentShape(Rectangle())
+                    }.buttonStyle(.plain)
                     }
                 }
             }
@@ -685,6 +697,17 @@ struct CameraView: View {
         .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
         .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.white.opacity(0.15), lineWidth: 1).allowsHitTesting(false) }
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func controlRow(_ title: String, icon: String, value: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Label(title, systemImage: icon)
+                Spacer()
+                Text(value).foregroundStyle(.secondary)
+                Image(systemName: "chevron.right").font(.caption)
+            }.font(.subheadline).frame(minHeight: 44).contentShape(Rectangle())
+        }.buttonStyle(.plain)
     }
 
     private func toolGrid(_ pages: [CameraToolPage]) -> some View {
@@ -974,7 +997,7 @@ private enum CameraToolPage: String, Hashable {
     case shortcuts = "Camera shortcuts", checks = "Device health & testing"
     case guides = "Viewfinder guides"
     case shoot = "Shot styles", focus = "Focus & depth", timer = "Timer", video = "Video quality"
-    case rescue = "Photo Rescue", advanced = "Advanced", preferences = "Preferences"
+    case rescue = "Photo Rescue", advanced = "Advanced", preferences = "App settings"
     case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Info", gallery = "Design Preview"
     var icon: String {
         switch self {
