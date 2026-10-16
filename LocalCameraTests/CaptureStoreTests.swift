@@ -56,6 +56,17 @@ final class CaptureStoreTests: XCTestCase {
         for style in [LongExposureStyle.motion, .trails] {
             let output = try await LongExposureRenderer.process(files, style: style, cancellation: NightWorkCancellation())
             XCTAssertEqual(output.dimensions.width, 80); XCTAssertEqual(output.dimensions.height, 60)
+            let image = try XCTUnwrap(UIImage(data: output.data)?.cgImage)
+            var pixel = [UInt8](repeating: 0, count: 4)
+            pixel.withUnsafeMutableBytes { buffer in
+                let context = CGContext(data: buffer.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                context.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+            }
+            let brightness = Double(pixel[0]) / 255
+            if style == .trails { XCTAssertEqual(brightness, 0.8, accuracy: 0.04) }
+            else { XCTAssertGreaterThan(brightness, 0.4); XCTAssertLessThan(brightness, 0.7) }
+
             XCTAssertTrue(output.lensLabel?.contains("2 frames") == true)
             XCTAssertTrue(FileManager.default.fileExists(atPath: files[0].path))
         }
@@ -70,8 +81,8 @@ final class CaptureStoreTests: XCTestCase {
     }
 
     func testNightComparisonPrefersDifferentLensesBeforeReferenceOriginals() {
-        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main · Night 3 frames", "Main · Reference", "Ultra Wide · Night 3 frames", "Ultra Wide · Reference"]), 2)
-        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main · Night 3 frames", "Main · Reference"]), 1)
+        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main Â· Night 3 frames", "Main Â· Reference", "Ultra Wide Â· Night 3 frames", "Ultra Wide Â· Reference"]), 2)
+        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main Â· Night 3 frames", "Main Â· Reference"]), 1)
         XCTAssertEqual(RecentComparison.secondIndex(labels: []), 0)
     }
 
@@ -218,7 +229,7 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertFalse(CameraViewModel.isBriefStatus("Saved to Photos, but local history could not be updated."))
         XCTAssertFalse(CameraViewModel.isBriefStatus("Only Main photo saved. The other camera did not capture a photo."))
         XCTAssertFalse(CameraViewModel.isBriefStatus("Not saved to Photos. A recovery copy is on this iPhone."))
-        XCTAssertFalse(CameraViewModel.isBriefStatus("Saving to Photos…"))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("Saving to Photosâ€¦"))
     }
 
     func testZoomRestorationClampsToChangedFormatLimits() {
