@@ -77,8 +77,11 @@ final class PanoramaStitcher {
             queue.async {
                 continuation.resume(with: Result {
                     var results: [CapturedPhoto] = []
+                    var stitchedCount = 0
                     for (index, lensFiles) in files.enumerated() {
-                        let result: CapturedPhoto = try autoreleasepool {
+                        let result: CapturedPhoto
+                        do {
+                        result = try autoreleasepool {
                             let stitcher = PanoramaStitcher(direction: direction)
                             defer { stitcher.context.clearCaches() }
                             var rejected = 0
@@ -101,13 +104,36 @@ final class PanoramaStitcher {
                             if rejected > 0 { photo.warning = "Sweep ended before unmatched frames. " + (photo.warning ?? "") }
                             return photo
                         }
+                        stitchedCount += 1
+                        } catch is CancellationError { throw CancellationError() }
+                        catch {
+                            guard files.count > 1, let file = lensFiles.first else { throw error }
+                            guard let reference = try? referencePhoto(file, label: labels.indices.contains(index) ? labels[index] : "Camera") else { continue }
+                            result = reference
+                        }
                         results.append(result)
                     }
+                    if cancellation.cancelled { throw CancellationError() }
                     guard var first = results.first else { throw PanoramaFailure.tooShort }
-                    first.companions = Array(results.dropFirst()); return first
+                    first.companions = Array(results.dropFirst())
+                    first.warning = files.count > 1 && results.count < files.count ? "One view saved; the other camera could not be recovered." :
+                        results.count == 1 ? "Panorama saved." :
+                        stitchedCount == results.count ? "Both panoramas saved." :
+                        stitchedCount == 1 ? "One panorama saved; the other camera kept as a photo." :
+                        "Could not stitch either view. Both reference photos saved."
+                    return first
                 })
             }
         }
+    }
+
+    private static func referencePhoto(_ file: URL, label: String) throws -> CapturedPhoto {
+        let data = try Data(contentsOf: file)
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int else { throw PhotoEditError.render }
+        return CapturedPhoto(data: data, dimensions: CMVideoDimensions(width: Int32(width), height: Int32(height)), lensLabel: label + " · Reference photo")
     }
 
     static func checkOverlap(previous: [URL], next: [Data], direction: PanoramaDirection,
@@ -220,6 +246,73 @@ final class PanoramaStitcher {
 // File operations never run on the UI actor.
 enum PanoramaFileStore {
     private static let queue = DispatchQueue(label: "CameraXT.panoramaFiles", qos: .userInitiated, autoreleaseFrequency: .workItem)
+    struct Journal: Codable {
+        var files: [[String]]
+        var labels: [String]
+        var direction: String
+        var readyToSave = false
+        var saved = false
+        func urls(in directory: URL) -> [[URL]] { files.map { $0.map { directory.appendingPathComponent($0) } } }
+    }
+    static var recoveryDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PanoramaRecovery", isDirectory: true)
+    }
+    static func checkpoint(_ journal: Journal, directory: URL = recoveryDirectory) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                continuation.resume(with: Result {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                        attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+                    var excluded = directory
+                    var values = URLResourceValues(); values.isExcludedFromBackup = true
+                    try excluded.setResourceValues(values)
+                    let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
+                    try encoder.encode(journal).write(to: directory.appendingPathComponent("session.plist"),
+                        options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                })
+            }
+        }
+    }
+    static func load(directory: URL = recoveryDirectory) async throws -> Journal? {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result {
+                    let file = directory.appendingPathComponent("session.plist")
+                    guard FileManager.default.fileExists(atPath: file.path) else { return nil }
+                    let journal = try PropertyListDecoder().decode(Journal.self, from: Data(contentsOf: file))
+                    if journal.saved { return journal }
+                    guard (1...2).contains(journal.files.count),
+                          let count = journal.files.first?.count, (1...PanoramaPolicy.maximumFrames).contains(count),
+                          journal.files.allSatisfy({ $0.count == count }),
+                          PanoramaDirection(rawValue: journal.direction) != nil else { throw PanoramaFailure.changedCamera }
+                    var size = 0
+                    for names in journal.files {
+                        for name in names {
+                            guard name.hasSuffix(".image"), !name.contains("/"), !name.contains("\\"), name != ".." else { throw PanoramaFailure.changedCamera }
+                            let url = directory.appendingPathComponent(name)
+                            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                            size += (attributes[.size] as? NSNumber)?.intValue ?? 0
+                        }
+                    }
+                    guard size <= PanoramaPolicy.maximumDiskBytes else { throw PanoramaFailure.limit }
+                    return journal
+                })
+            }
+        }
+    }
+    static func deleteFiles(_ files: [URL]) {
+        queue.async { for file in files { try? FileManager.default.removeItem(at: file) } }
+    }
+    static func clear(directory: URL = recoveryDirectory) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                continuation.resume(with: Result {
+                    if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
+                })
+            }
+        }
+    }
     static func write(_ photos: [Data], directory: URL, frame: Int) async throws -> [URL] {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
@@ -233,6 +326,23 @@ enum PanoramaFileStore {
                 })
             }
         }
+    }
+    static func byteCount(_ files: [URL]) async throws -> Int {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result {
+                    try files.reduce(0) { total, file in
+                        total + ((try FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.intValue ?? 0)
+                    }
+                })
+            }
+        }
+    }
+    static func thumbnailFile(_ file: URL) async throws -> Data {
+        let data: Data = try await withCheckedThrowingContinuation { continuation in
+            queue.async { continuation.resume(with: Result { try Data(contentsOf: file) }) }
+        }
+        return try await thumbnail(data)
     }
     static func thumbnail(_ data: Data) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
