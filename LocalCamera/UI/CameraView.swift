@@ -46,6 +46,8 @@ struct CameraView: View {
     @AppStorage("camera.dualCorner") private var dualCorner = 3
     @AppStorage("camera.showHelp") private var showHelp = false
     @State private var showsRecent = false
+    @State private var showsEditor = false
+    @State private var editorPhotos: [Data] = []
     @State private var selectedDualIndex = 0
     private var panelOpen: Bool { showsCaptureInfo || showsRecent || model.reviewingBurst }
     private var enlargedDualIndex: Int? {
@@ -92,10 +94,12 @@ struct CameraView: View {
                             }
                         }
                     }
+                    .padding(.top, 52).padding(.bottom, landscape ? 125 : 185)
                     .allowsHitTesting(!panelOpen)
                     .accessibilityHidden(panelOpen)
                 } else {
                     GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: false, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen)
+                        .ignoresSafeArea()
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
                         .allowsHitTesting(!panelOpen)
@@ -118,7 +122,9 @@ struct CameraView: View {
                 GeometryReader { geometry in
                     Group {
                         if showsRecent, let recent = model.recent {
-                            RecentCaptureView(record: recent, close: { showsRecent = false })
+                            RecentCaptureView(record: recent, close: { showsRecent = false }, edit: { photos in
+                                editorPhotos = photos; model.setPhotoEditorActive(true); showsEditor = true
+                            })
                                 .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
                         } else if model.reviewingBurst {
                             BurstReview(model: model)
@@ -132,16 +138,19 @@ struct CameraView: View {
                         .frame(maxHeight: .infinity, alignment: .bottom)
                 }
                 .padding(.horizontal, 10)
-                .padding(.bottom, 8)
+                .padding(.bottom, landscape ? 125 : 205)
             }
         }
         .overlay(alignment: .top) {
-            if !panelOpen { captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 8) }
+            if !panelOpen { captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 60) }
         }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            captureHUD.background(Color.black.ignoresSafeArea(edges: .top))
+        .overlay(alignment: .top) {
+            captureHUD.background(Color.black.opacity(0.25).ignoresSafeArea(edges: .top))
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) { captureControls(landscape: landscape) }
+        .overlay(alignment: .bottom) { captureControls(landscape: landscape) }
+        .fullScreenCover(isPresented: $showsEditor, onDismiss: { editorPhotos = []; model.setPhotoEditorActive(false); model.setActive(scenePhase == .active) }) {
+            PhotoEditorView(initialPhotos: editorPhotos)
+        }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsZoom = false; zoomDismissTask?.cancel() }
         .onChange(of: panelOpen) { _, open in
             if open { showsZoom = false; zoomDismissTask?.cancel() }
@@ -231,30 +240,6 @@ struct CameraView: View {
         .buttonStyle(.plain)
     }
 
-    private var shotModeSelector: some View {
-        HStack(spacing: 0) {
-            ForEach([false, true], id: \.self) { dual in
-                Button {
-                    showsCaptureInfo = false; showsRecent = false
-                    model.setDualEnabled(dual)
-                } label: {
-                    Text(dual ? "Dual" : "Single")
-                        .font(.caption.weight(.semibold))
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .foregroundStyle(model.camera.dualEnabled == dual ? .black : .white)
-                        .background(model.camera.dualEnabled == dual ? selection : Color.clear,
-                                    in: RoundedRectangle(cornerRadius: 8))
-                }
-                .disabled(!model.canConfigure || (dual && !model.camera.dualAvailable && !model.camera.dualEnabled))
-                .accessibilityLabel(dual ? "Dual Shot" : "Single Shot")
-                .accessibilityAddTraits(model.camera.dualEnabled == dual ? .isSelected : [])
-            }
-        }
-        .frame(maxWidth: 220)
-        .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-        .buttonStyle(.plain)
-    }
-
     private var captureStatus: some View {
         VStack(spacing: 12) {
             if let preparing = model.preparingMode {
@@ -282,6 +267,11 @@ struct CameraView: View {
                         .font(.caption)
                 }.padding(10).background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityElement(children: .combine)
+            }
+            if model.longExposureRunning {
+                Button("Finish sequence early") { model.finishLongExposure() }
+                    .font(.callout.weight(.semibold)).padding(10)
+                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
             }
             if model.countdown > 0 {
                 Text("\(model.countdown)").font(.system(size: 64, weight: .bold))
@@ -517,29 +507,18 @@ struct CameraView: View {
                     }.disabled(!model.canConfigure || panelOpen)
                 } else { lensSelector.disabled(panelOpen) }
             }.frame(minHeight: 44)
-            VStack(spacing: 2) {
-                modeLayout {
-                    ForEach(CaptureMode.allCases, id: \.self) { mode in
-                        Button {
-                        guard mode != model.mode else { return }
-                        showsCaptureInfo = false; showsRecent = false; model.selectMode(mode)
-                    } label: {
-                            Text(mode.rawValue.uppercased())
-                                .font(.caption.weight(.semibold))
-                                .frame(minWidth: 80, minHeight: 44)
-                                .foregroundStyle(model.mode == mode ? selection : .white.opacity(0.65))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityAddTraits(model.mode == mode ? .isSelected : [])
-                    }
-    
+            modeLayout {
+                ForEach(0..<3) { index in
+                    let selected = model.mode == .video ? index == 2 : index == (model.camera.dualEnabled ? 1 : 0)
+                    Button { showsCaptureInfo = false; showsRecent = false; model.chooseCaptureMode(index) } label: {
+                        Text(["PHOTO", "DUAL PHOTO", "VIDEO"][index])
+                            .font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                            .frame(minWidth: 70, minHeight: 44)
+                            .foregroundStyle(selected ? selection : .white)
+                    }.buttonStyle(.plain)
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                        .disabled(!model.canConfigure || (index == 1 && !model.camera.dualAvailable))
                 }
-                .fixedSize(horizontal: landscape, vertical: false)
-                .disabled(model.busy || model.configuring || model.hasPendingCapture || model.camera.recording)
-                shotModeSelector
-                    .opacity(model.mode == .photo ? 1 : 0)
-                    .allowsHitTesting(model.mode == .photo)
-                    .accessibilityHidden(model.mode != .photo)
             }
 
             HStack {
@@ -614,7 +593,7 @@ struct CameraView: View {
                     .alignmentGuide(.top) { dimensions in dimensions[.bottom] + 8 }
             }
         }
-        .background(Color.black.ignoresSafeArea(edges: .bottom))
+        .background(LinearGradient(colors: [.clear, .black.opacity(0.35)], startPoint: .top, endPoint: .bottom).ignoresSafeArea(edges: .bottom))
     }
 
     @ViewBuilder private var saveRecovery: some View {
@@ -627,7 +606,7 @@ struct CameraView: View {
         if showsRecent || model.reviewingBurst || textSize.isAccessibilitySize { return .infinity }
         let base: CGFloat
         switch toolPath.last {
-        case nil: return (advancedTools ? 650 : 430) + (hasAdjustments ? 44 : 0)
+        case nil: return (advancedTools ? 740 : 540) + (hasAdjustments ? 44 : 0)
         case .shoot: base = model.camera.dualEnabled ? 370 : 350
         case .preferences:
             base = preferencesSection == 0 ? 320 : preferencesSection == 1 ? (showQuickControls && quickAccess ? 510 : 360) : 450
@@ -668,6 +647,9 @@ struct CameraView: View {
                             Label("Night", systemImage: "moon")
                         }.frame(minHeight: 44)
                         controlRow("Style", icon: "camera", value: model.camera.dualEnabled ? model.camera.dualMode.rawValue : model.captureStyle) { toolPath.append(.shoot) }
+                        if !model.camera.dualEnabled {
+                            controlRow("Long exposure", icon: "sparkles", value: model.captureStyle == "Long Exposure" ? model.longExposureStyle.rawValue : "Off") { toolPath.append(.longExposure) }
+                        }
                     } else {
                         controlRow("Video quality", icon: "video", value: model.camera.videoLabel) { toolPath.append(.video) }
                     }
@@ -681,10 +663,13 @@ struct CameraView: View {
                         }.frame(minHeight: 44).contentShape(Rectangle())
                     }.buttonStyle(.plain).accessibilityValue(advancedTools ? "Expanded" : "Collapsed")
                     if advancedTools {
-                        toolGrid([.color, .manualFocus, .focus, .guides, .details, .rescue])
+                        toolGrid([.color, .manualFocus, .focus, .guides, .details])
                         if hasAdjustments { Button("Reset to Auto") { useTool(.automatic) }.frame(minHeight: 44) }
                     }
                     Divider()
+                    Button {
+                        editorPhotos = []; model.setPhotoEditorActive(true); showsEditor = true
+                    } label: { Label("Edit a photo", systemImage: "slider.horizontal.3").frame(minHeight: 44) }
                     Button { toolPath.append(.preferences) } label: {
                         HStack {
                             Image(systemName: "gearshape")
@@ -732,6 +717,22 @@ struct CameraView: View {
     @ViewBuilder private func toolPage(_ page: CameraToolPage) -> some View {
         Group {
             switch page {
+            case .longExposure:
+                CompactToolLayout {
+                    Picker("Long exposure style", selection: $model.longExposureStyle) {
+                        ForEach(LongExposureStyle.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.menu)
+                    Text(model.longExposureStyle.explanation).font(.callout)
+                    Picker("Total capture time", selection: $model.longExposureSeconds) {
+                        ForEach([15.0, 30, 60, 120, 300], id: \.self) { Text("\(Int($0)) seconds").tag($0) }
+                    }.pickerStyle(.menu)
+                    LabeledContent("Actual shutter / ISO", value: model.camera.exposureLabel)
+                    Text("Total time combines separate stills, not one continuous shutter exposure. Up to 90 frames at 12 MP; heat, memory and storage limits may end the sequence early. The combined JPEG and one reference original are saved; intermediate frames are temporary.").font(.caption)
+                    Button("Focus & exposure") { toolPath.append(.exposure) }
+                    Button("Use long exposure") { model.enableLongExposure(); showsCaptureInfo = false }
+                        .buttonStyle(.borderedProminent).foregroundStyle(.black)
+                        .disabled(!model.canConfigure || model.camera.dualEnabled || model.mode != .photo)
+                }
             case .rescue:
                 PhotoRescueView()
             case .gallery: CameraDesignGallery()
@@ -1003,7 +1004,7 @@ private enum CameraToolPage: String, Hashable {
     case shortcuts = "Camera shortcuts", checks = "Device health & testing"
     case guides = "Viewfinder guides"
     case shoot = "Shot styles", focus = "Focus & depth", timer = "Timer", video = "Video quality"
-    case rescue = "Photo Rescue", advanced = "Advanced", preferences = "App settings"
+    case longExposure = "Long exposure", rescue = "Photo Rescue", advanced = "Advanced", preferences = "App settings"
     case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Info", gallery = "Design Preview"
     var icon: String {
         switch self {
@@ -1014,6 +1015,7 @@ private enum CameraToolPage: String, Hashable {
         case .focus, .manualFocus: return "viewfinder"
         case .timer: return "timer"
         case .video: return "video"
+        case .longExposure: return "sparkles"
         case .rescue: return "wand.and.stars"
         case .advanced: return "slider.horizontal.3"
         case .preferences: return "gearshape"
@@ -1334,6 +1336,7 @@ private struct CameraDesignDetail: View {
 private struct RecentCaptureView: View {
     let record: CaptureStore.Record
     let close: () -> Void
+    let edit: ([Data]) -> Void
     @Environment(\.openURL) private var openURL
     @State private var selection = 0
     @State private var comparing = true
@@ -1392,6 +1395,14 @@ private struct RecentCaptureView: View {
                 }
                 Text("Pinch or double-tap to inspect. Preview is reduced to protect memory.").font(.caption)
             } else { Text("Open Photos to review this video.") }
+            if !record.isVideo, record.photos.indices.contains(selection) {
+                HStack {
+                    Button("Edit photo") { edit([record.photos[selection].data]) }.frame(minHeight: 44)
+                    if record.photos.count == 2 {
+                        Button("Edit both") { edit(record.photos.map(\.data)) }.frame(minHeight: 44)
+                    }
+                }
+            }
             Button("Open Photos") {
                 if let url = URL(string: "photos-redirect://") { openURL(url) }
             }.frame(minHeight: 44)
