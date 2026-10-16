@@ -5,6 +5,11 @@ import UIKit
 import ImageIO
 import UniformTypeIdentifiers
 
+/// Heavy still-image work shares one lane; live preview, video and session configuration stay independent.
+enum PhotoProcessingScheduler {
+    static let queue = DispatchQueue(label: "CameraXT.stillProcessing", qos: .userInitiated, autoreleaseFrequency: .workItem)
+}
+
 struct RescuedPhoto {
     let photo: CapturedPhoto
     let before: UIImage
@@ -14,7 +19,7 @@ struct RescuedPhoto {
 enum PhotoLook: String, CaseIterable { case natural = "Natural", warm = "Warm", mono = "Mono" }
 
 enum PhotoRescueProcessor {
-    private static let queue = DispatchQueue(label: "CameraXT.photoRescue", qos: .userInitiated)
+    private static let queue = PhotoProcessingScheduler.queue
     static func process(_ data: Data, strength: Double, look: PhotoLook = .natural, cancellation: NightWorkCancellation? = nil) async throws -> RescuedPhoto {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
@@ -87,7 +92,7 @@ struct CapturedPhoto {
 
 /// Compares a small burst on-device. Originals remain available for the user's choice.
 enum PhotoRanker {
-    private static let queue = DispatchQueue(label: "CameraXT.photoRanking", qos: .userInitiated)
+    private static let queue = PhotoProcessingScheduler.queue
     static func recommend(_ photos: [CapturedPhoto], completion: @escaping (Int) -> Void) {
         queue.async {
             if ProcessInfo.processInfo.thermalState == .serious || ProcessInfo.processInfo.thermalState == .critical { completion(-1); return }
@@ -164,22 +169,28 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
-        if let error = error {
-            result = .failure(error)
-        } else if let data = photo.fileDataRepresentation() {
-            let note = expectsDepth ? (photo.depthData == nil ? "Photo saved; depth was unavailable for this scene." : "Photo saved with embedded depth.") : nil
-            let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
-            let iso = (exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber])?.first?.doubleValue
-            let exposure = (exif[kCGImagePropertyExifExposureTime as String] as? NSNumber)?.doubleValue
-            let time = CMTimeGetSeconds(photo.timestamp)
-            let details = CaptureDetails(iso: iso, exposureSeconds: exposure, timestamp: time.isFinite ? time : nil)
-            result = .success(CapturedPhoto(data: data, dimensions: photo.resolvedSettings.photoDimensions, warning: note, details: details))
+        PhotoProcessingScheduler.queue.async { [self] in
+            autoreleasepool {
+                if let error = error {
+                    result = .failure(error)
+                } else if let data = photo.fileDataRepresentation() {
+                    let note = expectsDepth ? (photo.depthData == nil ? "Photo saved; depth was unavailable for this scene." : "Photo saved with embedded depth.") : nil
+                    let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
+                    let iso = (exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber])?.first?.doubleValue
+                    let exposure = (exif[kCGImagePropertyExifExposureTime as String] as? NSNumber)?.doubleValue
+                    let time = CMTimeGetSeconds(photo.timestamp)
+                    let details = CaptureDetails(iso: iso, exposureSeconds: exposure, timestamp: time.isFinite ? time : nil)
+                    result = .success(CapturedPhoto(data: data, dimensions: photo.resolvedSettings.photoDimensions, warning: note, details: details))
+                }
+            }
         }
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
-        completion(error.map { .failure($0) } ?? result)
+        PhotoProcessingScheduler.queue.async { [self] in
+            completion(error.map { .failure($0) } ?? result)
+        }
     }
 }
 
@@ -234,7 +245,7 @@ final class NightWorkCancellation: @unchecked Sendable {
 
 /// Conservative prototype: align one lens at a time, reject changed scenes, retain a reference.
 enum NightPhotoProcessor {
-    private static let queue = DispatchQueue(label: "CameraXT.night", qos: .userInitiated)
+    private static let queue = PhotoProcessingScheduler.queue
     static func process(_ frames: [CapturedPhoto], cancellation: NightWorkCancellation) async -> CapturedPhoto? {
         await withCheckedContinuation { continuation in
             queue.async {
