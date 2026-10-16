@@ -1,3 +1,4 @@
+import CoreMotion
 import AVFoundation
 import SwiftUI
 import UIKit
@@ -284,7 +285,7 @@ final class CameraViewModel: ObservableObject {
     @Published var selectedBurstIndex = 0
     @Published private(set) var recommendedBurstIndex = 0
     var hasPendingCapture: Bool { restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
-    var canShutter: Bool { camera.recording ? !busy : (camera.running && !busy && !configuring && preparingMode == nil && !hasPendingCapture && !resetOnReturn) }
+    var canShutter: Bool { panoramaRunning ? active : camera.recording ? !busy : (camera.running && !busy && !configuring && preparingMode == nil && !hasPendingCapture && !resetOnReturn) }
 
     var videoButtonTitle: String {
         if busy { return captureActivity == .saving ? "Saving…" : camera.recording || captureActivity == .processing ? "Finishing…" : "Starting…" }
@@ -337,6 +338,7 @@ final class CameraViewModel: ObservableObject {
     }
     func applyVideoSettings() { selectMode(.video) }
     func shutter() {
+        if panoramaRunning { finishPanoramaRequested = true; return }
         guard canShutter else { return }
         if haptics { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
         if controlsTask != nil {
@@ -757,6 +759,7 @@ final class CameraViewModel: ObservableObject {
         guard canCapture else { return }
         captureActivity = .taking
         busy = true
+        if captureStyle == "Panorama" { capturePanorama(); return }
         if captureStyle == "Long Exposure" && !camera.dualEnabled { captureLongExposure(); return }
         if captureStyle == "Night" { captureNight(); return }
         if burstEnabled && !camera.dualEnabled {
@@ -814,6 +817,102 @@ final class CameraViewModel: ObservableObject {
                     self.message = error.localizedDescription
                     self.busy = false
                 }
+            }
+        }
+    }
+
+    @Published var panoramaDirection: PanoramaDirection = .right
+    @Published private(set) var panoramaRunning = false
+    @Published private(set) var panoramaFrames = 0
+    @Published private(set) var panoramaElapsed = 0
+    private var finishPanoramaRequested = false
+    private let panoramaMotion = CMMotionManager()
+    func enablePanorama() {
+        guard canConfigure, mode == .photo else { return }
+        controlsTask?.cancel(); controlsTask = nil
+        burstEnabled = false; timerSeconds = 0
+        captureStyle = "Panorama"
+        message = "Panorama beta: tap the shutter, sweep slowly, then tap again to finish."
+    }
+    func disablePanorama() { if canConfigure { captureStyle = "Auto"; message = nil } }
+    private func capturePanorama() {
+        let token = NightWorkCancellation(); nightWork = token
+        let paired = camera.dualEnabled, direction = panoramaDirection
+        panoramaRunning = true; finishPanoramaRequested = false; panoramaFrames = 0; panoramaElapsed = 0
+        Task { [weak self] in
+            guard let self else { return }
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("camera-xt-panorama-" + UUID().uuidString, isDirectory: true)
+            var original: CapturedPhoto?
+            var files = [[URL]](repeating: [], count: paired ? 2 : 1)
+            var labels: [String] = []
+            var bytes = 0, startedSequence = false
+            defer {
+                self.panoramaMotion.stopDeviceMotionUpdates()
+                if startedSequence { self.engine.endLongExposure() }
+                try? FileManager.default.removeItem(at: directory)
+                self.panoramaRunning = false; self.nightWork = nil
+                if self.active { self.engine.start() }
+            }
+            do {
+                guard await withCheckedContinuation({ continuation in self.engine.beginPanorama { continuation.resume(returning: $0) } }) else { throw CameraFailure.unavailable }
+                startedSequence = true
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                if self.panoramaMotion.isDeviceMotionAvailable {
+                    self.panoramaMotion.deviceMotionUpdateInterval = 0.1
+                    self.panoramaMotion.startDeviceMotionUpdates()
+                }
+                let started = ProcessInfo.processInfo.systemUptime
+                var initialGravity: CMAcceleration?
+                while self.panoramaFrames < PanoramaPolicy.maximumFrames {
+                    guard self.active, !token.cancelled else { throw CancellationError() }
+                    self.panoramaElapsed = Int(ProcessInfo.processInfo.systemUptime - started)
+                    if self.finishPanoramaRequested || Double(self.panoramaElapsed) >= PanoramaPolicy.maximumSeconds { break }
+                    if let motion = self.panoramaMotion.deviceMotion {
+                        if initialGravity == nil { initialGravity = motion.gravity }
+                        let rate = motion.rotationRate
+                        let speed = sqrt(rate.x * rate.x + rate.y * rate.y + rate.z * rate.z)
+                        let g = initialGravity ?? motion.gravity
+                        let tilt = sqrt(pow(g.x - motion.gravity.x, 2) + pow(g.y - motion.gravity.y, 2) + pow(g.z - motion.gravity.z, 2))
+                        if speed > 0.35 || tilt > 0.2 {
+                            self.message = speed > 0.35 ? "Slow down to keep detail sharp" : "Keep the phone level"
+                            try await Task.sleep(nanoseconds: 120_000_000); continue
+                        }
+                    }
+                    self.message = "Sweep slowly " + direction.rawValue.lowercased() + " · tap the shutter to finish"
+                    let captureStart = ProcessInfo.processInfo.systemUptime
+                    let photo: CapturedPhoto = try await withCheckedThrowingContinuation { continuation in
+                        self.engine.capture(panorama: true) { continuation.resume(with: $0) }
+                    }
+                    if original == nil {
+                        original = photo; self.pendingPhoto = photo
+                        try await self.store.stage(photo); self.recoveryProtected = true
+                    }
+                    guard self.active, !token.cancelled else { throw CancellationError() }
+                    let parts = [photo] + photo.companions
+                    guard parts.count == files.count else { throw PanoramaFailure.changedCamera }
+                    let added = parts.reduce(0) { $0 + $1.data.count }
+                    if bytes + added > PanoramaPolicy.maximumDiskBytes { break }
+                    for (index, part) in parts.enumerated() {
+                        let file = directory.appendingPathComponent("\(index)-\(self.panoramaFrames).image")
+                        try part.data.write(to: file, options: .atomic); files[index].append(file)
+                    }
+                    if labels.isEmpty { labels = parts.map { $0.lensLabel ?? "Camera" } }
+                    bytes += added; self.panoramaFrames += 1
+                    let pause = max(0, 0.45 - (ProcessInfo.processInfo.systemUptime - captureStart))
+                    if pause > 0 { try await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000)) }
+                }
+                self.panoramaRunning = false; self.panoramaMotion.stopDeviceMotionUpdates()
+                self.captureActivity = .processing; self.engine.stop()
+                self.message = paired ? "Finishing two panoramas, one lens at a time…" : "Finishing panorama…"
+                let result = try await PanoramaStitcher.process(files: files, labels: labels, direction: direction, cancellation: token)
+                self.pendingPhoto = result
+                await self.savePending()
+            } catch {
+                self.panoramaRunning = false
+                if var reference = original {
+                    reference.warning = "Panorama could not finish; saved the starting photo\(paired ? " pair" : "") instead. " + error.localizedDescription
+                    self.pendingPhoto = reference; await self.savePending()
+                } else { self.busy = false; self.message = error.localizedDescription }
             }
         }
     }
