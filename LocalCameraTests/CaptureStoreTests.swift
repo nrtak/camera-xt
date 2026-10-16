@@ -31,22 +31,120 @@ final class CaptureStoreTests: XCTestCase {
         model.setActive(false)
     }
 
+    @MainActor
+    func testControlEditsSurviveInterruptionAndPreserveLongExposure() async throws {
+        let model = CameraViewModel()
+        for _ in 0..<200 {
+            if !model.restoring { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(model.restoring)
+        model.controlBinding.flash.wrappedValue = .on
+        XCTAssertTrue(model.controlsNeedApply, "A shortcut must schedule the camera update without a settings panel")
+        model.setActive(false)
+        XCTAssertTrue(model.controlsNeedApply, "An interruption must retain the unapplied edit")
+        model.flushPendingControls()
+        XCTAssertFalse(model.controlsNeedApply, "The shared shutter/focus flush must commit the pending edit first")
+        XCTAssertEqual(model.controls.flash, .on)
+        model.enableLongExposure()
+        model.controlBinding.lensPosition.wrappedValue = 0.7
+        model.controlBinding.automaticFocus.wrappedValue = false
+        model.applyControls()
+        XCTAssertEqual(model.captureStyle, "Long Exposure")
+        XCTAssertFalse(model.controlsNeedApply)
+        model.controlBinding.iso.wrappedValue = 200
+        XCTAssertTrue(model.controlsNeedApply)
+        model.resetControls()
+        XCTAssertFalse(model.controlsNeedApply, "Reset must supersede any delayed edit")
+        model.setActive(false)
+    }
+
+    func testUnrelatedControlChangesDoNotReapplyFocus() {
+        let original = CameraControls()
+        var updated = original; updated.flash = .on
+        var changes = CameraControlChanges(from: original, to: updated)
+        XCTAssertFalse(changes.focus)
+        XCTAssertFalse(changes.exposure)
+        XCTAssertFalse(changes.whiteBalance)
+        updated = original; updated.temperature = 6200
+        changes = CameraControlChanges(from: original, to: updated)
+        XCTAssertTrue(changes.whiteBalance)
+        XCTAssertFalse(changes.focus)
+        XCTAssertFalse(changes.exposure)
+        updated = original; updated.iso = 800
+        changes = CameraControlChanges(from: original, to: updated)
+        XCTAssertTrue(changes.exposure)
+        XCTAssertFalse(changes.focus)
+        updated = original; updated.automaticFocus = false
+        XCTAssertTrue(CameraControlChanges(from: original, to: updated).focus)
+    }
+
+    @MainActor
+    func testRecoveryActionsAreUnavailableDuringStartup() async throws {
+        let model = CameraViewModel()
+        XCTAssertTrue(model.restoring)
+        XCTAssertFalse(model.canUseRecovery)
+        model.discard()
+        XCTAssertFalse(model.busy, "Discard must not start while recovery is loading")
+        await model.retrySave()
+        XCTAssertFalse(model.recoveryActionRunning, "Retry must not overlap startup recovery")
+        for _ in 0..<200 {
+            if !model.restoring { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(model.restoring)
+        model.setActive(false)
+    }
+
+    func testPanoramaDoesNotRecommendUnavailableNightMode() {
+        XCTAssertNil(SceneAdvice.text(shutter: 0.1, iso: 1600, dual: false, night: false, panorama: true))
+        XCTAssertNil(SceneAdvice.text(shutter: 0.1, iso: 1600, dual: true, night: false, panorama: true))
+        XCTAssertNotNil(SceneAdvice.text(shutter: 0.1, iso: 1600, dual: false, night: false))
+    }
+
+    func testAbandonedStackCleanupLeavesUnrelatedFilesAndRecoveryIntact() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let abandoned = root.appendingPathComponent("camera-xt-stack-" + UUID().uuidString, isDirectory: true)
+        let unrelated = root.appendingPathComponent("camera-xt-stack-not-a-session", isDirectory: true)
+        let recovery = root.appendingPathComponent("CaptureRecovery", isDirectory: true)
+        for directory in [abandoned, unrelated, recovery] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("frame.image"))
+        }
+        await PanoramaFileStore.cleanupAbandonedStacks(in: root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: abandoned.path))
+        XCTAssertEqual(try Data(contentsOf: unrelated.appendingPathComponent("frame.image")), Data([1, 2, 3]))
+        XCTAssertEqual(try Data(contentsOf: recovery.appendingPathComponent("frame.image")), Data([1, 2, 3]))
+    }
+
     func testPanoramaPreferencesRoundTripAndOlderSettingsDecode() throws {
         var setup = SavedCameraSetup(lensID: nil, video: false, dual: true, dualMode: "Fast",
             style: "Auto", controls: CameraControls(), bias: 0, dualBrightness: [0, 0], zooms: [],
             timer: 0, burst: false, videoWidth: 1920, videoFPS: 30, stabilization: true,
             depth: false, eye: false, analysis: "Off", exposurePointOnly: false)
         setup.panorama = true; setup.panoramaMethod = "Stitch"; setup.panoramaDirection = "Left"
+        setup.longExposureStyle = LongExposureStyle.trails.rawValue; setup.longExposureSeconds = 120
         let data = try JSONEncoder().encode(setup)
         let restored = try JSONDecoder().decode(SavedCameraSetup.self, from: data)
         XCTAssertEqual(restored.panorama, true)
         XCTAssertEqual(restored.panoramaMethod, "Stitch")
         XCTAssertEqual(restored.panoramaDirection, "Left")
+        XCTAssertEqual(restored.longExposureStyle, LongExposureStyle.trails.rawValue)
+        XCTAssertEqual(restored.longExposureSeconds, 120)
+        XCTAssertEqual(restored, setup)
+        var changed = restored; changed.longExposureSeconds = 300
+        XCTAssertNotEqual(changed, setup, "Preference comparisons must notice duration edits")
+        changed = restored; changed.controls.iso += 1
+        XCTAssertNotEqual(changed, setup, "Preference comparisons must notice manual control edits")
         var old = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        for key in ["panorama", "panoramaMethod", "panoramaDirection"] { old.removeValue(forKey: key) }
+        for key in ["panorama", "panoramaMethod", "panoramaDirection", "longExposureStyle", "longExposureSeconds"] { old.removeValue(forKey: key) }
         old["style"] = "Panorama"
         let legacy = try JSONDecoder().decode(SavedCameraSetup.self, from: JSONSerialization.data(withJSONObject: old))
         XCTAssertNil(legacy.panorama)
+        XCTAssertNil(legacy.longExposureStyle)
+        XCTAssertNil(legacy.longExposureSeconds)
         XCTAssertEqual(legacy.style, "Panorama")
     }
 
@@ -77,6 +175,19 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
         try await PanoramaFileStore.clear(directory: directory)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testPanoramaJournalLoadsWhenOneLensFrameIsMissing() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { PanoramaFileStore.remove(directory) }
+        let pair = try await PanoramaFileStore.write([Data([1]), Data([2])], directory: directory, frame: 0)
+        let journal = PanoramaFileStore.Journal(files: [[pair[0].lastPathComponent], [pair[1].lastPathComponent]],
+            labels: ["Main", "Ultra Wide"], direction: "Right")
+        try await PanoramaFileStore.checkpoint(journal, directory: directory)
+        try FileManager.default.removeItem(at: pair[0])
+        let restored = try await PanoramaFileStore.load(directory: directory)
+        XCTAssertEqual(restored?.files, journal.files, "Preserve lens ordering and allow recovery of the intact camera")
+        XCTAssertEqual(try Data(contentsOf: pair[1]), Data([2]))
     }
 
     func testPanoramaRecoveryRejectsUnsafePaths() async throws {
@@ -153,6 +264,21 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertEqual(partial.companions.count, 1)
         XCTAssertTrue(partial.companions[0].lensLabel?.contains("Reference") == true)
         XCTAssertEqual(partial.warning, "One panorama saved; the other camera kept as a photo.")
+        let missing = directory.appendingPathComponent("missing.image")
+        let corrupt = directory.appendingPathComponent("corrupt.image")
+        try Data([0, 1, 2]).write(to: corrupt)
+        let salvaged = try await PanoramaStitcher.process(files: [files + [missing, corrupt]], labels: ["Main"], direction: .right, cancellation: NightWorkCancellation())
+        XCTAssertGreaterThan(salvaged.dimensions.width, 700)
+        XCTAssertTrue(salvaged.warning?.contains("coverage may be incomplete") == true,
+            "The saved message must retain missing/corrupt frame warnings")
+        let missingLens = try await PanoramaStitcher.process(files: [[missing], files], labels: ["Main", "Ultra Wide"], direction: .right, cancellation: NightWorkCancellation())
+        XCTAssertGreaterThan(missingLens.dimensions.width, 700)
+        XCTAssertTrue(missingLens.lensLabel?.contains("Ultra Wide") == true)
+        XCTAssertTrue(missingLens.warning?.contains("other camera could not be recovered") == true)
+        let fallbackAfterMissing = try await PanoramaStitcher.process(files: [files, [missing, files[0]]], labels: ["Main", "Ultra Wide"], direction: .right, cancellation: NightWorkCancellation())
+        XCTAssertEqual(fallbackAfterMissing.companions.count, 1,
+            "Reference fallback must search beyond a missing first frame")
+        XCTAssertTrue(fallbackAfterMissing.companions[0].lensLabel?.contains("Reference") == true)
         let reversedPartial = try await PanoramaStitcher.process(files: [[files[0]], files], labels: ["Main", "Ultra Wide"], direction: .right, cancellation: NightWorkCancellation())
         XCTAssertGreaterThan(reversedPartial.companions[0].dimensions.width, 700)
         do {
@@ -388,6 +514,10 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertTrue(CameraViewModel.isBriefStatus("Saved"))
         XCTAssertTrue(CameraViewModel.isBriefStatus("Saved 2 photos"))
         XCTAssertTrue(CameraViewModel.isBriefStatus("Depth capture ready"))
+        XCTAssertTrue(CameraViewModel.isBriefStatus("Panorama saved."))
+        XCTAssertTrue(CameraViewModel.isBriefStatus("Both panoramas saved."))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("Both panoramas saved. Main: coverage may be incomplete."))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("One panorama saved; the other camera kept as a photo."))
         XCTAssertFalse(CameraViewModel.isBriefStatus("Saved to Photos, but local history could not be updated."))
         XCTAssertFalse(CameraViewModel.isBriefStatus("Only Main photo saved. The other camera did not capture a photo."))
         XCTAssertFalse(CameraViewModel.isBriefStatus("Not saved to Photos. A recovery copy is on this iPhone."))
