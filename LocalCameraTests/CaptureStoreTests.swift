@@ -15,6 +15,9 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertTrue(model.canConfigure)
         model.enablePanorama()
         XCTAssertTrue(model.panoramaSelected)
+        model.exposureBias = 1
+        model.chooseCaptureMode(1)
+        XCTAssertEqual(model.exposureBias, 1, "Selecting the current mode must not reset adjustments")
         model.setNightEnabled(true)
         model.enableLongExposure()
         XCTAssertTrue(model.panoramaSelected)
@@ -45,6 +48,46 @@ final class CaptureStoreTests: XCTestCase {
         let legacy = try JSONDecoder().decode(SavedCameraSetup.self, from: JSONSerialization.data(withJSONObject: old))
         XCTAssertNil(legacy.panorama)
         XCTAssertEqual(legacy.style, "Panorama")
+    }
+
+    func testPanoramaJournalRetainsAcceptedFilesAndCommitsUndo() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { PanoramaFileStore.remove(directory) }
+        let first = try await PanoramaFileStore.write([Data([1, 2]), Data([3, 4])], directory: directory, frame: 0)
+        let second = try await PanoramaFileStore.write([Data([5, 6]), Data([7, 8])], directory: directory, frame: 1)
+        var journal = PanoramaFileStore.Journal(files: [[first[0].lastPathComponent, second[0].lastPathComponent],
+            [first[1].lastPathComponent, second[1].lastPathComponent]], labels: ["Main", "Ultra Wide"], direction: "Right")
+        try await PanoramaFileStore.checkpoint(journal, directory: directory)
+        let restored = try await PanoramaFileStore.load(directory: directory)
+        XCTAssertEqual(restored?.files, journal.files)
+        journal.files = journal.files.map { Array($0.dropLast()) }
+        try await PanoramaFileStore.checkpoint(journal, directory: directory)
+        PanoramaFileStore.deleteFiles(second)
+        let undone = try await PanoramaFileStore.load(directory: directory)
+        XCTAssertEqual(undone?.files.first?.count, 1)
+        XCTAssertEqual(try Data(contentsOf: first[0]), Data([1, 2]))
+        journal.readyToSave = true
+        try await PanoramaFileStore.checkpoint(journal, directory: directory)
+        let ready = try await PanoramaFileStore.load(directory: directory)
+        XCTAssertEqual(ready?.readyToSave, true)
+        journal.saved = true
+        try await PanoramaFileStore.checkpoint(journal, directory: directory)
+        let saved = try await PanoramaFileStore.load(directory: directory)
+        XCTAssertEqual(saved?.saved, true, "Keep the committed marker until both recovery stores are cleaned")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+        try await PanoramaFileStore.clear(directory: directory)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testPanoramaRecoveryRejectsUnsafePaths() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { PanoramaFileStore.remove(directory) }
+        let journal = PanoramaFileStore.Journal(files: [["../outside.image"]], labels: ["Main"], direction: "Right")
+        try await PanoramaFileStore.checkpoint(journal, directory: directory)
+        do {
+            _ = try await PanoramaFileStore.load(directory: directory)
+            XCTFail("Recovery must reject paths outside its own directory")
+        } catch { XCTAssertTrue(error is PanoramaFailure) }
     }
 
     func testPanoramaPolicyRejectsReverseFastAndVerticalMovement() {
@@ -105,6 +148,13 @@ final class CaptureStoreTests: XCTestCase {
             XCTAssertGreaterThan(result.dimensions.height, 370)
             XCTAssertEqual(result.dimensions.width, result.companions[0].dimensions.width)
         }
+        let partial = try await PanoramaStitcher.process(files: [files, [files[0]]], labels: ["Main", "Ultra Wide"], direction: .right, cancellation: NightWorkCancellation())
+        XCTAssertGreaterThan(partial.dimensions.width, 700)
+        XCTAssertEqual(partial.companions.count, 1)
+        XCTAssertTrue(partial.companions[0].lensLabel?.contains("Reference") == true)
+        XCTAssertEqual(partial.warning, "One panorama saved; the other camera kept as a photo.")
+        let reversedPartial = try await PanoramaStitcher.process(files: [[files[0]], files], labels: ["Main", "Ultra Wide"], direction: .right, cancellation: NightWorkCancellation())
+        XCTAssertGreaterThan(reversedPartial.companions[0].dimensions.width, 700)
         do {
             _ = try await PanoramaStitcher.process(files: [[files[0]]], labels: ["Main"], direction: .right, cancellation: NightWorkCancellation())
             XCTFail("A single frame must not be labeled a panorama")
