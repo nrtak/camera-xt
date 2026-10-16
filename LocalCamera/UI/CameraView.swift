@@ -93,12 +93,12 @@ struct CameraView: View {
                             }
                         }
                     }
-                    .padding(.top, 52).padding(.bottom, landscape ? 125 : 185)
+                    .padding(.top, 52).padding(.bottom, captureControlsHeight + 8)
                     .allowsHitTesting(!panelOpen)
                     .accessibilityHidden(panelOpen)
                 } else {
                     GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: false, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen)
-                        .ignoresSafeArea()
+                        .padding(.top, 52).padding(.bottom, captureControlsHeight + 8)
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
                         .allowsHitTesting(!panelOpen)
@@ -542,19 +542,42 @@ struct CameraView: View {
             }.frame(minHeight: 44)
             modeLayout {
                 ForEach(0..<3) { index in
-                    let selected = model.mode == .video ? index == 2 : index == (model.camera.dualEnabled ? 1 : 0)
+                    let selected = model.mode == .video ? index == 2 : index == (model.captureStyle == "Panorama" ? 1 : 0)
                     Button { showsCaptureInfo = false; showsRecent = false; model.chooseCaptureMode(index) } label: {
-                        Text(["PHOTO", "DUAL PHOTO", "VIDEO"][index])
+                        Text(["PHOTO", "PANORAMA", "VIDEO"][index])
                             .font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
                             .frame(minWidth: 70, minHeight: 44)
                             .foregroundStyle(selected ? selection : .white)
                     }.buttonStyle(.plain)
                         .accessibilityAddTraits(selected ? .isSelected : [])
-                        .disabled(!model.canConfigure || (index == 1 && !model.camera.dualAvailable))
+                        .disabled(!model.canConfigure)
                 }
             }
-            .padding(.horizontal, 8).padding(.vertical, 3)
-            .background(Color.black.opacity(0.88), in: RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal, 8)
+            if model.mode == .photo {
+                HStack(spacing: 12) {
+                    ForEach([false, true], id: \.self) { dual in
+                        let selected = model.camera.dualEnabled == dual
+                        Button { model.setDualEnabled(dual) } label: {
+                            Text(dual ? "Dual" : "Single")
+                                .font(.caption.weight(.semibold))
+                                .frame(minWidth: 60, minHeight: 44)
+                                .foregroundStyle(selected ? selection : .white)
+                                .background(selected ? selection.opacity(0.15) : .clear, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                        .disabled(!model.canConfigure || panelOpen || (dual && !model.camera.dualAvailable))
+                    }
+                    if model.captureStyle == "Panorama" {
+                        Button { openTool(.panorama) } label: {
+                            Text(model.panoramaMethod.rawValue)
+                                .font(.caption.weight(.semibold)).frame(minWidth: 60, minHeight: 44)
+                        }.disabled(!model.canConfigure || panelOpen)
+                            .accessibilityLabel("Panorama method: " + model.panoramaMethod.rawValue)
+                    }
+                }
+            }
 
             HStack {
                 Button {
@@ -620,8 +643,9 @@ struct CameraView: View {
             .frame(minWidth: landscape ? 200 : nil)
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 18).padding(.top, 6).padding(.bottom, 8)
+        .padding(.horizontal, 18).padding(.top, 10).padding(.bottom, 8)
         .frame(maxWidth: .infinity)
+        .background(Color.black.ignoresSafeArea(edges: .bottom))
         .overlay(alignment: .top) {
             if showsZoom && !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
                 zoomSlider.fixedSize(horizontal: false, vertical: true)
