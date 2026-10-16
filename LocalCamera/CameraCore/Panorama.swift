@@ -110,6 +110,48 @@ final class PanoramaStitcher {
         }
     }
 
+    static func checkOverlap(previous: [URL], next: [Data], direction: PanoramaDirection,
+                             cancellation: NightWorkCancellation) async throws -> Bool {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result {
+                    guard !previous.isEmpty, previous.count == next.count else { return false }
+                    let stitcher = PanoramaStitcher(direction: direction)
+                    defer { stitcher.context.clearCaches() }
+                    for (file, data) in zip(previous, next) {
+                        if cancellation.cancelled { throw CancellationError() }
+                        let accepted: Bool = try autoreleasepool {
+                            let reference = try PhotoEditRenderer.decode(Data(contentsOf: file), maximum: 512)
+                            let image = try PhotoEditRenderer.decode(data, maximum: 512)
+                            do {
+                                _ = try stitcher.translation(image, reference: reference)
+                                return true
+                            } catch PanoramaFailure.alignment { return false }
+                            catch PanoramaFailure.stationary { return false }
+                            catch PanoramaFailure.changedCamera { return false }
+                        }
+                        if !accepted { return false }
+                    }
+                    return true
+                })
+            }
+        }
+    }
+
+    private func translation(_ small: CIImage, reference: CIImage) throws -> CGAffineTransform {
+        guard small.extent == reference.extent else { throw PanoramaFailure.changedCamera }
+        let request = VNTranslationalImageRegistrationRequest(targetedCIImage: small, options: [:])
+        try VNImageRequestHandler(ciImage: reference, options: [:]).perform([request])
+        guard let result = request.results?.first, result.confidence >= 0.3 else { throw PanoramaFailure.alignment }
+        let proposed = result.alignmentTransform
+        guard proposed.tx.isFinite, proposed.ty.isFinite else { throw PanoramaFailure.alignment }
+        if abs(proposed.tx) < small.extent.width * 0.015 && abs(proposed.ty) < small.extent.height * 0.02 { throw PanoramaFailure.stationary }
+        let scored = [proposed, proposed.inverted()].map { ($0, error(small, reference: reference, transform: $0)) }
+        guard let best = scored.min(by: { $0.1 < $1.1 }), best.1 < 0.12,
+              PanoramaPolicy.accepts(best.0, size: small.extent.size, direction: direction) else { throw PanoramaFailure.alignment }
+        return best.0
+    }
+
     private func append(_ data: Data, label: String) throws {
         let image = try PhotoEditRenderer.decode(data, maximum: PanoramaPolicy.sourceDimension)
         let small = try PhotoEditRenderer.decode(data, maximum: 512)
@@ -122,19 +164,9 @@ final class PanoramaStitcher {
     }
 
     private func extend(_ strip: Strip, image: CIImage, small: CIImage) throws -> Strip {
-        guard small.extent == strip.previous.extent else { throw PanoramaFailure.changedCamera }
-        let request = VNTranslationalImageRegistrationRequest(targetedCIImage: small, options: [:])
-        try VNImageRequestHandler(ciImage: strip.previous, options: [:]).perform([request])
-        guard let result = request.results?.first, result.confidence >= 0.3 else { throw PanoramaFailure.alignment }
-        let proposed = result.alignmentTransform
-        guard proposed.tx.isFinite, proposed.ty.isFinite else { throw PanoramaFailure.alignment }
-        if abs(proposed.tx) < small.extent.width * 0.015 && abs(proposed.ty) < small.extent.height * 0.02 { throw PanoramaFailure.stationary }
-        let candidates = [proposed, proposed.inverted()]
-        let scored = candidates.map { ($0, error(small, reference: strip.previous, transform: $0)) }
-        guard let best = scored.min(by: { $0.1 < $1.1 }), best.1 < 0.12,
-              PanoramaPolicy.accepts(best.0, size: small.extent.size, direction: direction) else { throw PanoramaFailure.alignment }
+        let offset = try translation(small, reference: strip.previous)
         let scale = image.extent.width / small.extent.width
-        let origin = CGPoint(x: strip.origin.x + best.0.tx * scale, y: strip.origin.y + best.0.ty * scale)
+        let origin = CGPoint(x: strip.origin.x + offset.tx * scale, y: strip.origin.y + offset.ty * scale)
         let moved = image.transformed(by: CGAffineTransform(translationX: origin.x, y: origin.y))
         let union = strip.bounds.union(moved.extent).integral
         guard union.width <= CGFloat(PanoramaPolicy.maximumDimension), union.height <= CGFloat(PanoramaPolicy.sourceDimension) * 1.3,
@@ -181,5 +213,47 @@ final class PanoramaStitcher {
         photo.lensLabel = strip.label + " · Panorama"
         photo.warning = "Panorama beta · \(strip.frames) frames · \(cg.width) × \(cg.height). Moving subjects and close foregrounds may show seams."
         return photo
+    }
+}
+
+
+// File operations never run on the UI actor.
+enum PanoramaFileStore {
+    private static let queue = DispatchQueue(label: "CameraXT.panoramaFiles", qos: .userInitiated, autoreleaseFrequency: .workItem)
+    static func write(_ photos: [Data], directory: URL, frame: Int) async throws -> [URL] {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    return try photos.enumerated().map { index, data in
+                        let file = directory.appendingPathComponent("\(index)-\(frame).image")
+                        try data.write(to: file, options: .atomic)
+                        return file
+                    }
+                })
+            }
+        }
+    }
+    static func thumbnail(_ data: Data) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result {
+                    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                          let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                            kCGImageSourceCreateThumbnailFromImageAlways: true,
+                            kCGImageSourceCreateThumbnailWithTransform: true,
+                            kCGImageSourceThumbnailMaxPixelSize: 240
+                          ] as CFDictionary) else { throw PhotoEditError.render }
+                    let output = NSMutableData()
+                    guard let destination = CGImageDestinationCreateWithData(output, UTType.jpeg.identifier as CFString, 1, nil) else { throw PhotoEditError.render }
+                    CGImageDestinationAddImage(destination, image, nil)
+                    guard CGImageDestinationFinalize(destination) else { throw PhotoEditError.render }
+                    return output as Data
+                })
+            }
+        }
+    }
+    static func remove(_ directory: URL) {
+        queue.async { try? FileManager.default.removeItem(at: directory) }
     }
 }
