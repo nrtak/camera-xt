@@ -22,7 +22,10 @@ final class CaptureStoreTests: XCTestCase {
         let scene = UIGraphicsImageRenderer(size: CGSize(width: 800, height: 384), format: format).image { context in
             for y in stride(from: 0, to: 384, by: 8) {
                 for x in stride(from: 0, to: 800, by: 8) {
-                    let value = CGFloat((x * 73 + y * 137 + x * y * 11) % 251) / 251
+                    let horizontal: Int = x * 73
+                    let vertical: Int = y * 137
+                    let mixed: Int = x * y * 11
+                    let value: CGFloat = CGFloat((horizontal + vertical + mixed) % 251) / 251.0
                     UIColor(hue: value, saturation: 0.65, brightness: 0.3 + 0.7 * value, alpha: 1).setFill()
                     context.fill(CGRect(x: x, y: y, width: 8, height: 8))
                 }
