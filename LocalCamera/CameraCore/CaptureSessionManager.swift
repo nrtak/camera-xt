@@ -323,13 +323,13 @@ final class CaptureSessionManager {
         }
     }
 
-    func capture(speed: Bool = false, night: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+    func capture(speed: Bool = false, night: Bool = false, panorama: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         queue.async {
             let orientation = self.burstRunning ? self.sequenceOrientation : self.interfaceOrientation
             if self.snapshot.dualEnabled {
                 self.dual.setOrientation(orientation)
                 self.dual.onProgress = self.onCaptureProgress
-                self.dual.capture(night: night) { [weak self] result in
+                self.dual.capture(night: night, panorama: panorama) { [weak self] result in
                     if let self, self.pendingMemoryFallback {
                         self.pendingMemoryFallback = false
                         self.setDualEnabled(false, reason: "Memory is low · returned to Single Photo. Your capture can still be saved.")
@@ -347,7 +347,7 @@ final class CaptureSessionManager {
             }
             let codec: AVVideoCodecType = self.output.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
-            if night {
+            if night || panorama {
                 guard let device = self.input?.device,
                       let size = NightCapturePolicy.photoSize(device.activeFormat.supportedMaxPhotoDimensions,
                                                              maximum: self.output.maxPhotoDimensions) else {
@@ -355,10 +355,10 @@ final class CaptureSessionManager {
                 }
                 settings.maxPhotoDimensions = size
             } else { settings.maxPhotoDimensions = self.output.maxPhotoDimensions }
-            settings.photoQualityPrioritization = night ? .quality : speed || self.input?.device.exposureMode == .custom ? .speed : .quality
-            settings.isDepthDataDeliveryEnabled = !night && self.snapshot.depthEnabled && self.output.isDepthDataDeliveryEnabled
+            settings.photoQualityPrioritization = panorama ? .speed : night ? .quality : speed || self.input?.device.exposureMode == .custom ? .speed : .quality
+            settings.isDepthDataDeliveryEnabled = !night && !panorama && self.snapshot.depthEnabled && self.output.isDepthDataDeliveryEnabled
             settings.embedsDepthDataInPhoto = settings.isDepthDataDeliveryEnabled
-            if !night && self.input?.device.isFlashAvailable == true && self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
+            if !night && !panorama && self.input?.device.isFlashAvailable == true && self.output.supportedFlashModes.contains(self.controls.flash) { settings.flashMode = self.controls.flash }
             let lensLabel = self.snapshot.lenses.first(where: { $0.id == self.snapshot.selectedID })?.name ?? "Camera"
             let processor = PhotoCaptureProcessor(expectsDepth: settings.isDepthDataDeliveryEnabled) { [weak self] result in
                 guard let self = self else { return }
@@ -977,6 +977,16 @@ final class CaptureSessionManager {
         snapshot.flashAvailable = device.hasFlash && device.isFlashAvailable
     }
 
+    func beginPanorama(_ completion: @escaping (Bool) -> Void) {
+        queue.async {
+            guard !self.burstRunning, self.processor == nil, !self.dual.busy,
+                  !self.snapshot.videoMode, self.snapshot.running, self.wantsRunning else { completion(false); return }
+            self.sequenceOrientation = self.interfaceOrientation
+            self.burstRunning = true
+            completion(true)
+        }
+    }
+
     func beginLongExposure(_ completion: @escaping (Bool) -> Void) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, !self.snapshot.dualEnabled,
@@ -1172,7 +1182,8 @@ private final class DualPhotoCamera {
     private(set) var busy = false
     private var mode: DualShotMode = .fast
     private var nightCapture = false
-    private var captureMode: DualShotMode { nightCapture ? .detail : mode }
+    private var panoramaCapture = false
+    private var captureMode: DualShotMode { panoramaCapture ? .fast : nightCapture ? .detail : mode }
     var onProgress: ((String) -> Void)?
     private var cancelRemaining = false
     private(set) var resolution = "—"
@@ -1277,7 +1288,7 @@ private final class DualPhotoCamera {
         originals.removeAll()
     }
 
-    func capture(night: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+    func capture(night: Bool = false, panorama: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         guard session.isRunning, !session.isInterrupted, !busy, outputs.count == 2 else {
             completion(.failure(CameraFailure.unavailable)); return
         }
@@ -1290,6 +1301,7 @@ private final class DualPhotoCamera {
             completion(.failure(Failure.overloaded)); return
         }
         nightCapture = night
+        panoramaCapture = panorama
         var requests: [AVCapturePhotoSettings] = []
         for (index, output) in outputs.enumerated() {
             let device = inputs[index].device
@@ -1300,14 +1312,14 @@ private final class DualPhotoCamera {
                 completion(.failure(Failure.unsupported)); return
             }
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
-            if night {
+            if night || panorama {
                 guard let size = NightCapturePolicy.photoSize(device.activeFormat.supportedMaxPhotoDimensions,
                                                              maximum: output.maxPhotoDimensions) else {
                     completion(.failure(Failure.unsupported)); return
                 }
                 settings.maxPhotoDimensions = size
             } else { settings.maxPhotoDimensions = output.maxPhotoDimensions }
-            settings.photoQualityPrioritization = night ? output.maxPhotoQualityPrioritization : captureMode == .detail ? .quality : .speed
+            settings.photoQualityPrioritization = panorama ? .speed : night ? output.maxPhotoQualityPrioritization : captureMode == .detail ? .quality : .speed
             requests.append(settings)
         }
         results.removeAll()
