@@ -46,8 +46,7 @@ struct CameraView: View {
     @AppStorage("camera.dualCorner") private var dualCorner = 3
     @AppStorage("camera.showHelp") private var showHelp = false
     @State private var showsRecent = false
-    @State private var showsEditor = false
-    @State private var editorPhotos: [Data] = []
+    @State private var captureControlsHeight: CGFloat = 205
     @State private var selectedDualIndex = 0
     private var panelOpen: Bool { showsCaptureInfo || showsRecent || model.reviewingBurst }
     private var enlargedDualIndex: Int? {
@@ -122,9 +121,7 @@ struct CameraView: View {
                 GeometryReader { geometry in
                     Group {
                         if showsRecent, let recent = model.recent {
-                            RecentCaptureView(record: recent, close: { showsRecent = false }, edit: { photos in
-                                editorPhotos = photos; model.setPhotoEditorActive(true); showsEditor = true
-                            })
+                            RecentCaptureView(record: recent, close: { showsRecent = false })
                                 .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
                         } else if model.reviewingBurst {
                             BurstReview(model: model)
@@ -132,24 +129,34 @@ struct CameraView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                         } else { captureInfo }
                     }
-                        .frame(height: min(geometry.size.height * (toolPath.isEmpty ? 0.96 : 0.82), toolPanelHeight))
+                        .frame(height: min(max(0, geometry.size.height), toolPanelHeight))
                         .contentShape(Rectangle())
                         .background { Rectangle().fill(Color.clear).contentShape(Rectangle()).onTapGesture {} }
                         .frame(maxHeight: .infinity, alignment: .bottom)
                 }
                 .padding(.horizontal, 10)
-                .padding(.bottom, landscape ? 125 : 205)
+                .padding(.top, 8)
+                .padding(.bottom, captureControlsHeight + 8)
             }
         }
         .overlay(alignment: .top) {
             if !panelOpen { captureStatus.fixedSize(horizontal: false, vertical: true).padding(.top, 60) }
         }
         .overlay(alignment: .top) {
-            captureHUD.background(Color.black.opacity(0.25).ignoresSafeArea(edges: .top))
+            if !panelOpen {
+                captureHUD.background(Color.black.opacity(0.25).ignoresSafeArea(edges: .top))
+            }
         }
-        .overlay(alignment: .bottom) { captureControls(landscape: landscape) }
-        .fullScreenCover(isPresented: $showsEditor, onDismiss: { editorPhotos = []; model.setPhotoEditorActive(false); model.setActive(scenePhase == .active) }) {
-            PhotoEditorView(initialPhotos: editorPhotos)
+        .overlay(alignment: .bottom) {
+            captureControls(landscape: landscape)
+                .background {
+                    GeometryReader { geometry in
+                        Color.clear.preference(key: CaptureControlsHeightKey.self, value: geometry.size.height)
+                    }
+                }
+        }
+        .onPreferenceChange(CaptureControlsHeightKey.self) { height in
+            if height.isFinite && height > 0 { captureControlsHeight = height }
         }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsZoom = false; zoomDismissTask?.cancel() }
         .onChange(of: panelOpen) { _, open in
@@ -579,7 +586,7 @@ struct CameraView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .accessibilityLabel("Switch front and rear camera")
-                .disabled(!model.canSwitch || !model.camera.lenses.contains { $0.isFront != model.selectedLens?.isFront })
+                .disabled(panelOpen || !model.canSwitch || !model.camera.lenses.contains { $0.isFront != model.selectedLens?.isFront })
             }
             .frame(minWidth: landscape ? 200 : nil)
             .buttonStyle(.plain)
@@ -606,7 +613,7 @@ struct CameraView: View {
         if showsRecent || model.reviewingBurst || textSize.isAccessibilitySize { return .infinity }
         let base: CGFloat
         switch toolPath.last {
-        case nil: return (advancedTools ? 740 : 540) + (hasAdjustments ? 44 : 0)
+        case nil: return (advancedTools ? 650 : 470) + (hasAdjustments ? 44 : 0)
         case .shoot: base = model.camera.dualEnabled ? 370 : 350
         case .preferences:
             base = preferencesSection == 0 ? 320 : preferencesSection == 1 ? (showQuickControls && quickAccess ? 510 : 360) : 450
@@ -627,6 +634,7 @@ struct CameraView: View {
                     }.accessibilityLabel("Back")
                 }
                 Text(toolPath.last?.rawValue ?? "Camera controls").font(.headline)
+                    .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
                 Spacer()
                 Button { showHelp.toggle() } label: {
                     Image(systemName: showHelp ? "info.circle.fill" : "info.circle").frame(width: 44, height: 44)
@@ -634,7 +642,7 @@ struct CameraView: View {
                 Button { showsCaptureInfo = false } label: {
                     Image(systemName: "xmark").frame(width: 44, height: 44)
                 }.accessibilityLabel("Close camera tools")
-            }.padding(.horizontal, 12)
+            }.padding(.horizontal, 12).fixedSize(horizontal: false, vertical: true)
             if let page = toolPath.last {
                 toolPage(page)
             } else {
@@ -667,9 +675,6 @@ struct CameraView: View {
                         if hasAdjustments { Button("Reset to Auto") { useTool(.automatic) }.frame(minHeight: 44) }
                     }
                     Divider()
-                    Button {
-                        editorPhotos = []; model.setPhotoEditorActive(true); showsEditor = true
-                    } label: { Label("Edit a photo", systemImage: "slider.horizontal.3").frame(minHeight: 44) }
                     Button { toolPath.append(.preferences) } label: {
                         HStack {
                             Image(systemName: "gearshape")
@@ -1336,7 +1341,6 @@ private struct CameraDesignDetail: View {
 private struct RecentCaptureView: View {
     let record: CaptureStore.Record
     let close: () -> Void
-    let edit: ([Data]) -> Void
     @Environment(\.openURL) private var openURL
     @State private var selection = 0
     @State private var comparing = true
@@ -1395,14 +1399,6 @@ private struct RecentCaptureView: View {
                 }
                 Text("Pinch or double-tap to inspect. Preview is reduced to protect memory.").font(.caption)
             } else { Text("Open Photos to review this video.") }
-            if !record.isVideo, record.photos.indices.contains(selection) {
-                HStack {
-                    Button("Edit photo") { edit([record.photos[selection].data]) }.frame(minHeight: 44)
-                    if record.photos.count == 2 {
-                        Button("Edit both") { edit(record.photos.map(\.data)) }.frame(minHeight: 44)
-                    }
-                }
-            }
             Button("Open Photos") {
                 if let url = URL(string: "photos-redirect://") { openURL(url) }
             }.frame(minHeight: 44)
@@ -1612,4 +1608,9 @@ private struct LiveHistogram: View {
                 .accessibilityLabel("Live brightness histogram, darkest tones on the left")
         }
     }
+}
+
+private struct CaptureControlsHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
