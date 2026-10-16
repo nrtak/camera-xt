@@ -6,7 +6,7 @@ import ImageIO
 struct CameraPreview: UIViewRepresentable {
     let engine: CaptureSessionManager
     var onFocus: (CGPoint, Bool) -> Void
-    var fillView = true
+    var fillView = false
     var allowsFocus = true
     var secondary = false
     var showsFocusFeedback = true
@@ -36,7 +36,11 @@ struct CameraPreview: UIViewRepresentable {
             if grid.superlayer == nil { layer.addSublayer(grid) }
             if guide.superview == nil { guide.isUserInteractionEnabled = false; guide.contentMode = .scaleAspectFit; addSubview(guide) }
             let frame = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-            guard PreviewGeometry.isValid(frame), gridFrame != frame else { return }
+            guard PreviewGeometry.isValid(frame) else {
+                grid.path = nil; guide.frame = .zero; gridFrame = .null
+                return
+            }
+            guard gridFrame != frame else { return }
             gridFrame = frame
             guide.frame = frame
             let path = UIBezierPath()
@@ -70,7 +74,9 @@ struct CameraPreview: UIViewRepresentable {
             guard showsFocusFeedback else { return }
             onFocus(devicePoint, locked)
             marker?.removeFromSuperview()
-            let marker = UILabel(frame: CGRect(x: min(max(0, point.x - 32), max(0, view.bounds.width - 64)), y: min(max(0, point.y - 32), max(0, view.bounds.height - 64)), width: 64, height: 64))
+            let visibleFrame = videoRect.intersection(view.bounds)
+            guard let markerFrame = PreviewGeometry.focusRect(at: point, in: visibleFrame) else { return }
+            let marker = UILabel(frame: markerFrame)
             marker.text = exposureOnly ? "EV" : nil
             marker.font = .preferredFont(forTextStyle: .caption2)
             marker.textAlignment = .center; marker.textColor = .white
@@ -123,6 +129,14 @@ struct CameraPreview: UIViewRepresentable {
 
 /// Reject transient invalid camera geometry before assigning CALayer/UIView frames.
 enum PreviewGeometry {
+    static func focusRect(at point: CGPoint, in frame: CGRect) -> CGRect? {
+        guard isValid(frame), point.x.isFinite, point.y.isFinite, frame.contains(point) else { return nil }
+        let width = min(64, frame.width), height = min(64, frame.height)
+        return CGRect(x: min(max(frame.minX, point.x - width / 2), frame.maxX - width),
+                      y: min(max(frame.minY, point.y - height / 2), frame.maxY - height),
+                      width: width, height: height)
+    }
+
     static func isValid(_ rect: CGRect) -> Bool {
         !rect.isNull && !rect.isInfinite && !rect.isEmpty &&
         rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite &&
