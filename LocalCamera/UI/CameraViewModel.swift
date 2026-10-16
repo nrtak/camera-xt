@@ -294,7 +294,7 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var burstPreviews: [UIImage] = []
     @Published var selectedBurstIndex = 0
     @Published private(set) var recommendedBurstIndex = 0
-    var hasPendingCapture: Bool { restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
+    var hasPendingCapture: Bool { panoramaRecovery != nil || restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
     var canShutter: Bool { panoramaRunning ? (active && !panoramaTakingPhoto && !finishPanoramaRequested) : camera.recording ? !busy : (camera.running && !busy && !configuring && preparingMode == nil && !hasPendingCapture && !resetOnReturn) }
 
     var videoButtonTitle: String {
@@ -362,6 +362,7 @@ final class CameraViewModel: ObservableObject {
             else if !panoramaTakingPhoto && !finishPanoramaRequested {
                 panoramaTakingPhoto = true
                 panoramaPhotoRequested = true
+                panoramaWake?.yield(())
             }
             return
         }
@@ -588,7 +589,7 @@ final class CameraViewModel: ObservableObject {
         engine.setDepthEnabled(false)
     }
 
-    func enteredBackground() { saveSetup(); nightWork?.cancel() }
+    func enteredBackground() { saveSetup(); nightWork?.cancel(); panoramaWake?.yield(()) }
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         CameraLaunchPreferences.prepareOnce()
@@ -720,7 +721,7 @@ final class CameraViewModel: ObservableObject {
     func setActive(_ value: Bool) {
         if !value {
             saveSetup()
-            nightWork?.cancel()
+            nightWork?.cancel(); panoramaWake?.yield(())
             controlsTask?.cancel(); controlsTask = nil
             messageTask?.cancel(); messageTask = nil
             if let message, Self.isBriefStatus(message) { self.message = nil }
@@ -855,6 +856,16 @@ final class CameraViewModel: ObservableObject {
         }
     }
 
+    @Published private(set) var panoramaRecovery: PanoramaFileStore.Journal?
+    private var panoramaWake: AsyncStream<Void>.Continuation?
+    private var panoramaUndoRequested = false
+    var canUndoPanorama: Bool { panoramaRunning && panoramaMethod == .stitch && panoramaFrames > 1 && !panoramaTakingPhoto && !finishPanoramaRequested }
+    func undoPanorama() {
+        guard canUndoPanorama else { return }
+        panoramaUndoRequested = true
+        panoramaTakingPhoto = true
+        panoramaWake?.yield(())
+    }
     @Published private(set) var panoramaReference: UIImage?
     @Published var panoramaMethod: PanoramaMethod = .sweep
     @Published private(set) var panoramaTakingPhoto = false
@@ -862,6 +873,7 @@ final class CameraViewModel: ObservableObject {
     func finishPanorama() {
         guard panoramaRunning else { return }
         finishPanoramaRequested = true
+        panoramaWake?.yield(())
     }
     @Published var panoramaDirection: PanoramaDirection = .right
     @Published private(set) var panoramaRunning = false
@@ -870,7 +882,7 @@ final class CameraViewModel: ObservableObject {
     private var finishPanoramaRequested = false
     private let panoramaMotion = CMMotionManager()
     func enablePanorama() {
-        guard canConfigure, mode == .photo else { return }
+        guard canConfigure, mode == .photo, !panoramaSelected else { return }
         controlsTask?.cancel(); controlsTask = nil
         resetTemporarySettings()
         panoramaSelected = true
@@ -884,9 +896,24 @@ final class CameraViewModel: ObservableObject {
         panoramaReference = nil
         panoramaPhotoRequested = true; panoramaTakingPhoto = method == .stitch
         panoramaRunning = true; finishPanoramaRequested = false; panoramaFrames = 0; panoramaElapsed = 0
+        panoramaUndoRequested = false
+        let wake = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        panoramaWake = wake.continuation
         Task { [weak self] in
             guard let self else { return }
-            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("camera-xt-panorama-" + UUID().uuidString, isDirectory: true)
+            let directory = PanoramaFileStore.recoveryDirectory
+            var iterator = wake.stream.makeAsyncIterator()
+            let deadline = Task { @MainActor [weak self] in
+                do { try await Task.sleep(nanoseconds: UInt64(method.maximumSeconds) * 1_000_000_000) }
+                catch { return }
+                self?.finishPanorama()
+            }
+            let memoryObserver = NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { _ in
+                token.cancel(); wake.continuation.yield(())
+            }
+            let thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main) { _ in
+                if token.cancelled { wake.continuation.yield(()) }
+            }
             var original: CapturedPhoto?
             var files = [[URL]](repeating: [], count: paired ? 2 : 1)
             var labels: [String] = []
@@ -894,7 +921,10 @@ final class CameraViewModel: ObservableObject {
             defer {
                 self.panoramaMotion.stopDeviceMotionUpdates()
                 if startedSequence { self.engine.endLongExposure() }
-                PanoramaFileStore.remove(directory)
+                deadline.cancel()
+                NotificationCenter.default.removeObserver(memoryObserver)
+                NotificationCenter.default.removeObserver(thermalObserver)
+                wake.continuation.finish(); self.panoramaWake = nil
                 self.panoramaReference = nil
                 self.panoramaRunning = false; self.panoramaTakingPhoto = false; self.panoramaPhotoRequested = false; self.nightWork = nil
                 if self.active { self.engine.start() }
@@ -912,8 +942,27 @@ final class CameraViewModel: ObservableObject {
                     guard self.active, !token.cancelled else { throw CancellationError() }
                     self.panoramaElapsed = Int(ProcessInfo.processInfo.systemUptime - started)
                     if self.finishPanoramaRequested || self.panoramaElapsed >= method.maximumSeconds { break }
+                    if self.panoramaUndoRequested {
+                        self.panoramaUndoRequested = false
+                        if self.panoramaFrames > 1 {
+                            let removed = files.compactMap { $0.last }
+                            let updated = files.map { Array($0.dropLast()) }
+                            let journal = PanoramaFileStore.Journal(files: updated.map { $0.map(\.lastPathComponent) }, labels: labels, direction: direction.rawValue)
+                            try await PanoramaFileStore.checkpoint(journal)
+                            self.panoramaRecovery = journal
+                            files = updated
+                            PanoramaFileStore.deleteFiles(removed)
+                            self.panoramaFrames -= 1
+                            bytes = try await PanoramaFileStore.byteCount(files.flatMap { $0 })
+                            if let file = files.first?.last, let thumbnail = try? await PanoramaFileStore.thumbnailFile(file) {
+                                self.panoramaReference = UIImage(data: thumbnail)
+                            } else { self.panoramaReference = nil }
+                            self.message = "Last photo removed. Line up with the previous photo and retake."
+                        }
+                        self.panoramaTakingPhoto = false
+                    }
                     if method == .stitch && !self.panoramaPhotoRequested {
-                        try await Task.sleep(nanoseconds: 150_000_000)
+                        _ = await iterator.next()
                         continue
                     }
                     if let motion = self.panoramaMotion.deviceMotion {
@@ -958,10 +1007,14 @@ final class CameraViewModel: ObservableObject {
                     let stored = try await PanoramaFileStore.write(parts.map { $0.data }, directory: directory, frame: self.panoramaFrames)
                     for (index, file) in stored.enumerated() { files[index].append(file) }
                     if method == .stitch {
-                        let thumbnail = try await PanoramaFileStore.thumbnail(photo.data)
-                        self.panoramaReference = UIImage(data: thumbnail)
+                        if let thumbnail = try? await PanoramaFileStore.thumbnail(photo.data) {
+                            self.panoramaReference = UIImage(data: thumbnail)
+                        } else { self.panoramaReference = nil }
                     }
                     if labels.isEmpty { labels = parts.map { $0.lensLabel ?? "Camera" } }
+                    let journal = PanoramaFileStore.Journal(files: files.map { $0.map(\.lastPathComponent) }, labels: labels, direction: direction.rawValue)
+                    try await PanoramaFileStore.checkpoint(journal)
+                    self.panoramaRecovery = journal
                     bytes += added; self.panoramaFrames += 1
                     if method == .stitch {
                         self.panoramaTakingPhoto = false
@@ -975,10 +1028,19 @@ final class CameraViewModel: ObservableObject {
                 self.message = paired ? "Finishing two panoramas, one lens at a time…" : "Finishing panorama…"
                 let result = try await PanoramaStitcher.process(files: files, labels: labels, direction: direction, cancellation: token)
                 self.pendingPhoto = result
+                try await self.store.stage(result)
+                if var journal = self.panoramaRecovery {
+                    journal.readyToSave = true
+                    try await PanoramaFileStore.checkpoint(journal)
+                    self.panoramaRecovery = journal
+                }
                 await self.savePending()
             } catch {
                 self.panoramaRunning = false
-                if var reference = original {
+                if self.panoramaRecovery != nil {
+                    self.busy = false
+                    self.message = "Panorama shots are protected on this iPhone. Retry to finish stitching, or discard the session. Check Photos before retrying an interrupted save."
+                } else if var reference = original {
                     reference.warning = "Panorama could not finish; saved the starting photo\(paired ? " pair" : "") instead. " + error.localizedDescription
                     self.pendingPhoto = reference; await self.savePending()
                 } else { self.busy = false; self.message = error.localizedDescription }
@@ -1020,7 +1082,6 @@ final class CameraViewModel: ObservableObject {
             do {
                 guard await withCheckedContinuation({ continuation in self.engine.beginLongExposure { continuation.resume(returning: $0) } }) else { throw CameraFailure.unavailable }
                 sequenceBegan = true
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let started = ProcessInfo.processInfo.systemUptime
                 while files.count < LongExposureLimits.frameCount && bytes < LongExposureLimits.diskBytes {
                     guard self.active, !work.cancelled else { throw CancellationError() }
@@ -1037,9 +1098,8 @@ final class CameraViewModel: ObservableObject {
                     }
                     guard self.active, !work.cancelled else { throw CancellationError() }
                     guard bytes + photo.data.count <= LongExposureLimits.diskBytes else { break }
-                    let file = directory.appendingPathComponent("\(files.count).image")
-                    try photo.data.write(to: file, options: .atomic)
-                    files.append(file); bytes += photo.data.count
+                    let written = try await PanoramaFileStore.write([photo.data], directory: directory, frame: files.count)
+                    files.append(contentsOf: written); bytes += photo.data.count
                     let interval = max(0, duration / Double(LongExposureLimits.frameCount) - (ProcessInfo.processInfo.systemUptime - frameStart))
                     if interval > 0 { try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000)) }
                 }
@@ -1127,6 +1187,34 @@ final class CameraViewModel: ObservableObject {
     func retrySave() async {
         guard !busy else { return }
         if recoveryReadFailed { restoring = true; await restoreCaptures(); return }
+        if panoramaRecovery?.saved == true {
+            do {
+                try await store.discard()
+                try await PanoramaFileStore.clear()
+                panoramaRecovery = nil; pendingPhoto = nil; pendingVideo = nil; recoveryProtected = false
+                message = "Saved panorama cleanup completed."
+            }
+            catch { message = "Saved to Photos. Could not finish local cleanup." }
+            return
+        }
+        if let journal = panoramaRecovery, !journal.readyToSave {
+            busy = true; captureActivity = .processing
+            let work = NightWorkCancellation(); nightWork = work
+            defer { nightWork = nil; busy = false; if active { engine.start() } }
+            engine.stop()
+            do {
+                let photo = try await PanoramaStitcher.process(files: journal.urls(in: PanoramaFileStore.recoveryDirectory),
+                    labels: journal.labels, direction: PanoramaDirection(rawValue: journal.direction) ?? .right, cancellation: work)
+                pendingPhoto = photo
+                try await store.stage(photo)
+                var updated = journal; updated.readyToSave = true
+                try await PanoramaFileStore.checkpoint(updated)
+                panoramaRecovery = updated
+            } catch {
+                message = "Could not finish the panorama. Your accepted shots are still protected. " + error.localizedDescription
+                return
+            }
+        }
         await savePending()
     }
 
@@ -1165,12 +1253,23 @@ final class CameraViewModel: ObservableObject {
             lastSaveMilliseconds = Int((ProcessInfo.processInfo.systemUptime - saveStarted) * 1000)
             // Photos has committed. Cache failures must never offer an automatic duplicate save.
             pendingPhoto = nil; pendingVideo = nil
+            if var journal = panoramaRecovery {
+                journal.saved = true
+                panoramaRecovery = journal
+                try? await PanoramaFileStore.checkpoint(journal)
+            }
+            var localSaveCompleted = false
             do {
                 recent = try await store.finish(thumbnail: thumbnail)
+                localSaveCompleted = true
                 await updateRecentThumbnail()
                 message = savedMessage
             } catch {
                 message = "Saved to Photos, but local history could not be updated."
+            }
+            if panoramaRecovery != nil && localSaveCompleted {
+                do { try await PanoramaFileStore.clear(); panoramaRecovery = nil }
+                catch { message = "Saved to Photos. Local panorama cleanup is pending; restart the app before another capture." }
             }
             recoveryProtected = false
             if haptics { UINotificationFeedbackGenerator().notificationOccurred(.success) }
@@ -1187,14 +1286,34 @@ final class CameraViewModel: ObservableObject {
         await updateRecentThumbnail()
         do {
             recoveryReadFailed = false
+            panoramaRecovery = try await PanoramaFileStore.load()
+            if panoramaRecovery?.saved == true {
+                try await store.discard()
+                try await PanoramaFileStore.clear()
+                panoramaRecovery = nil; pendingPhoto = nil; pendingVideo = nil; recoveryProtected = false
+                message = "Panorama already saved to Photos."
+                return
+            }
+            if panoramaRecovery == nil { try await PanoramaFileStore.clear() }
             if let record = try await store.load("pending.plist") {
-                if record.saved { try await store.discard() }
+                if record.saved {
+                    try await store.discard()
+                    if panoramaRecovery != nil { try await PanoramaFileStore.clear(); panoramaRecovery = nil }
+                }
                 else {
                     pendingPhoto = record.captured
                     if record.isVideo { pendingVideo = try await store.videoURL() }
                     recoveryProtected = true
                     message = "Recovered an unfinished save. Check Photos before retrying to avoid a duplicate."
                 }
+            }
+            if let journal = panoramaRecovery {
+                if journal.readyToSave && pendingPhoto == nil {
+                    var updated = journal; updated.readyToSave = false
+                    panoramaRecovery = updated
+                }
+                recoveryProtected = true
+                message = "Recovered panorama shots. Retry to finish or discard this session. Check Photos first to avoid duplicates."
             }
         } catch { recoveryReadFailed = true; message = "Capture recovery could not be read. Keep this app installed and free storage before trying again." }
     }
@@ -1229,6 +1348,8 @@ final class CameraViewModel: ObservableObject {
         busy = true
         Task {
             do {
+                try await PanoramaFileStore.clear()
+                panoramaRecovery = nil
                 try await store.discard()
                 pendingPhoto = nil; burstPhotos = []; burstPreviews = []; reviewingBurst = false
                 pendingVideo = nil; recoveryProtected = false; recoveryReadFailed = false
