@@ -24,6 +24,16 @@ enum LongExposureLimits {
 /// Reads a single source frame at a time and materializes each blend to avoid an ever-growing image graph.
 enum LongExposureRenderer {
     private static let queue = DispatchQueue(label: "CameraXT.longExposure", qos: .userInitiated)
+    private static func alignmentError(_ image: CIImage, reference: CIImage, transform: CGAffineTransform, context: CIContext) -> Float {
+        let bounds = reference.extent.insetBy(dx: reference.extent.width * 0.06, dy: reference.extent.height * 0.06)
+        let difference = image.transformed(by: transform).applyingFilter("CIDifferenceBlendMode", parameters: [kCIInputBackgroundImageKey: reference])
+        let mean = difference.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: bounds)])
+        var pixel = [Float](repeating: 0, count: 4)
+        pixel.withUnsafeMutableBytes { context.render(mean, toBitmap: $0.baseAddress!, rowBytes: 16,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!) }
+        return (pixel[0] + pixel[1] + pixel[2]) / 3
+    }
     static func process(_ files: [URL], style: LongExposureStyle, cancellation: NightWorkCancellation) async throws -> CapturedPhoto {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
@@ -49,7 +59,11 @@ enum LongExposureRenderer {
                                     let request = VNTranslationalImageRegistrationRequest(targetedCIImage: small, options: [:])
                                     try VNImageRequestHandler(ciImage: smallBase, options: [:]).perform([request])
                                     guard let observation = request.results?.first, observation.confidence >= 0.5 else { return nil }
-                                    let t = observation.alignmentTransform
+                                    let proposed = observation.alignmentTransform
+                                    guard proposed.tx.isFinite, proposed.ty.isFinite else { return nil }
+                                    guard let t = [proposed, proposed.inverted()].min(by: {
+                                        alignmentError(small, reference: smallBase, transform: $0, context: context) < alignmentError(small, reference: smallBase, transform: $1, context: context)
+                                    }), alignmentError(small, reference: smallBase, transform: t, context: context) < 0.12 else { return nil }
                                     guard t.tx.isFinite, t.ty.isFinite, abs(t.tx) < small.extent.width * 0.03,
                                           abs(t.ty) < small.extent.height * 0.03 else { return nil }
                                     let scale = bounds.width / small.extent.width
@@ -76,7 +90,7 @@ enum LongExposureRenderer {
                                                                     kCGImagePropertyOrientation: 1] as CFDictionary)
                         guard CGImageDestinationFinalize(destination) else { throw PhotoEditError.render }
                         var photo = CapturedPhoto(data: data as Data, dimensions: CMVideoDimensions(width: Int32(cg.width), height: Int32(cg.height)))
-                        photo.lensLabel = "\(style.rawValue) · \(accepted) frames"
+                        photo.lensLabel = "\(style.rawValue) Ã‚Â· \(accepted) frames"
                         photo.warning = "Combined \(accepted) of \(files.count) frames. Reference original saved separately."
                         return photo
                     }
