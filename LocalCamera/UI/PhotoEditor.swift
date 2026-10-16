@@ -27,7 +27,7 @@ enum PhotoEditError: LocalizedError {
 
 /// Serial rendering bounds concurrent image buffers; adjustment history contains no bitmaps.
 enum PhotoEditRenderer {
-    private static let queue = DispatchQueue(label: "CameraXT.editor", qos: .userInitiated)
+    private static let queue = PhotoProcessingScheduler.queue
     private static let context = CIContext(options: [.cacheIntermediates: false])
     static func render(_ data: Data, edits: PhotoAdjustments, preview: Bool, cancellation: NightWorkCancellation) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
