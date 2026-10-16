@@ -4,6 +4,16 @@ import ImageIO
 import UniformTypeIdentifiers
 import Vision
 
+enum PanoramaMethod: String, CaseIterable {
+    case sweep = "Sweep", stitch = "Stitch"
+    var maximumSeconds: Int { self == .sweep ? 45 : 180 }
+    var instructions: String {
+        self == .sweep
+            ? "Move slowly in the arrow direction. Tap the shutter again to finish."
+            : "Take overlapping photos in the arrow direction, keeping at least two-thirds of the scene shared. Tap Finish to combine them."
+    }
+}
+
 enum PanoramaDirection: String, CaseIterable {
     case right = "Right", left = "Left"
     var sign: CGFloat { self == .right ? 1 : -1 }
