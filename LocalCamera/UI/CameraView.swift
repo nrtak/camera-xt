@@ -275,6 +275,25 @@ struct CameraView: View {
                 }.padding(10).background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityElement(children: .combine)
             }
+            if model.mode == .photo && model.captureStyle == "Panorama" {
+                VStack(spacing: 4) {
+                    HStack {
+                        Image(systemName: model.panoramaDirection.symbol)
+                        Text(model.camera.dualEnabled ? "DUAL PANORAMA" : "PANORAMA").fontWeight(.semibold)
+                        Spacer()
+                        if !model.busy {
+                            Button("Reverse") { model.panoramaDirection = model.panoramaDirection == .right ? .left : .right }
+                                .frame(minHeight: 44)
+                            Button("Off") { model.disablePanorama() }.frame(minHeight: 44)
+                        }
+                    }
+                    Text(model.message ?? "Tap the shutter and sweep slowly. Tap again to finish.")
+                        .font(.caption).fixedSize(horizontal: false, vertical: true)
+                    if model.panoramaRunning {
+                        Text("\(model.panoramaFrames) frames · \(model.panoramaElapsed)s / 45s").font(.caption.monospacedDigit())
+                    }
+                }.font(.caption).padding(10).background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 10))
+            }
             if model.longExposureRunning {
                 Button("Finish sequence early") { model.finishLongExposure() }
                     .font(.callout.weight(.semibold)).padding(10)
@@ -287,7 +306,7 @@ struct CameraView: View {
             VStack(spacing: 6) {
                 if model.lowStorage { Text("Low storage · free space before recording").font(.caption) }
                 if model.camera.cooling { Text("iPhone is warm · processing reduced").font(.caption) }
-                if let message = model.message {
+                if let message = model.message, model.captureStyle != "Panorama" {
                     Label(model.busy ? model.captureActivity.rawValue : message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
                         .font(.callout).accessibilityLabel(message)
                     if model.busy && showHelp { Text(message).font(.caption) }
@@ -527,6 +546,8 @@ struct CameraView: View {
                         .disabled(!model.canConfigure || (index == 1 && !model.camera.dualAvailable))
                 }
             }
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Color.black.opacity(0.88), in: RoundedRectangle(cornerRadius: 10))
 
             HStack {
                 Button {
@@ -561,17 +582,18 @@ struct CameraView: View {
                     ZStack {
                         Circle().fill(model.mode == .video ? Color.red : Color.white)
                         Circle().strokeBorder(Color.black.opacity(0.65), lineWidth: 2).padding(5)
-                        if model.camera.recording { RoundedRectangle(cornerRadius: 4).fill(.white).frame(width: 28, height: 28) }
+                        if model.panoramaRunning { RoundedRectangle(cornerRadius: 4).fill(.black).frame(width: 28, height: 28) }
+                        else if model.camera.recording { RoundedRectangle(cornerRadius: 4).fill(.white).frame(width: 28, height: 28) }
                         else if model.busy || model.configuring { ProgressView().tint(.black) }
                     }
                     .frame(width: 76, height: 76)
                     .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
-                    Text(model.mode == .video ? model.videoButtonTitle : " ")
+                    Text(model.panoramaRunning ? "Finish" : model.mode == .video ? model.videoButtonTitle : " ")
                         .font(.caption.weight(.semibold)).lineLimit(1)
-                        .accessibilityHidden(model.mode != .video)
+                        .accessibilityHidden(model.mode != .video && !model.panoramaRunning)
                     }
                 }
-                .accessibilityLabel(model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
+                .accessibilityLabel(model.panoramaRunning ? "Finish panorama" : model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
                 .accessibilityValue(model.shutterStatus)
                 .disabled(!model.canShutter)
                 .opacity(model.canShutter ? 1 : 0.4)
@@ -613,7 +635,7 @@ struct CameraView: View {
         if showsRecent || model.reviewingBurst || textSize.isAccessibilitySize { return .infinity }
         let base: CGFloat
         switch toolPath.last {
-        case nil: return (advancedTools ? 650 : 470) + (hasAdjustments ? 44 : 0)
+        case nil: return (advancedTools ? 690 : 510) + (hasAdjustments ? 44 : 0)
         case .shoot: base = model.camera.dualEnabled ? 370 : 350
         case .preferences:
             base = preferencesSection == 0 ? 320 : preferencesSection == 1 ? (showQuickControls && quickAccess ? 510 : 360) : 450
@@ -655,6 +677,7 @@ struct CameraView: View {
                             Label("Night", systemImage: "moon")
                         }.frame(minHeight: 44)
                         controlRow("Style", icon: "camera", value: model.camera.dualEnabled ? model.camera.dualMode.rawValue : model.captureStyle) { toolPath.append(.shoot) }
+                        controlRow("Panorama", icon: "pano", value: model.captureStyle == "Panorama" ? "On" : "Off") { toolPath.append(.panorama) }
                         if !model.camera.dualEnabled {
                             controlRow("Long exposure", icon: "sparkles", value: model.captureStyle == "Long Exposure" ? model.longExposureStyle.rawValue : "Off") { toolPath.append(.longExposure) }
                         }
@@ -722,6 +745,18 @@ struct CameraView: View {
     @ViewBuilder private func toolPage(_ page: CameraToolPage) -> some View {
         Group {
             switch page {
+            case .panorama:
+                CompactToolLayout {
+                    Text(model.camera.dualEnabled ? "Two panoramas from one sweep" : "One panorama from a guided sweep").font(.headline)
+                    Picker("Sweep direction", selection: $model.panoramaDirection) {
+                        ForEach(PanoramaDirection.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.segmented)
+                    Text("Tap the shutter, turn slowly in the arrow's direction, then tap again to finish. Keep the phone level and use a still, well-lit scene.")
+                    Text("Beta: saves JPEG panoramas separately for each lens. Capture is limited to 45 seconds or 36 frames; stitching runs one lens at a time afterward. Up to 32 MP per result, depending on sweep and cropping. Not a 360° capture. Moving subjects, close objects and large turns may show seams.").font(.caption)
+                    Text("If stitching fails, the starting photo or pair is saved instead.").font(.caption)
+                    Button("Use panorama") { model.enablePanorama(); showsCaptureInfo = false }
+                        .buttonStyle(.borderedProminent).foregroundStyle(.black).disabled(!model.canConfigure || model.mode != .photo)
+                }
             case .longExposure:
                 CompactToolLayout {
                     Picker("Long exposure style", selection: $model.longExposureStyle) {
@@ -1009,7 +1044,7 @@ private enum CameraToolPage: String, Hashable {
     case shortcuts = "Camera shortcuts", checks = "Device health & testing"
     case guides = "Viewfinder guides"
     case shoot = "Shot styles", focus = "Focus & depth", timer = "Timer", video = "Video quality"
-    case longExposure = "Long exposure", rescue = "Photo Rescue", advanced = "Advanced", preferences = "App settings"
+    case panorama = "Panorama", longExposure = "Long exposure", rescue = "Photo Rescue", advanced = "Advanced", preferences = "App settings"
     case exposure = "Exposure", color = "Color", manualFocus = "Manual focus", details = "Info", gallery = "Design Preview"
     var icon: String {
         switch self {
@@ -1020,6 +1055,7 @@ private enum CameraToolPage: String, Hashable {
         case .focus, .manualFocus: return "viewfinder"
         case .timer: return "timer"
         case .video: return "video"
+        case .panorama: return "pano"
         case .longExposure: return "sparkles"
         case .rescue: return "wand.and.stars"
         case .advanced: return "slider.horizontal.3"
