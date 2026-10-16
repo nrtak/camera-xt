@@ -679,6 +679,9 @@ struct CameraView: View {
 
     @ViewBuilder private var saveRecovery: some View {
         Button(model.panoramaRecovery?.saved == true ? "Finish cleanup" : model.panoramaRecovery?.readyToSave == false ? "Finish panorama" : "Retry save") { Task { await model.retrySave() } }
+        if model.canSavePanoramaPhoto {
+            Button("Save available photo") { Task { await model.saveAvailablePanoramaPhoto() } }
+        }
         Button("Settings", action: openSettings)
         Button("Discard", role: .destructive) { confirmDiscard = true }
     }
