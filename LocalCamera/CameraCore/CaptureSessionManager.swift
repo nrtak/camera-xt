@@ -977,6 +977,17 @@ final class CaptureSessionManager {
         snapshot.flashAvailable = device.hasFlash && device.isFlashAvailable
     }
 
+    func beginLongExposure(_ completion: @escaping (Bool) -> Void) {
+        queue.async {
+            guard !self.burstRunning, self.processor == nil, !self.snapshot.dualEnabled,
+                  !self.snapshot.videoMode, self.session.isRunning, self.wantsRunning else { completion(false); return }
+            self.burstRunning = true
+            self.sequenceOrientation = self.interfaceOrientation
+            completion(true)
+        }
+    }
+    func endLongExposure() { queue.async { self.burstRunning = false } }
+
     func captureNight(cancellation: NightWorkCancellation, completion: @escaping (Result<[CapturedPhoto], Error>) -> Void) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, !self.dual.busy,
