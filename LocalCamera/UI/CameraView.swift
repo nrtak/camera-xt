@@ -281,17 +281,11 @@ struct CameraView: View {
                 }.padding(10).background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityElement(children: .combine)
             }
-            if model.mode == .photo && model.panoramaSelected {
+            if model.mode == .photo && model.panoramaSelected && (model.panoramaRunning || model.message != nil) {
                 VStack(spacing: 4) {
-                    HStack {
-                        Image(systemName: model.panoramaDirection.symbol)
-                        Text(model.camera.dualEnabled ? "DUAL PANORAMA" : "PANORAMA").fontWeight(.semibold)
-                        Spacer()
-                        if !model.busy {
-                            Button("Reverse") { model.panoramaDirection = model.panoramaDirection == .right ? .left : .right }
-                                .frame(minHeight: 44)
-                            Button("Off") { model.disablePanorama() }.frame(minHeight: 44)
-                        }
+                    if model.panoramaRunning {
+                        Label("Move " + model.panoramaDirection.rawValue.lowercased(), systemImage: model.panoramaDirection.symbol)
+                            .fontWeight(.semibold)
                     }
                     Text(model.message ?? model.panoramaMethod.instructions)
                         .font(.caption).fixedSize(horizontal: false, vertical: true)
@@ -302,6 +296,9 @@ struct CameraView: View {
                         }.accessibilityElement(children: .combine)
                     }
                     if model.panoramaRunning {
+                        if model.panoramaMethod == .stitch && model.panoramaFrames < 3 {
+                            Text("At least 3 overlapping photos needed · \(model.panoramaFrames)/3").font(.caption2)
+                        }
                         HStack {
                             Text(model.panoramaMethod == .stitch ? "\(model.panoramaFrames) photos / 36" : "\(model.panoramaFrames) photos · \(model.panoramaElapsed)s / \(model.panoramaMethod.maximumSeconds)s").font(.caption.monospacedDigit())
                             Spacer()
@@ -309,8 +306,14 @@ struct CameraView: View {
                                 Button("Undo") { model.undoPanorama() }
                                     .frame(minWidth: 44, minHeight: 44).disabled(!model.canUndoPanorama)
                                     .accessibilityLabel("Remove last panorama photo")
-                                Button("Finish") { model.finishPanorama() }
-                                    .fontWeight(.semibold).frame(minWidth: 60, minHeight: 44)
+                                if model.panoramaFrames < PanoramaPolicy.minimumFrames {
+                                    Button("Stop") { model.finishPanorama(automatic: true) }
+                                        .frame(minWidth: 60, minHeight: 44)
+                                        .accessibilityLabel("Stop panorama and keep captured photos")
+                                } else {
+                                    Button("Finish") { model.finishPanorama() }
+                                        .fontWeight(.semibold).frame(minWidth: 60, minHeight: 44).disabled(!model.canFinishPanorama)
+                                }
                             }
                         }
                     }
@@ -325,24 +328,26 @@ struct CameraView: View {
                 Text("\(model.countdown)").font(.system(size: 64, weight: .bold))
                     .accessibilityLabel("Shutter in \(model.countdown) seconds")
             }
-            VStack(spacing: 6) {
-                if model.lowStorage { Text("Low storage · free space before recording").font(.caption) }
-                if model.camera.cooling { Text("iPhone is warm · processing reduced").font(.caption) }
-                if let message = model.message, !model.panoramaSelected {
-                    Label(model.busy ? model.captureActivity.rawValue : message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
-                        .font(.callout).accessibilityLabel(message)
-                    if model.busy && showHelp { Text(message).font(.caption) }
+            if model.lowStorage || model.camera.cooling || (!model.panoramaSelected && model.message != nil) || (model.hasPendingCapture && model.canUseRecovery) {
+                VStack(spacing: 6) {
+                    if model.lowStorage { Text("Low storage · free space before recording").font(.caption) }
+                    if model.camera.cooling { Text("iPhone is warm · processing reduced").font(.caption) }
+                    if let message = model.message, !model.panoramaSelected {
+                        Label(model.busy ? model.captureActivity.rawValue : message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
+                            .font(.callout).accessibilityLabel(message)
+                        if model.busy && showHelp { Text(message).font(.caption) }
+                    }
+                    if model.hasPendingCapture && model.canUseRecovery {
+                        ViewThatFits(in: .horizontal) {
+                            HStack { saveRecovery }
+                            VStack { saveRecovery }
+                        }.font(.callout)
+                    }
                 }
-                if model.hasPendingCapture && model.canUseRecovery {
-                    ViewThatFits(in: .horizontal) {
-                        HStack { saveRecovery }
-                        VStack { saveRecovery }
-                    }.font(.callout)
-                }
+                .multilineTextAlignment(.center)
+                .padding(10)
+                .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
             }
-            .multilineTextAlignment(.center)
-            .padding(model.message != nil || model.lowStorage || model.camera.cooling || model.hasPendingCapture ? 10 : 0)
-            .background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
         }
         .padding(.horizontal, 14)
     }
@@ -371,9 +376,11 @@ struct CameraView: View {
                     quickControl("Timer", icon: "timer", value: model.timerSeconds == 0 ? "Off" : "\(model.timerSeconds)s", active: model.timerSeconds > 0) {
                         model.timerSeconds = model.timerSeconds == 0 ? 3 : model.timerSeconds == 3 ? 10 : 0
                     }
-                    quickControl("Night", icon: model.captureStyle == "Night" ? "moon.fill" : "moon", value: model.captureStyle == "Night" ? "On" : "Off", active: model.captureStyle == "Night") {
-                        model.setNightEnabled(model.captureStyle != "Night")
-                    }.disabled(model.panoramaSelected)
+                    if !model.panoramaSelected {
+                        quickControl("Night", icon: model.captureStyle == "Night" ? "moon.fill" : "moon", value: model.captureStyle == "Night" ? "On" : "Off", active: model.captureStyle == "Night") {
+                            model.setNightEnabled(model.captureStyle != "Night")
+                        }
+                    }
                 } else {
                     quickControl("Brightness", icon: "sun.max", value: String(format: "%+.1f EV", model.exposureBias)) { openTool(.exposure) }
                     quickControl("Video quality", icon: "video", value: model.camera.videoLabel) { openTool(.video) }
@@ -479,16 +486,18 @@ struct CameraView: View {
     }
 
     private var zoomChoices: some View {
-        ForEach(ZoomShortcuts.make(model.camera.lenses)) { choice in
-            Button { model.select(choice.lens, zoom: choice.multiplier) } label: {
+        ForEach(ZoomShortcuts.make(model.camera.lenses).filter { choice in
+            model.mode != .video || (choice.value >= zoomState().minimum && choice.value <= zoomState().maximum)
+        }) { choice in
+            Button { model.selectZoom(choice) } label: {
                 Text(choice.value.rounded() == choice.value ? String(format: "%.0f×", choice.value) : zoomText(choice.value))
                     .font(.subheadline.weight(.semibold)).monospacedDigit()
                     .frame(minWidth: 44, minHeight: 44)
-                    .foregroundStyle(choice.lens.id == model.camera.selectedID && abs(zoomState().value - choice.value) < 0.05 ? selection : .white)
+                    .foregroundStyle((model.mode == .video || choice.lens.id == model.camera.selectedID) && abs(zoomState().value - choice.value) < 0.05 ? selection : .white)
             }
-            .highPriorityGesture(zoomButtonGesture { model.select(choice.lens, zoom: choice.multiplier) })
+            .highPriorityGesture(zoomButtonGesture { model.selectZoom(choice) })
             .accessibilityLabel("\(zoomText(choice.value)) zoom")
-            .disabled(!model.canSwitch)
+            .disabled(model.mode == .video ? !model.canConfigure || !model.camera.running : !model.canSwitch)
         }
     }
 

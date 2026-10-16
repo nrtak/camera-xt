@@ -6,6 +6,26 @@ import ImageIO
 import PhotosUI
 import Combine
 
+/// Actions waiting for the same settings update share one camera acknowledgment.
+@MainActor
+final class ControlUpdateWaiters {
+    private var pending: [Int: [(Bool) -> Void]] = [:]
+
+    func begin(revision: Int, completion: ((Bool) -> Void)?) -> Bool {
+        let needsUpdate = pending[revision] == nil
+        if needsUpdate { pending[revision] = [] }
+        if let completion { pending[revision, default: []].append(completion) }
+        return needsUpdate
+    }
+
+    func finish(revision: Int, applied: Bool) {
+        // Remove the batch before callbacks can enqueue more work. All actions in
+        // this batch receive the same result, even when a focus action changes settings.
+        let callbacks = pending.removeValue(forKey: revision) ?? []
+        for callback in callbacks { callback(applied) }
+    }
+}
+
 enum CameraLaunchPreferences {
     static let policyKey = "camera.rememberSetup"
     static let setupKey = "camera.savedSetup"
@@ -230,7 +250,7 @@ final class CameraViewModel: ObservableObject {
             dualBrightness = saved.dualBrightness.count == 2 ? saved.dualBrightness : [0, 0]
             for index in 0..<2 { engine.setExposureBias(dualBrightness[index], dualIndex: index) }
         } else {
-            engine.setControls(controls)
+            applyControls(preserveStyle: true)
             engine.setDepthEnabled(saved.depth)
             if saved.eye { engine.setEyeFocus(true) }
             else { engine.setAnalysis(saved.analysis) }
@@ -307,6 +327,9 @@ final class CameraViewModel: ObservableObject {
     private var timerTask: Task<Void, Never>?
     private var controlsTask: Task<Void, Never>?
     private(set) var controlsNeedApply = false
+    private var controlsRevision = 0
+    private let controlUpdateWaiters = ControlUpdateWaiters()
+    private var controlsRequireFullApply = false
     var controlBinding: Binding<CameraControls> {
         Binding(get: { self.controls }, set: { value in
             guard self.canConfigure else { return }
@@ -318,6 +341,7 @@ final class CameraViewModel: ObservableObject {
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     @Published var controls = CameraControls() {
         didSet {
+            controlsRevision &+= 1
             // Presets supersede delayed edits; user bindings schedule their new value below.
             controlsTask?.cancel(); controlsTask = nil; controlsNeedApply = false
         }
@@ -401,8 +425,14 @@ final class CameraViewModel: ObservableObject {
             return
         }
         guard canShutter else { return }
+        if controlsNeedApply && !camera.recording && !camera.dualEnabled {
+            flushPendingControls { [weak self] applied in
+                guard applied, let self, self.active else { return }
+                self.shutter()
+            }
+            return
+        }
         if haptics { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-        flushPendingControls()
         if camera.recording {
             captureActivity = .processing
             busy = true
@@ -478,8 +508,14 @@ final class CameraViewModel: ObservableObject {
     }
     func focus(at point: CGPoint, locked: Bool) {
         guard camera.running, canConfigure else { return }
-        // Send all pending edits first; focus then overrides only its own settings.
-        flushPendingControls()
+        // Do not change focus until pending edits have actually reached the camera.
+        if controlsNeedApply {
+            flushPendingControls { [weak self] applied in
+                guard applied, let self, self.active else { return }
+                self.focus(at: point, locked: locked)
+            }
+            return
+        }
         if !exposurePointOnly { controls.automaticFocus = true; controls.facePriority = false }
         else { controls.automaticExposure = true }
         engine.focus(at: point, locked: locked, exposureOnly: exposurePointOnly)
@@ -490,17 +526,32 @@ final class CameraViewModel: ObservableObject {
         engine.focus(at: point, locked: locked, dualIndex: index, exposureOnly: exposurePointOnly)
     }
 
-    func flushPendingControls() {
-        guard controlsNeedApply else { return }
+    func flushPendingControls(completion: ((Bool) -> Void)? = nil) {
+        guard controlsNeedApply else { completion?(true); return }
         controlsTask?.cancel(); controlsTask = nil
-        applyControls()
+        applyControls(preserveStyle: true, completion: completion)
     }
 
-    func applyControls() {
-        guard !busy, !configuring, !hasPendingCapture, !camera.dualEnabled else { return }
-        if captureStyle != "Long Exposure" { captureStyle = "Auto" }
-        engine.setControls(controls, changedOnly: controlsNeedApply)
-        controlsNeedApply = false
+    func applyControls(preserveStyle: Bool = false, completion: ((Bool) -> Void)? = nil) {
+        guard !busy, !configuring, !hasPendingCapture, !camera.dualEnabled else { completion?(false); return }
+        if !preserveStyle && captureStyle != "Long Exposure" { captureStyle = "Auto" }
+        let revision = controlsRevision
+        guard controlUpdateWaiters.begin(revision: revision, completion: completion) else { return }
+        if !controlsNeedApply { controlsRequireFullApply = true }
+        let changedOnly = !controlsRequireFullApply
+        controlsNeedApply = true
+        engine.setControls(controls, changedOnly: changedOnly) { [weak self] applied in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.controlsRevision == revision else {
+                    self.controlUpdateWaiters.finish(revision: revision, applied: false)
+                    return
+                }
+                self.controlsNeedApply = !applied
+                if applied { self.controlsRequireFullApply = false }
+                self.controlUpdateWaiters.finish(revision: revision, applied: applied)
+            }
+        }
     }
 
     func scheduleControls() {
@@ -551,7 +602,7 @@ final class CameraViewModel: ObservableObject {
         if !camera.dualEnabled {
             controls = CameraControls()
             exposureBias = 0
-            engine.setControls(controls)
+            applyControls(preserveStyle: true)
             engine.setDepthEnabled(false)
             engine.setAnalysis("Off")
             setEyeFocus(false)
@@ -622,6 +673,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     func resetTemporarySettings() {
+        if panoramaSelected { message = nil; panoramaReference = nil }
         panoramaSelected = false
         timerSeconds = 0
         burstEnabled = false
@@ -679,7 +731,7 @@ final class CameraViewModel: ObservableObject {
                 else { self.adviceCandidate = advice; self.adviceSamples = 1 }
                 if self.adviceSamples >= 3 { self.sceneAdvice = advice }
                 self.restoreSetupIfReady()
-                if self.active && self.controlsNeedApply && self.canConfigure { self.applyControls() }
+                if self.active && self.controlsNeedApply && self.canConfigure { self.applyControls(preserveStyle: true) }
                 if self.resetOnReturn, self.active, self.canConfigure {
                     self.resetOnReturn = false
                     self.resetTemporarySettings()
@@ -752,7 +804,7 @@ final class CameraViewModel: ObservableObject {
         guard !busy, !configuring, !hasPendingCapture else { return }
         if enabled {
             controls.automaticFocus = true
-            engine.setControls(controls)
+            applyControls(preserveStyle: true)
         }
         engine.setEyeFocus(enabled)
     }
@@ -793,7 +845,7 @@ final class CameraViewModel: ObservableObject {
         permission = AVCaptureDevice.authorizationStatus(for: .video)
         if active && permission == .authorized && !editingPhoto && !(nightWork != nil && captureActivity == .processing) {
             engine.start()
-            if controlsNeedApply && canConfigure { applyControls() }
+            if controlsNeedApply && canConfigure { applyControls(preserveStyle: true) }
         } else { engine.stop() }
     }
 
@@ -814,6 +866,14 @@ final class CameraViewModel: ObservableObject {
         requestingPermission = false
         permission = AVCaptureDevice.authorizationStatus(for: .video)
         if active && permission == .authorized { engine.start() }
+    }
+
+    func selectZoom(_ choice: ZoomShortcut) {
+        if mode == .video {
+            guard canConfigure, camera.running, let zoom = camera.zooms.first,
+                  choice.value >= zoom.minimum, choice.value <= zoom.maximum else { return }
+            engine.setZoom(choice.value, deviceID: zoom.deviceID)
+        } else { select(choice.lens, zoom: choice.multiplier) }
     }
 
     func select(_ lens: CameraLens, zoom: Double = 1) {
@@ -916,8 +976,15 @@ final class CameraViewModel: ObservableObject {
     @Published var panoramaMethod: PanoramaMethod = .sweep
     @Published private(set) var panoramaTakingPhoto = false
     private var panoramaPhotoRequested = false
-    func finishPanorama() {
+    var canFinishPanorama: Bool {
+        panoramaRunning && !finishPanoramaRequested && PanoramaPolicy.canFinish(frames: panoramaFrames, takingPhoto: panoramaTakingPhoto)
+    }
+    func finishPanorama(automatic: Bool = false) {
         guard panoramaRunning else { return }
+        if !automatic && panoramaMethod == .stitch && !canFinishPanorama {
+            message = "Take at least 3 overlapping photos before finishing."
+            return
+        }
         finishPanoramaRequested = true
         panoramaWake?.yield(())
     }
@@ -932,7 +999,7 @@ final class CameraViewModel: ObservableObject {
         controlsTask?.cancel(); controlsTask = nil
         resetTemporarySettings()
         panoramaSelected = true
-        message = panoramaMethod.instructions
+        message = nil
     }
     func disablePanorama() { if canConfigure { panoramaSelected = false; panoramaReference = nil; message = nil } }
     private func capturePanorama() {
@@ -952,7 +1019,7 @@ final class CameraViewModel: ObservableObject {
             let deadline = Task { @MainActor [weak self] in
                 do { try await Task.sleep(nanoseconds: UInt64(method.maximumSeconds) * 1_000_000_000) }
                 catch { return }
-                self?.finishPanorama()
+                self?.finishPanorama(automatic: true)
             }
             let memoryObserver = NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { _ in
                 token.cancel(); wake.continuation.yield(())
@@ -964,6 +1031,7 @@ final class CameraViewModel: ObservableObject {
             var files = [[URL]](repeating: [], count: paired ? 2 : 1)
             var labels: [String] = []
             var bytes = 0, startedSequence = false
+            var stopNotice: String?
             defer {
                 self.panoramaMotion.stopDeviceMotionUpdates()
                 if startedSequence { self.engine.endLongExposure() }
@@ -1038,7 +1106,10 @@ final class CameraViewModel: ObservableObject {
                     let parts = [photo] + photo.companions
                     guard parts.count == files.count else { throw PanoramaFailure.changedCamera }
                     let added = parts.reduce(0) { $0 + $1.data.count }
-                    if bytes + added > PanoramaPolicy.maximumDiskBytes { break }
+                    if bytes + added > PanoramaPolicy.maximumDiskBytes {
+                        stopNotice = "Capture stopped at the storage limit; panorama coverage may be shorter than intended."
+                        break
+                    }
                     if method == .stitch && self.panoramaFrames > 0 {
                         let accepted = try await PanoramaStitcher.checkOverlap(
                             previous: files.compactMap { $0.last }, next: parts.map { $0.data },
@@ -1069,10 +1140,19 @@ final class CameraViewModel: ObservableObject {
                     let pause = max(0, 0.45 - (ProcessInfo.processInfo.systemUptime - captureStart))
                     if pause > 0 { try await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000)) }
                 }
+                if stopNotice == nil && (self.panoramaFrames >= PanoramaPolicy.maximumFrames || self.panoramaElapsed >= method.maximumSeconds || (self.finishPanoramaRequested && ProcessInfo.processInfo.systemUptime - started >= Double(method.maximumSeconds))) {
+                    stopNotice = "Capture stopped at the time or photo limit; panorama coverage may be shorter than intended."
+                }
+                if var journal = self.panoramaRecovery, let stopNotice {
+                    journal.stopNotice = stopNotice
+                    try await PanoramaFileStore.checkpoint(journal)
+                    self.panoramaRecovery = journal
+                }
                 self.panoramaRunning = false; self.panoramaMotion.stopDeviceMotionUpdates()
                 self.captureActivity = .processing; self.engine.stop()
                 self.message = paired ? "Finishing two panoramas, one lens at a time…" : "Finishing panorama…"
-                let result = try await PanoramaStitcher.process(files: files, labels: labels, direction: direction, cancellation: token)
+                var result = try await PanoramaStitcher.process(files: files, labels: labels, direction: direction, cancellation: token)
+                if let stopNotice { result.warning = [result.warning, stopNotice].compactMap { $0 }.joined(separator: " ") }
                 self.pendingPhoto = result
                 try await self.store.stage(result)
                 if var journal = self.panoramaRecovery {
@@ -1108,7 +1188,7 @@ final class CameraViewModel: ObservableObject {
         burstEnabled = false
         controls.flash = .off
         engine.setAnalysis("Off"); engine.setEyeFocus(false)
-        engine.setControls(controls)
+        applyControls(preserveStyle: true)
         captureStyle = "Long Exposure"
         message = "Use a tripod. Set focus and exposure before starting."
     }
@@ -1283,8 +1363,9 @@ final class CameraViewModel: ObservableObject {
             defer { nightWork = nil; busy = false; if active { engine.start() } }
             engine.stop()
             do {
-                let photo = try await PanoramaStitcher.process(files: journal.urls(in: PanoramaFileStore.recoveryDirectory),
+                var photo = try await PanoramaStitcher.process(files: journal.urls(in: PanoramaFileStore.recoveryDirectory),
                     labels: journal.labels, direction: PanoramaDirection(rawValue: journal.direction) ?? .right, cancellation: work)
+                if let notice = journal.stopNotice { photo.warning = [photo.warning, notice].compactMap { $0 }.joined(separator: " ") }
                 pendingPhoto = photo
                 try await store.stage(photo)
                 var updated = journal; updated.readyToSave = true
