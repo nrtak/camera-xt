@@ -5,8 +5,14 @@ import UIKit
 
 final class CaptureStoreTests: XCTestCase {
     @MainActor
-    func testPanoramaModeCannotBeReplacedByPhotoStyles() {
+    func testPanoramaModeCannotBeReplacedByPhotoStyles() async throws {
         let model = CameraViewModel()
+        for _ in 0..<200 {
+            if !model.restoring { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(model.restoring, "Recovery loading must complete before testing mode changes")
+        XCTAssertTrue(model.canConfigure)
         model.enablePanorama()
         XCTAssertTrue(model.panoramaSelected)
         model.setNightEnabled(true)
