@@ -4,6 +4,59 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testPanoramaPolicyRejectsReverseFastAndVerticalMovement() {
+        let size = CGSize(width: 512, height: 384)
+        XCTAssertTrue(PanoramaPolicy.accepts(CGAffineTransform(translationX: 80, y: 2), size: size, direction: .right))
+        XCTAssertTrue(PanoramaPolicy.accepts(CGAffineTransform(translationX: -80, y: 2), size: size, direction: .left))
+        XCTAssertFalse(PanoramaPolicy.accepts(CGAffineTransform(translationX: -80, y: 0), size: size, direction: .right))
+        XCTAssertFalse(PanoramaPolicy.accepts(CGAffineTransform(translationX: 300, y: 0), size: size, direction: .right))
+        XCTAssertFalse(PanoramaPolicy.accepts(CGAffineTransform(translationX: 80, y: 90), size: size, direction: .right))
+        XCTAssertFalse(PanoramaPolicy.accepts(CGAffineTransform(translationX: .nan, y: 0), size: size, direction: .right))
+    }
+
+    func testPanoramaStitchesBothDirectionsAndSeparateLensOutputs() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let scene = UIGraphicsImageRenderer(size: CGSize(width: 800, height: 384), format: format).image { context in
+            for y in stride(from: 0, to: 384, by: 8) {
+                for x in stride(from: 0, to: 800, by: 8) {
+                    let value = CGFloat((x * 73 + y * 137 + x * y * 11) % 251) / 251
+                    UIColor(hue: value, saturation: 0.65, brightness: 0.3 + 0.7 * value, alpha: 1).setFill()
+                    context.fill(CGRect(x: x, y: y, width: 8, height: 8))
+                }
+            }
+        }
+        let full = try XCTUnwrap(scene.cgImage)
+        var files: [URL] = []
+        for offset in [0, 80, 160, 240] {
+            let crop = try XCTUnwrap(full.cropping(to: CGRect(x: offset, y: 0, width: 512, height: 384)))
+            let data = try XCTUnwrap(UIImage(cgImage: crop).pngData())
+            let file = directory.appendingPathComponent("\(offset).png"); try data.write(to: file); files.append(file)
+        }
+        for direction in PanoramaDirection.allCases {
+            let ordered = direction == .right ? files : Array(files.reversed())
+            let result = try await PanoramaStitcher.process(files: [ordered, ordered], labels: ["Main", "Ultra Wide"], direction: direction, cancellation: NightWorkCancellation())
+            XCTAssertEqual(result.companions.count, 1)
+            XCTAssertTrue(result.lensLabel?.contains("Main") == true)
+            XCTAssertTrue(result.companions[0].lensLabel?.contains("Ultra Wide") == true)
+            XCTAssertGreaterThan(result.dimensions.width, 700)
+            XCTAssertLessThanOrEqual(result.dimensions.width, 760)
+            XCTAssertGreaterThan(result.dimensions.height, 370)
+            XCTAssertEqual(result.dimensions.width, result.companions[0].dimensions.width)
+        }
+        do {
+            _ = try await PanoramaStitcher.process(files: [[files[0]]], labels: ["Main"], direction: .right, cancellation: NightWorkCancellation())
+            XCTFail("A single frame must not be labeled a panorama")
+        } catch { XCTAssertTrue(error is PanoramaFailure) }
+        let cancellation = NightWorkCancellation(); cancellation.cancel()
+        do {
+            _ = try await PanoramaStitcher.process(files: [files], labels: ["Main"], direction: .right, cancellation: cancellation)
+            XCTFail("Cancelled panorama must not render")
+        } catch { XCTAssertTrue(error is CancellationError) }
+    }
+
     func testEditorPreservesDimensionsAndOriginalBytes() async throws {
         let format = UIGraphicsImageRendererFormat(); format.scale = 1
         let image = UIGraphicsImageRenderer(size: CGSize(width: 60, height: 80), format: format).image { context in
