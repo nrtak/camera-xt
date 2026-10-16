@@ -90,7 +90,7 @@ enum LongExposureRenderer {
                                                                     kCGImagePropertyOrientation: 1] as CFDictionary)
                         guard CGImageDestinationFinalize(destination) else { throw PhotoEditError.render }
                         var photo = CapturedPhoto(data: data as Data, dimensions: CMVideoDimensions(width: Int32(cg.width), height: Int32(cg.height)))
-                        photo.lensLabel = "\(style.rawValue) Ã‚Â· \(accepted) frames"
+                        photo.lensLabel = "\(style.rawValue) · \(accepted) frames"
                         photo.warning = "Combined \(accepted) of \(files.count) frames. Reference original saved separately."
                         return photo
                     }
