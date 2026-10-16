@@ -305,6 +305,23 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertFalse(DualCaptureLimits.accepts(native, supported: [small]))
         XCTAssertNil(DualCaptureLimits.photoSize(in: [CMVideoDimensions(width: 0, height: 3024)]))
     }
+    func testFocusMarkerStaysWithinLetterboxedPhoto() {
+        let photo = CGRect(x: 0, y: 120, width: 390, height: 520)
+        for point in [CGPoint(x: 1, y: 121), CGPoint(x: 389, y: 121),
+                      CGPoint(x: 1, y: 639), CGPoint(x: 389, y: 639)] {
+            guard let marker = PreviewGeometry.focusRect(at: point, in: photo) else {
+                XCTFail("Visible photo corners must accept focus"); continue
+            }
+            XCTAssertTrue(photo.contains(marker))
+            XCTAssertEqual(marker.width, 64)
+        }
+        XCTAssertNil(PreviewGeometry.focusRect(at: CGPoint(x: 100, y: 20), in: photo))
+        XCTAssertNil(PreviewGeometry.focusRect(at: .zero, in: .zero))
+        XCTAssertNil(PreviewGeometry.focusRect(at: CGPoint(x: CGFloat.nan, y: 200), in: photo))
+        let inset = CGRect(x: 30, y: 40, width: 40, height: 50)
+        XCTAssertEqual(PreviewGeometry.focusRect(at: CGPoint(x: 35, y: 45), in: inset), inset)
+    }
+
     func testPreviewRejectsInvalidTransitionGeometry() {
         XCTAssertFalse(PreviewGeometry.isValid(.null))
         XCTAssertFalse(PreviewGeometry.isValid(.infinite))
