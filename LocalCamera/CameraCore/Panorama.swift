@@ -78,6 +78,7 @@ final class PanoramaStitcher {
                 continuation.resume(with: Result {
                     var results: [CapturedPhoto] = []
                     var stitchedCount = 0
+                    var notices: [String] = []
                     for (index, lensFiles) in files.enumerated() {
                         let result: CapturedPhoto
                         do {
@@ -85,6 +86,8 @@ final class PanoramaStitcher {
                             let stitcher = PanoramaStitcher(direction: direction)
                             defer { stitcher.context.clearCaches() }
                             var rejected = 0
+                            var skipped = 0
+                            var reachedLimit = false
                             for file in lensFiles {
                                 if cancellation.cancelled { throw CancellationError() }
                                 do {
@@ -93,23 +96,37 @@ final class PanoramaStitcher {
                                         try stitcher.append(data, label: labels.indices.contains(index) ? labels[index] : "Camera")
                                     }
                                     rejected = 0
-                                } catch PanoramaFailure.limit { break }
+                                } catch PanoramaFailure.limit { reachedLimit = true; break }
                                 catch PanoramaFailure.stationary { continue }
                                 catch PanoramaFailure.alignment {
-                                    rejected += 1
+                                    rejected += 1; skipped += 1
                                     if rejected >= 3 { break }
+                                } catch is CancellationError { throw CancellationError() }
+                                catch {
+                                    // A missing or unreadable source must not discard the usable frames.
+                                    skipped += 1
                                 }
                             }
-                            var photo = try stitcher.finish()
-                            if rejected > 0 { photo.warning = "Sweep ended before unmatched frames. " + (photo.warning ?? "") }
+                            let photo = try stitcher.finish()
+                            let label = labels.indices.contains(index) ? labels[index] : "Camera"
+                            if reachedLimit { notices.append(label + ": panorama stopped at the size limit.") }
+                            if rejected >= 3 { notices.append(label + ": panorama ended early because frames could not be aligned.") }
+                            else if skipped > 0 { notices.append(label + ": some frames were unavailable or could not be aligned; coverage may be incomplete.") }
                             return photo
                         }
                         stitchedCount += 1
                         } catch is CancellationError { throw CancellationError() }
                         catch {
-                            guard files.count > 1, let file = lensFiles.first else { throw error }
-                            guard let reference = try? referencePhoto(file, label: labels.indices.contains(index) ? labels[index] : "Camera") else { continue }
-                            result = reference
+                            guard files.count > 1 else { throw error }
+                            var fallback: CapturedPhoto?
+                            for file in lensFiles {
+                                if cancellation.cancelled { throw CancellationError() }
+                                if let photo = try? referencePhoto(file, label: labels.indices.contains(index) ? labels[index] : "Camera") {
+                                    fallback = photo; break
+                                }
+                            }
+                            guard let fallback else { continue }
+                            result = fallback
                         }
                         results.append(result)
                     }
@@ -121,6 +138,7 @@ final class PanoramaStitcher {
                         stitchedCount == results.count ? "Both panoramas saved." :
                         stitchedCount == 1 ? "One panorama saved; the other camera kept as a photo." :
                         "Could not stitch either view. Both reference photos saved."
+                    if !notices.isEmpty { first.warning = ([first.warning ?? "Saved."] + notices).joined(separator: " ") }
                     return first
                 })
             }
@@ -291,6 +309,9 @@ enum PanoramaFileStore {
                         for name in names {
                             guard name.hasSuffix(".image"), !name.contains("/"), !name.contains("\\"), name != ".." else { throw PanoramaFailure.changedCamera }
                             let url = directory.appendingPathComponent(name)
+                            // Keep the journal intact so stitching can salvage other frames/lenses.
+                            // Unsafe paths still fail above; missing files are handled by the renderer.
+                            guard FileManager.default.fileExists(atPath: url.path) else { continue }
                             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
                             size += (attributes[.size] as? NSNumber)?.intValue ?? 0
                         }
@@ -363,6 +384,26 @@ enum PanoramaFileStore {
             }
         }
     }
+    // Called before startup recovery finishes, before any new sequence can begin.
+    static func cleanupAbandonedStacks(in root: URL = FileManager.default.temporaryDirectory) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async {
+                defer { continuation.resume() }
+                let prefix = "camera-xt-stack-"
+                guard let entries = try? FileManager.default.contentsOfDirectory(at: root,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
+                for entry in entries {
+                    guard entry.lastPathComponent.hasPrefix(prefix),
+                          UUID(uuidString: String(entry.lastPathComponent.dropFirst(prefix.count))) != nil,
+                          entry.deletingLastPathComponent().standardizedFileURL == root.standardizedFileURL,
+                          let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                          values.isDirectory == true, values.isSymbolicLink != true else { continue }
+                    try? FileManager.default.removeItem(at: entry)
+                }
+            }
+        }
+    }
+
     static func remove(_ directory: URL) {
         queue.async { try? FileManager.default.removeItem(at: directory) }
     }

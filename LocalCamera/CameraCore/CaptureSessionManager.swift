@@ -20,6 +20,17 @@ struct CameraControls: Equatable, Codable {
     }
 }
 
+struct CameraControlChanges {
+    let focus: Bool
+    let exposure: Bool
+    let whiteBalance: Bool
+    init(from old: CameraControls, to new: CameraControls) {
+        focus = old.automaticFocus != new.automaticFocus || old.lensPosition != new.lensPosition || old.facePriority != new.facePriority
+        exposure = old.automaticExposure != new.automaticExposure || old.iso != new.iso || old.shutterSeconds != new.shutterSeconds
+        whiteBalance = old.automaticWhiteBalance != new.automaticWhiteBalance || old.temperature != new.temperature || old.tint != new.tint
+    }
+}
+
 enum ZoomLimits {
     static func clamp(_ value: Double, minimum: Double, maximum: Double) -> Double? {
         guard value.isFinite, minimum.isFinite, maximum.isFinite, minimum >= 1, maximum >= minimum else { return nil }
@@ -27,7 +38,7 @@ enum ZoomLimits {
     }
 }
 
-struct CameraZoom: Codable {
+struct CameraZoom: Codable, Equatable {
     var deviceID = ""
     var value: Double = 1
     var minimum: Double = 1
@@ -879,28 +890,32 @@ final class CaptureSessionManager {
         }
     }
 
-    func setControls(_ value: CameraControls) {
+    func setControls(_ value: CameraControls, changedOnly: Bool = false) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
                   let device = self.input?.device else { return }
             do {
+                let changes = CameraControlChanges(from: self.controls, to: value)
                 self.controls = value
-                if !value.automaticFocus { self.disableEyeFocus() }
-                try self.applyControls(to: device)
+                if !value.automaticFocus && (!changedOnly || changes.focus) { self.disableEyeFocus() }
+                try self.applyControls(to: device, changes: changedOnly ? changes : nil)
                 self.publish()
             } catch { self.publish(message: error.localizedDescription) }
         }
     }
 
-    private func applyControls(to device: AVCaptureDevice, automatic: Bool = false) throws {
-        focusRequests[device.uniqueID] = nil
+    private func applyControls(to device: AVCaptureDevice, automatic: Bool = false, changes: CameraControlChanges? = nil) throws {
+        let updateFocus = automatic || changes?.focus != false
+        let updateExposure = automatic || changes?.exposure != false
+        let updateWhiteBalance = automatic || changes?.whiteBalance != false
+        if updateFocus { focusRequests[device.uniqueID] = nil }
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
         if automatic {
             if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5) }
             if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5) }
         }
-        if device.isFocusModeSupported(.continuousAutoFocus) {
+        if updateFocus && device.isFocusModeSupported(.continuousAutoFocus) {
             device.automaticallyAdjustsFaceDrivenAutoFocusEnabled = false
             device.isFaceDrivenAutoFocusEnabled = controls.facePriority && !snapshot.eyeFocusEnabled
             if controls.automaticFocus || automatic || !device.isLockingFocusWithCustomLensPositionSupported {
@@ -909,26 +924,32 @@ final class CaptureSessionManager {
                 device.setFocusModeLocked(lensPosition: min(1, max(0, controls.lensPosition)), completionHandler: nil)
             }
         }
-        if controls.automaticExposure || automatic || !device.isExposureModeSupported(.custom) {
-            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
-        } else if device.isExposureModeSupported(.custom) {
-            var maximum = CMTimeGetSeconds(device.activeFormat.maxExposureDuration)
-            if snapshot.videoMode { maximum = min(maximum, CMTimeGetSeconds(device.activeVideoMaxFrameDuration)) }
-            let seconds = max(CMTimeGetSeconds(device.activeFormat.minExposureDuration), min(maximum, controls.shutterSeconds))
-            device.setExposureModeCustom(duration: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000),
-                                         iso: min(device.activeFormat.maxISO, max(device.activeFormat.minISO, controls.iso)), completionHandler: nil)
+        if updateExposure {
+            if controls.automaticExposure || automatic || !device.isExposureModeSupported(.custom) {
+                if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            } else if device.isExposureModeSupported(.custom) {
+                var maximum = CMTimeGetSeconds(device.activeFormat.maxExposureDuration)
+                if snapshot.videoMode { maximum = min(maximum, CMTimeGetSeconds(device.activeVideoMaxFrameDuration)) }
+                let seconds = max(CMTimeGetSeconds(device.activeFormat.minExposureDuration), min(maximum, controls.shutterSeconds))
+                device.setExposureModeCustom(duration: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000),
+                                             iso: min(device.activeFormat.maxISO, max(device.activeFormat.minISO, controls.iso)), completionHandler: nil)
+            }
         }
-        if controls.automaticWhiteBalance || automatic || !device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
-            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
-        } else if device.isWhiteBalanceModeSupported(.locked) {
-            let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: controls.temperature, tint: controls.tint)
-            var gains = device.deviceWhiteBalanceGains(for: values)
-            gains.redGain = min(device.maxWhiteBalanceGain, max(1, gains.redGain))
-            gains.greenGain = min(device.maxWhiteBalanceGain, max(1, gains.greenGain))
-            gains.blueGain = min(device.maxWhiteBalanceGain, max(1, gains.blueGain))
-            device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+        if updateWhiteBalance {
+            if controls.automaticWhiteBalance || automatic || !device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+            } else if device.isWhiteBalanceModeSupported(.locked) {
+                let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: controls.temperature, tint: controls.tint)
+                var gains = device.deviceWhiteBalanceGains(for: values)
+                gains.redGain = min(device.maxWhiteBalanceGain, max(1, gains.redGain))
+                gains.greenGain = min(device.maxWhiteBalanceGain, max(1, gains.greenGain))
+                gains.blueGain = min(device.maxWhiteBalanceGain, max(1, gains.blueGain))
+                device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            }
         }
-        snapshot.focusLocked = !controls.automaticFocus && !automatic && device.isLockingFocusWithCustomLensPositionSupported
+        if updateFocus {
+            snapshot.focusLocked = !controls.automaticFocus && !automatic && device.isLockingFocusWithCustomLensPositionSupported
+        }
     }
 
     private func startMetering() {
