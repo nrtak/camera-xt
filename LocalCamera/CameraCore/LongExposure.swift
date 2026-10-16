@@ -23,7 +23,7 @@ enum LongExposureLimits {
 
 /// Reads a single source frame at a time and materializes each blend to avoid an ever-growing image graph.
 enum LongExposureRenderer {
-    private static let queue = DispatchQueue(label: "CameraXT.longExposure", qos: .userInitiated)
+    private static let queue = PhotoProcessingScheduler.queue
     private static func alignmentError(_ image: CIImage, reference: CIImage, transform: CGAffineTransform, context: CIContext) -> Float {
         let bounds = reference.extent.insetBy(dx: reference.extent.width * 0.06, dy: reference.extent.height * 0.06)
         let difference = image.transformed(by: transform).applyingFilter("CIDifferenceBlendMode", parameters: [kCIInputBackgroundImageKey: reference])
