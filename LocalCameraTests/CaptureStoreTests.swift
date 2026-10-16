@@ -5,6 +5,58 @@ import UIKit
 
 final class CaptureStoreTests: XCTestCase {
     @MainActor
+    func testFocusThenShutterShareOneControlAcknowledgment() {
+        let waiters = ControlUpdateWaiters()
+        var revision = 1
+        var actions: [String] = []
+        // A scheduled settings update may already be in flight before either tap.
+        XCTAssertTrue(waiters.begin(revision: revision, completion: nil))
+        XCTAssertFalse(waiters.begin(revision: revision) { applied in
+            if applied { actions.append("focus A"); revision += 1 }
+        })
+        XCTAssertFalse(waiters.begin(revision: revision) { applied in
+            if applied { actions.append("focus B"); revision += 1 }
+        })
+        XCTAssertFalse(waiters.begin(revision: revision) { applied in
+            if applied { actions.append("shutter") }
+        })
+        waiters.finish(revision: 1, applied: true)
+        XCTAssertEqual(actions, ["focus A", "focus B", "shutter"],
+                       "Focus changes must not discard later actions waiting on the same update")
+        waiters.finish(revision: 1, applied: true)
+        XCTAssertEqual(actions.count, 3, "An acknowledgment must not repeat actions")
+    }
+
+    @MainActor
+    func testRejectedControlsReleaseWaitersAndAllowRetry() {
+        let waiters = ControlUpdateWaiters()
+        var results: [Bool] = []
+        XCTAssertTrue(waiters.begin(revision: 1) { results.append($0) })
+        XCTAssertFalse(waiters.begin(revision: 1) { results.append($0) })
+        waiters.finish(revision: 1, applied: false)
+        XCTAssertEqual(results, [false, false])
+        XCTAssertTrue(waiters.begin(revision: 1) { results.append($0) })
+        waiters.finish(revision: 1, applied: true)
+        XCTAssertEqual(results, [false, false, true])
+    }
+
+    @MainActor
+    func testOldControlAcknowledgmentDoesNotDrainNewerActions() {
+        let waiters = ControlUpdateWaiters()
+        var actions: [String] = []
+        XCTAssertTrue(waiters.begin(revision: 1) { applied in
+            if applied { actions.append("old") }
+        })
+        XCTAssertTrue(waiters.begin(revision: 2) { applied in
+            if applied { actions.append("new") }
+        })
+        waiters.finish(revision: 1, applied: false)
+        XCTAssertTrue(actions.isEmpty)
+        waiters.finish(revision: 2, applied: true)
+        XCTAssertEqual(actions, ["new"])
+    }
+
+    @MainActor
     func testPanoramaModeCannotBeReplacedByPhotoStyles() async throws {
         let model = CameraViewModel()
         for _ in 0..<200 {
@@ -32,6 +84,33 @@ final class CaptureStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testPanoramaGuidanceDoesNotLeakAcrossModes() async throws {
+        let model = CameraViewModel()
+        for _ in 0..<200 {
+            if !model.restoring { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(model.restoring)
+        for method in PanoramaMethod.allCases {
+            model.panoramaMethod = method
+            model.enablePanorama()
+            XCTAssertTrue(model.panoramaSelected)
+            XCTAssertNil(model.message, "Idle instructions must not enter the shared status banner")
+            model.message = method.instructions
+            model.chooseCaptureMode(0)
+            XCTAssertFalse(model.panoramaSelected)
+            XCTAssertNil(model.message)
+            model.enablePanorama()
+            model.message = method.instructions
+            // Photo-to-Video uses this reset before asynchronous camera reconfiguration.
+            model.resetTemporarySettings()
+            XCTAssertFalse(model.panoramaSelected)
+            XCTAssertNil(model.message)
+        }
+        model.setActive(false)
+    }
+
+    @MainActor
     func testControlEditsSurviveInterruptionAndPreserveLongExposure() async throws {
         let model = CameraViewModel()
         for _ in 0..<200 {
@@ -43,20 +122,59 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertTrue(model.controlsNeedApply, "A shortcut must schedule the camera update without a settings panel")
         model.setActive(false)
         XCTAssertTrue(model.controlsNeedApply, "An interruption must retain the unapplied edit")
-        model.flushPendingControls()
-        XCTAssertFalse(model.controlsNeedApply, "The shared shutter/focus flush must commit the pending edit first")
+        let applied = await withCheckedContinuation { continuation in
+            model.flushPendingControls { continuation.resume(returning: $0) }
+        }
+        XCTAssertFalse(applied, "An unconfigured camera must reject the update")
+        XCTAssertTrue(model.controlsNeedApply, "A rejected edit must remain pending for retry")
         XCTAssertEqual(model.controls.flash, .on)
         model.enableLongExposure()
         model.controlBinding.lensPosition.wrappedValue = 0.7
         model.controlBinding.automaticFocus.wrappedValue = false
         model.applyControls()
         XCTAssertEqual(model.captureStyle, "Long Exposure")
-        XCTAssertFalse(model.controlsNeedApply)
+        XCTAssertTrue(model.controlsNeedApply, "An update stays pending until acknowledged")
         model.controlBinding.iso.wrappedValue = 200
         XCTAssertTrue(model.controlsNeedApply)
         model.resetControls()
-        XCTAssertFalse(model.controlsNeedApply, "Reset must supersede any delayed edit")
+        XCTAssertTrue(model.controlsNeedApply, "Reset must also wait for camera acknowledgment")
+        XCTAssertEqual(model.controls, CameraControls(), "Reset must supersede the prior values")
         model.setActive(false)
+    }
+
+    @MainActor
+    func testRetryingPresetDoesNotReplaceNightStyle() async throws {
+        let model = CameraViewModel()
+        for _ in 0..<200 {
+            if !model.restoring { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(model.restoring)
+        model.setNightEnabled(true)
+        XCTAssertEqual(model.captureStyle, "Night")
+        let applied = await withCheckedContinuation { continuation in
+            model.flushPendingControls { continuation.resume(returning: $0) }
+        }
+        XCTAssertFalse(applied)
+        XCTAssertTrue(model.controlsNeedApply)
+        XCTAssertEqual(model.captureStyle, "Night", "Retrying settings must not change the selected capture style")
+        model.setActive(false)
+    }
+
+    func testStitchFinishRequiresEnoughCompletedPhotos() {
+        XCTAssertFalse(PanoramaPolicy.canFinish(frames: 0, takingPhoto: false))
+        XCTAssertFalse(PanoramaPolicy.canFinish(frames: 2, takingPhoto: false))
+        XCTAssertFalse(PanoramaPolicy.canFinish(frames: 3, takingPhoto: true))
+        XCTAssertTrue(PanoramaPolicy.canFinish(frames: 3, takingPhoto: false))
+    }
+
+    func testPanoramaStopNoticeSurvivesRecoveryAndOldJournalsDecode() throws {
+        let old = Data(#"{"files":[],"labels":[],"direction":"Right","readyToSave":false,"saved":false}"#.utf8)
+        var journal = try JSONDecoder().decode(PanoramaFileStore.Journal.self, from: old)
+        XCTAssertNil(journal.stopNotice)
+        journal.stopNotice = "Capture stopped at the storage limit."
+        let restored = try JSONDecoder().decode(PanoramaFileStore.Journal.self, from: JSONEncoder().encode(journal))
+        XCTAssertEqual(restored.stopNotice, journal.stopNotice)
     }
 
     func testUnrelatedControlChangesDoNotReapplyFocus() {
