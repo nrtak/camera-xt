@@ -302,13 +302,21 @@ final class CameraViewModel: ObservableObject {
         return canShutter ? "Ready" : "Camera unavailable"
     }
 
-    private var requestedDualPhoto: Bool?
+    private var requestedPanorama: Bool?
     func chooseCaptureMode(_ index: Int) {
-        guard canConfigure else { return }
-        if index == 2 { if mode != .video { selectMode(.video) }; return }
-        let dual = index == 1
-        if mode == .photo { setDualEnabled(dual) }
-        else { requestedDualPhoto = dual; selectMode(.photo) }
+        guard canConfigure, (0...2).contains(index) else { return }
+        if index == 2 {
+            requestedPanorama = nil
+            if mode != .video { selectMode(.video) }
+            return
+        }
+        if mode == .photo {
+            if index == 1 { enablePanorama() }
+            else if captureStyle == "Panorama" { disablePanorama() }
+        } else {
+            requestedPanorama = index == 1
+            selectMode(.photo)
+        }
     }
 
     func selectMode(_ selected: CaptureMode) {
@@ -328,9 +336,9 @@ final class CameraViewModel: ObservableObject {
                 self.mode = snapshot.videoMode ? .video : .photo
                 self.preparingMode = nil
                 self.configuring = false
-                if let dual = self.requestedDualPhoto {
-                    self.requestedDualPhoto = nil
-                    if self.mode == .photo { self.setDualEnabled(dual) }
+                if let panorama = self.requestedPanorama {
+                    self.requestedPanorama = nil
+                    if self.mode == .photo && panorama { self.enablePanorama() }
                 }
                 if let failure = snapshot.message { self.message = failure }
             }
