@@ -4,6 +4,24 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    @MainActor
+    func testPanoramaModeCannotBeReplacedByPhotoStyles() {
+        let model = CameraViewModel()
+        model.enablePanorama()
+        XCTAssertTrue(model.panoramaSelected)
+        model.setNightEnabled(true)
+        model.enableLongExposure()
+        XCTAssertTrue(model.panoramaSelected)
+        XCTAssertEqual(model.captureStyle, "Auto")
+        model.chooseCaptureMode(0)
+        XCTAssertFalse(model.panoramaSelected)
+        model.enableLongExposure()
+        XCTAssertEqual(model.captureStyle, "Long Exposure")
+        model.setDualEnabled(true)
+        XCTAssertEqual(model.captureStyle, "Auto")
+        model.setActive(false)
+    }
+
     func testPanoramaPreferencesRoundTripAndOlderSettingsDecode() throws {
         var setup = SavedCameraSetup(lensID: nil, video: false, dual: true, dualMode: "Fast",
             style: "Auto", controls: CameraControls(), bias: 0, dualBrightness: [0, 0], zooms: [],
