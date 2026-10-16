@@ -4,6 +4,63 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testEditorPreservesDimensionsAndOriginalBytes() async throws {
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 60, height: 80), format: format).image { context in
+            UIColor(white: 0.3, alpha: 1).setFill(); context.fill(CGRect(x: 0, y: 0, width: 60, height: 80))
+        }
+        let source = try XCTUnwrap(image.jpegData(compressionQuality: 1)), copy = source
+        var edits = PhotoAdjustments(); edits.exposure = 1
+        let data = try await PhotoEditRenderer.render(source, edits: edits, preview: false, cancellation: NightWorkCancellation())
+        let result = try XCTUnwrap(UIImage(data: data)?.cgImage)
+        XCTAssertEqual(result.width, 60); XCTAssertEqual(result.height, 80)
+        XCTAssertEqual(source, copy)
+        edits.crop = 1
+        let cropped = try await PhotoEditRenderer.render(source, edits: edits, preview: false, cancellation: NightWorkCancellation())
+        let square = try XCTUnwrap(UIImage(data: cropped)?.cgImage)
+        XCTAssertEqual(square.width, square.height); XCTAssertEqual(square.width, 60)
+        edits.crop = 0; edits.turns = 1
+        let rotated = try await PhotoEditRenderer.render(source, edits: edits, preview: false, cancellation: NightWorkCancellation())
+        let turned = try XCTUnwrap(UIImage(data: rotated)?.cgImage)
+        XCTAssertEqual(turned.width, 80); XCTAssertEqual(turned.height, 60)
+    }
+
+    func testEditorRejectsInvalidInputAndCancellation() async {
+        do {
+            _ = try await PhotoEditRenderer.render(Data([0, 1]), edits: PhotoAdjustments(), preview: false, cancellation: NightWorkCancellation())
+            XCTFail("Invalid input must not export")
+        } catch {}
+        let cancelled = NightWorkCancellation(); cancelled.cancel()
+        do {
+            _ = try await PhotoEditRenderer.render(Data(), edits: PhotoAdjustments(), preview: true, cancellation: cancelled)
+            XCTFail("Cancelled work must not render")
+        } catch { XCTAssertTrue(error is CancellationError) }
+    }
+
+    func testLongExposureLimitsAndSequentialComposite() async throws {
+        XCTAssertEqual(LongExposureLimits.duration(.nan), 30)
+        XCTAssertEqual(LongExposureLimits.duration(-5), 15)
+        XCTAssertEqual(LongExposureLimits.duration(1000), 300)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        var files: [URL] = []
+        for value in [CGFloat(0.2), CGFloat(0.8)] {
+            let image = UIGraphicsImageRenderer(size: CGSize(width: 80, height: 60), format: format).image { context in
+                UIColor(white: value, alpha: 1).setFill(); context.fill(CGRect(x: 0, y: 0, width: 80, height: 60))
+            }
+            let file = directory.appendingPathComponent("\(files.count).jpg")
+            try XCTUnwrap(image.jpegData(compressionQuality: 1)).write(to: file); files.append(file)
+        }
+        for style in [LongExposureStyle.motion, .trails] {
+            let output = try await LongExposureRenderer.process(files, style: style, cancellation: NightWorkCancellation())
+            XCTAssertEqual(output.dimensions.width, 80); XCTAssertEqual(output.dimensions.height, 60)
+            XCTAssertTrue(output.lensLabel?.contains("2 frames") == true)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: files[0].path))
+        }
+    }
+
     func testSceneAdviceRejectsInvalidReadingsAndDoesNotSuggestNightInBrightLight() {
         XCTAssertNil(SceneAdvice.text(shutter: .nan, iso: 100, dual: true, night: false))
         XCTAssertNil(SceneAdvice.text(shutter: 0, iso: 100, dual: false, night: false))
