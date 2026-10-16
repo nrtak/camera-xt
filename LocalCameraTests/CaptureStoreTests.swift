@@ -81,8 +81,8 @@ final class CaptureStoreTests: XCTestCase {
     }
 
     func testNightComparisonPrefersDifferentLensesBeforeReferenceOriginals() {
-        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main Â· Night 3 frames", "Main Â· Reference", "Ultra Wide Â· Night 3 frames", "Ultra Wide Â· Reference"]), 2)
-        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main Â· Night 3 frames", "Main Â· Reference"]), 1)
+        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main · Night 3 frames", "Main · Reference", "Ultra Wide · Night 3 frames", "Ultra Wide · Reference"]), 2)
+        XCTAssertEqual(RecentComparison.secondIndex(labels: ["Main · Night 3 frames", "Main · Reference"]), 1)
         XCTAssertEqual(RecentComparison.secondIndex(labels: []), 0)
     }
 
@@ -229,7 +229,7 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertFalse(CameraViewModel.isBriefStatus("Saved to Photos, but local history could not be updated."))
         XCTAssertFalse(CameraViewModel.isBriefStatus("Only Main photo saved. The other camera did not capture a photo."))
         XCTAssertFalse(CameraViewModel.isBriefStatus("Not saved to Photos. A recovery copy is on this iPhone."))
-        XCTAssertFalse(CameraViewModel.isBriefStatus("Saving to Photosâ€¦"))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("Saving to Photos…"))
     }
 
     func testZoomRestorationClampsToChangedFormatLimits() {
