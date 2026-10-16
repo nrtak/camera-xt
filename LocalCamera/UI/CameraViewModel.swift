@@ -285,7 +285,7 @@ final class CameraViewModel: ObservableObject {
     @Published var selectedBurstIndex = 0
     @Published private(set) var recommendedBurstIndex = 0
     var hasPendingCapture: Bool { restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
-    var canShutter: Bool { panoramaRunning ? active : camera.recording ? !busy : (camera.running && !busy && !configuring && preparingMode == nil && !hasPendingCapture && !resetOnReturn) }
+    var canShutter: Bool { panoramaRunning ? (active && !panoramaTakingPhoto && !finishPanoramaRequested) : camera.recording ? !busy : (camera.running && !busy && !configuring && preparingMode == nil && !hasPendingCapture && !resetOnReturn) }
 
     var videoButtonTitle: String {
         if busy { return captureActivity == .saving ? "Saving…" : camera.recording || captureActivity == .processing ? "Finishing…" : "Starting…" }
@@ -338,7 +338,15 @@ final class CameraViewModel: ObservableObject {
     }
     func applyVideoSettings() { selectMode(.video) }
     func shutter() {
-        if panoramaRunning { finishPanoramaRequested = true; return }
+        if panoramaRunning {
+            guard active else { return }
+            if panoramaMethod == .sweep { finishPanoramaRequested = true }
+            else if !panoramaTakingPhoto && !finishPanoramaRequested {
+                panoramaTakingPhoto = true
+                panoramaPhotoRequested = true
+            }
+            return
+        }
         guard canShutter else { return }
         if haptics { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
         if controlsTask != nil {
@@ -821,6 +829,13 @@ final class CameraViewModel: ObservableObject {
         }
     }
 
+    @Published var panoramaMethod: PanoramaMethod = .sweep
+    @Published private(set) var panoramaTakingPhoto = false
+    private var panoramaPhotoRequested = false
+    func finishPanorama() {
+        guard panoramaRunning else { return }
+        finishPanoramaRequested = true
+    }
     @Published var panoramaDirection: PanoramaDirection = .right
     @Published private(set) var panoramaRunning = false
     @Published private(set) var panoramaFrames = 0
@@ -832,12 +847,14 @@ final class CameraViewModel: ObservableObject {
         controlsTask?.cancel(); controlsTask = nil
         burstEnabled = false; timerSeconds = 0
         captureStyle = "Panorama"
-        message = "Panorama beta: tap the shutter, sweep slowly, then tap again to finish."
+        message = panoramaMethod.instructions
     }
     func disablePanorama() { if canConfigure { captureStyle = "Auto"; message = nil } }
     private func capturePanorama() {
         let token = NightWorkCancellation(); nightWork = token
         let paired = camera.dualEnabled, direction = panoramaDirection
+        let method = panoramaMethod
+        panoramaPhotoRequested = true; panoramaTakingPhoto = method == .stitch
         panoramaRunning = true; finishPanoramaRequested = false; panoramaFrames = 0; panoramaElapsed = 0
         Task { [weak self] in
             guard let self else { return }
@@ -850,7 +867,7 @@ final class CameraViewModel: ObservableObject {
                 self.panoramaMotion.stopDeviceMotionUpdates()
                 if startedSequence { self.engine.endLongExposure() }
                 try? FileManager.default.removeItem(at: directory)
-                self.panoramaRunning = false; self.nightWork = nil
+                self.panoramaRunning = false; self.panoramaTakingPhoto = false; self.panoramaPhotoRequested = false; self.nightWork = nil
                 if self.active { self.engine.start() }
             }
             do {
@@ -866,7 +883,11 @@ final class CameraViewModel: ObservableObject {
                 while self.panoramaFrames < PanoramaPolicy.maximumFrames {
                     guard self.active, !token.cancelled else { throw CancellationError() }
                     self.panoramaElapsed = Int(ProcessInfo.processInfo.systemUptime - started)
-                    if self.finishPanoramaRequested || Double(self.panoramaElapsed) >= PanoramaPolicy.maximumSeconds { break }
+                    if self.finishPanoramaRequested || self.panoramaElapsed >= method.maximumSeconds { break }
+                    if method == .stitch && !self.panoramaPhotoRequested {
+                        try await Task.sleep(nanoseconds: 150_000_000)
+                        continue
+                    }
                     if let motion = self.panoramaMotion.deviceMotion {
                         if initialGravity == nil { initialGravity = motion.gravity }
                         let rate = motion.rotationRate
@@ -878,7 +899,10 @@ final class CameraViewModel: ObservableObject {
                             try await Task.sleep(nanoseconds: 120_000_000); continue
                         }
                     }
-                    self.message = "Sweep slowly " + direction.rawValue.lowercased() + " · tap the shutter to finish"
+                    self.panoramaPhotoRequested = false
+                    self.message = method == .sweep
+                        ? "Sweep slowly " + direction.rawValue.lowercased() + " · tap the shutter to finish"
+                        : "Taking photo… hold steady"
                     let captureStart = ProcessInfo.processInfo.systemUptime
                     let photo: CapturedPhoto = try await withCheckedThrowingContinuation { continuation in
                         self.engine.capture(panorama: true) { continuation.resume(with: $0) }
@@ -898,6 +922,10 @@ final class CameraViewModel: ObservableObject {
                     }
                     if labels.isEmpty { labels = parts.map { $0.lensLabel ?? "Camera" } }
                     bytes += added; self.panoramaFrames += 1
+                    if method == .stitch {
+                        self.panoramaTakingPhoto = false
+                        self.message = "Move a little " + direction.rawValue.lowercased() + ", overlap two-thirds, then tap the shutter. Finish when done."
+                    }
                     let pause = max(0, 0.45 - (ProcessInfo.processInfo.systemUptime - captureStart))
                     if pause > 0 { try await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000)) }
                 }
