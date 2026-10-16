@@ -38,6 +38,9 @@ struct SavedCameraSetup: Codable {
     var eye: Bool
     var analysis: String
     var exposurePointOnly: Bool
+    var panorama: Bool? = nil
+    var panoramaMethod: String? = nil
+    var panoramaDirection: String? = nil
 }
 
 @MainActor
@@ -164,7 +167,8 @@ final class CameraViewModel: ObservableObject {
             controls: controls, bias: exposureBias, dualBrightness: dualBrightness, zooms: camera.zooms,
             timer: timerSeconds, burst: burstEnabled, videoWidth: videoWidth, videoFPS: videoFPS,
             stabilization: stabilization, depth: camera.depthEnabled, eye: camera.eyeFocusEnabled,
-            analysis: camera.analysisMode, exposurePointOnly: exposurePointOnly)
+            analysis: camera.analysisMode, exposurePointOnly: exposurePointOnly,
+            panorama: panoramaSelected, panoramaMethod: panoramaMethod.rawValue, panoramaDirection: panoramaDirection.rawValue)
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
         if let data = try? encoder.encode(setup), data != lastSavedSetup {
             lastSavedSetup = data
@@ -196,7 +200,13 @@ final class CameraViewModel: ObservableObject {
         launchSetup = nil
         controls = saved.controls; exposureBias = saved.bias
         exposurePointOnly = saved.exposurePointOnly
-        captureStyle = saved.style; timerSeconds = saved.timer; burstEnabled = saved.burst && !camera.dualEnabled
+        panoramaSelected = !saved.video && (saved.panorama ?? (saved.style == "Panorama"))
+        panoramaMethod = PanoramaMethod(rawValue: saved.panoramaMethod ?? "") ?? .sweep
+        panoramaDirection = PanoramaDirection(rawValue: saved.panoramaDirection ?? "") ?? .right
+        captureStyle = saved.style == "Panorama" ? "Auto" : saved.style
+        if panoramaSelected { captureStyle = "Auto" }
+        if camera.dualEnabled && captureStyle == "Long Exposure" { captureStyle = "Auto" }
+        timerSeconds = saved.timer; burstEnabled = saved.burst && !camera.dualEnabled
         if camera.dualEnabled {
             dualBrightness = saved.dualBrightness.count == 2 ? saved.dualBrightness : [0, 0]
             for index in 0..<2 { engine.setExposureBias(dualBrightness[index], dualIndex: index) }
@@ -312,7 +322,7 @@ final class CameraViewModel: ObservableObject {
         }
         if mode == .photo {
             if index == 1 { enablePanorama() }
-            else if captureStyle == "Panorama" { disablePanorama() }
+            else if panoramaSelected { disablePanorama() }
         } else {
             requestedPanorama = index == 1
             selectMode(.photo)
@@ -414,6 +424,7 @@ final class CameraViewModel: ObservableObject {
     private var pendingTool: QuickCaptureTool?
     private var expectingCaptureProgress = false
     private var modeAfterDual: CaptureMode?
+    @Published private(set) var panoramaSelected = false
     @Published private(set) var captureStyle = "Auto"
     @Published private(set) var configuring = false
     @Published var exposureBias: Float = 0 {
@@ -421,6 +432,10 @@ final class CameraViewModel: ObservableObject {
     }
     func setDualEnabled(_ enabled: Bool) {
         guard !busy, !configuring, !hasPendingCapture, mode == .photo, enabled != camera.dualEnabled else { return }
+        if enabled && captureStyle == "Long Exposure" {
+            resetTemporarySettings()
+            message = "Long exposure is available in Single only. Switched to standard Dual Photo."
+        }
         configuring = true
         if enabled { burstEnabled = false }
         engine.setDualEnabled(enabled, mode: enabled && captureStyle == "Night" ? .detail : nil)
@@ -470,7 +485,7 @@ final class CameraViewModel: ObservableObject {
         applyControls()
     }
     func actionPreset() {
-        guard mode == .photo, camera.customExposureAvailable, !camera.dualEnabled, !busy, !configuring, !hasPendingCapture else { return }
+        guard !panoramaSelected, mode == .photo, camera.customExposureAvailable, !camera.dualEnabled, !busy, !configuring, !hasPendingCapture else { return }
         controls.iso = min(camera.maxISO, max(camera.minISO, camera.currentISO * Float(camera.currentShutter * 500)))
         controls.shutterSeconds = 1.0 / 500
         controls.automaticExposure = false
@@ -487,6 +502,7 @@ final class CameraViewModel: ObservableObject {
     func nightPreset() { setNightEnabled(true) }
 
     func setNightEnabled(_ enabled: Bool) {
+        guard !panoramaSelected else { message = "Night is available in Photo mode."; return }
         guard canConfigure, mode == .photo else { return }
         timerSeconds = 0
         burstEnabled = false
@@ -507,6 +523,7 @@ final class CameraViewModel: ObservableObject {
 
     func activate(_ tool: QuickCaptureTool) {
         guard canConfigure else { return }
+        guard !panoramaSelected else { message = "Photo styles are available in Photo mode. Switch to Photo to use this feature."; return }
         if tool == .night && camera.dualEnabled { setNightEnabled(true); return }
         if camera.dualEnabled && tool != .dual { message = "Switching from Dual Shot to single-camera Photo for this feature." }
         else if camera.videoMode { message = "Switching from Video to Photo for this feature." }
@@ -563,6 +580,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     func resetTemporarySettings() {
+        panoramaSelected = false
         timerSeconds = 0
         burstEnabled = false
         captureStyle = "Auto"
@@ -775,7 +793,7 @@ final class CameraViewModel: ObservableObject {
         guard canCapture else { return }
         captureActivity = .taking
         busy = true
-        if captureStyle == "Panorama" { capturePanorama(); return }
+        if panoramaSelected { capturePanorama(); return }
         if captureStyle == "Long Exposure" && !camera.dualEnabled { captureLongExposure(); return }
         if captureStyle == "Night" { captureNight(); return }
         if burstEnabled && !camera.dualEnabled {
@@ -837,6 +855,7 @@ final class CameraViewModel: ObservableObject {
         }
     }
 
+    @Published private(set) var panoramaReference: UIImage?
     @Published var panoramaMethod: PanoramaMethod = .sweep
     @Published private(set) var panoramaTakingPhoto = false
     private var panoramaPhotoRequested = false
@@ -853,15 +872,16 @@ final class CameraViewModel: ObservableObject {
     func enablePanorama() {
         guard canConfigure, mode == .photo else { return }
         controlsTask?.cancel(); controlsTask = nil
-        burstEnabled = false; timerSeconds = 0
-        captureStyle = "Panorama"
+        resetTemporarySettings()
+        panoramaSelected = true
         message = panoramaMethod.instructions
     }
-    func disablePanorama() { if canConfigure { captureStyle = "Auto"; message = nil } }
+    func disablePanorama() { if canConfigure { panoramaSelected = false; panoramaReference = nil; message = nil } }
     private func capturePanorama() {
         let token = NightWorkCancellation(); nightWork = token
         let paired = camera.dualEnabled, direction = panoramaDirection
         let method = panoramaMethod
+        panoramaReference = nil
         panoramaPhotoRequested = true; panoramaTakingPhoto = method == .stitch
         panoramaRunning = true; finishPanoramaRequested = false; panoramaFrames = 0; panoramaElapsed = 0
         Task { [weak self] in
@@ -874,14 +894,14 @@ final class CameraViewModel: ObservableObject {
             defer {
                 self.panoramaMotion.stopDeviceMotionUpdates()
                 if startedSequence { self.engine.endLongExposure() }
-                try? FileManager.default.removeItem(at: directory)
+                PanoramaFileStore.remove(directory)
+                self.panoramaReference = nil
                 self.panoramaRunning = false; self.panoramaTakingPhoto = false; self.panoramaPhotoRequested = false; self.nightWork = nil
                 if self.active { self.engine.start() }
             }
             do {
                 guard await withCheckedContinuation({ continuation in self.engine.beginPanorama { continuation.resume(returning: $0) } }) else { throw CameraFailure.unavailable }
                 startedSequence = true
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 if self.panoramaMotion.isDeviceMotionAvailable {
                     self.panoramaMotion.deviceMotionUpdateInterval = 0.1
                     self.panoramaMotion.startDeviceMotionUpdates()
@@ -924,9 +944,22 @@ final class CameraViewModel: ObservableObject {
                     guard parts.count == files.count else { throw PanoramaFailure.changedCamera }
                     let added = parts.reduce(0) { $0 + $1.data.count }
                     if bytes + added > PanoramaPolicy.maximumDiskBytes { break }
-                    for (index, part) in parts.enumerated() {
-                        let file = directory.appendingPathComponent("\(index)-\(self.panoramaFrames).image")
-                        try part.data.write(to: file, options: .atomic); files[index].append(file)
+                    if method == .stitch && self.panoramaFrames > 0 {
+                        let accepted = try await PanoramaStitcher.checkOverlap(
+                            previous: files.compactMap { $0.last }, next: parts.map { $0.data },
+                            direction: direction, cancellation: token)
+                        guard self.active, !token.cancelled else { throw CancellationError() }
+                        if !accepted {
+                            self.panoramaTakingPhoto = false
+                            self.message = "Not enough matching overlap. Move back toward the previous photo, keep level, and retake."
+                            continue
+                        }
+                    }
+                    let stored = try await PanoramaFileStore.write(parts.map { $0.data }, directory: directory, frame: self.panoramaFrames)
+                    for (index, file) in stored.enumerated() { files[index].append(file) }
+                    if method == .stitch {
+                        let thumbnail = try await PanoramaFileStore.thumbnail(photo.data)
+                        self.panoramaReference = UIImage(data: thumbnail)
                     }
                     if labels.isEmpty { labels = parts.map { $0.lensLabel ?? "Camera" } }
                     bytes += added; self.panoramaFrames += 1
@@ -959,7 +992,7 @@ final class CameraViewModel: ObservableObject {
     private var finishLongExposureRequested = false
     func finishLongExposure() { finishLongExposureRequested = true }
     func enableLongExposure() {
-        guard canConfigure, mode == .photo, !camera.dualEnabled else { return }
+        guard canConfigure, mode == .photo, !camera.dualEnabled, !panoramaSelected else { return }
         burstEnabled = false
         controls.flash = .off
         engine.setAnalysis("Off"); engine.setEyeFocus(false)
