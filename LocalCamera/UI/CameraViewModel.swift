@@ -19,7 +19,7 @@ enum CameraLaunchPreferences {
     static func prepareOnce() { _ = prepared }
 }
 
-struct SavedCameraSetup: Codable {
+struct SavedCameraSetup: Codable, Equatable {
     var lensID: String?
     var video: Bool
     var dual: Bool
@@ -41,6 +41,8 @@ struct SavedCameraSetup: Codable {
     var panorama: Bool? = nil
     var panoramaMethod: String? = nil
     var panoramaDirection: String? = nil
+    var longExposureStyle: String? = nil
+    var longExposureSeconds: Double? = nil
 }
 
 @MainActor
@@ -105,7 +107,8 @@ enum QuickCaptureTool: Equatable { case action, night, dual, depth, eye, burst, 
 enum CaptureActivity: String { case preparing = "Preparing", taking = "Taking photos", processing = "Processing", saving = "Saving" }
 
 enum SceneAdvice {
-    static func text(shutter: Double, iso: Float, dual: Bool, night: Bool) -> String? {
+    static func text(shutter: Double, iso: Float, dual: Bool, night: Bool, panorama: Bool = false) -> String? {
+        guard !panorama else { return nil }
         guard shutter.isFinite, iso.isFinite, shutter > 0, iso > 0,
               shutter >= 1.0 / 30 || iso >= 800 else { return nil }
         if night { return "Night: hold still until capture finishes." }
@@ -158,6 +161,17 @@ final class CameraViewModel: ObservableObject {
     private var launchSetup: SavedCameraSetup?
     private var launchStage = 0
     private var lastSavedSetup: Data?
+    private var lastObservedSetup: SavedCameraSetup?
+    private var setupSaveTask: Task<Void, Never>?
+    private func scheduleSetupSave() {
+        guard setupSaveTask == nil else { return }
+        setupSaveTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            self.setupSaveTask = nil
+            self.saveSetup()
+        }
+    }
 
     private func saveSetup() {
         guard launchSetup == nil, camera.running, !configuring, !restoring,
@@ -168,12 +182,15 @@ final class CameraViewModel: ObservableObject {
             timer: timerSeconds, burst: burstEnabled, videoWidth: videoWidth, videoFPS: videoFPS,
             stabilization: stabilization, depth: camera.depthEnabled, eye: camera.eyeFocusEnabled,
             analysis: camera.analysisMode, exposurePointOnly: exposurePointOnly,
-            panorama: panoramaSelected, panoramaMethod: panoramaMethod.rawValue, panoramaDirection: panoramaDirection.rawValue)
+            panorama: panoramaSelected, panoramaMethod: panoramaMethod.rawValue, panoramaDirection: panoramaDirection.rawValue,
+            longExposureStyle: longExposureStyle.rawValue, longExposureSeconds: LongExposureLimits.duration(longExposureSeconds))
+        guard setup != lastObservedSetup else { return }
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
         if let data = try? encoder.encode(setup), data != lastSavedSetup {
             lastSavedSetup = data
             UserDefaults.standard.set(data, forKey: CameraLaunchPreferences.setupKey)
         }
+        lastObservedSetup = setup
     }
 
     private func restoreSetupIfReady() {
@@ -203,6 +220,8 @@ final class CameraViewModel: ObservableObject {
         panoramaSelected = !saved.video && (saved.panorama ?? (saved.style == "Panorama"))
         panoramaMethod = PanoramaMethod(rawValue: saved.panoramaMethod ?? "") ?? .sweep
         panoramaDirection = PanoramaDirection(rawValue: saved.panoramaDirection ?? "") ?? .right
+        longExposureStyle = LongExposureStyle(rawValue: saved.longExposureStyle ?? "") ?? .sky
+        longExposureSeconds = LongExposureLimits.duration(saved.longExposureSeconds ?? 30)
         captureStyle = saved.style == "Panorama" ? "Auto" : saved.style
         if panoramaSelected { captureStyle = "Auto" }
         if camera.dualEnabled && captureStyle == "Long Exposure" { captureStyle = "Auto" }
@@ -251,6 +270,8 @@ final class CameraViewModel: ObservableObject {
     @Published var dualBrightness: [Float] = [0, 0]
     private let store = CaptureStore()
     private var recoveryReadFailed = false
+    @Published private(set) var recoveryActionRunning = false
+    var canUseRecovery: Bool { !busy && !restoring && !recoveryActionRunning }
     private var launchTime = Date()
     private var storageTask: Task<Void, Never>?
     @Published private(set) var pendingPhoto: CapturedPhoto?
@@ -270,7 +291,7 @@ final class CameraViewModel: ObservableObject {
     }
     nonisolated static func isBriefStatus(_ message: String) -> Bool {
         if ["Saved", "Video saved", "Both photos saved", "Depth capture ready", "Eye focus ready",
-            "Ready to aim and shoot", "Unsaved capture discarded."].contains(message) { return true }
+            "Ready to aim and shoot", "Unsaved capture discarded.", "Panorama saved.", "Both panoramas saved."].contains(message) { return true }
         let words = message.split(separator: " ")
         return words.count == 3 && words[0] == "Saved" && Int(words[1]).map { $0 > 0 } == true && words[2] == "photos"
     }
@@ -285,16 +306,29 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var countdown = 0
     private var timerTask: Task<Void, Never>?
     private var controlsTask: Task<Void, Never>?
+    private(set) var controlsNeedApply = false
+    var controlBinding: Binding<CameraControls> {
+        Binding(get: { self.controls }, set: { value in
+            guard self.canConfigure else { return }
+            self.controls = value
+            self.scheduleControls()
+        })
+    }
     private var recordingRequested = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
-    @Published var controls = CameraControls()
+    @Published var controls = CameraControls() {
+        didSet {
+            // Presets supersede delayed edits; user bindings schedule their new value below.
+            controlsTask?.cancel(); controlsTask = nil; controlsNeedApply = false
+        }
+    }
     @Published var burstEnabled = false
     @Published var reviewingBurst = false
     @Published private(set) var burstPhotos: [CapturedPhoto] = []
     @Published private(set) var burstPreviews: [UIImage] = []
     @Published var selectedBurstIndex = 0
     @Published private(set) var recommendedBurstIndex = 0
-    var hasPendingCapture: Bool { panoramaRecovery != nil || restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
+    var hasPendingCapture: Bool { recoveryActionRunning || panoramaRecovery != nil || restoring || recoveryReadFailed || pendingPhoto != nil || pendingVideo != nil || !burstPhotos.isEmpty }
     var canShutter: Bool { panoramaRunning ? (active && !panoramaTakingPhoto && !finishPanoramaRequested) : camera.recording ? !busy : (camera.running && !busy && !configuring && preparingMode == nil && !hasPendingCapture && !resetOnReturn) }
 
     var videoButtonTitle: String {
@@ -368,11 +402,7 @@ final class CameraViewModel: ObservableObject {
         }
         guard canShutter else { return }
         if haptics { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-        if controlsTask != nil {
-            controlsTask?.cancel()
-            controlsTask = nil
-            applyControls()
-        }
+        flushPendingControls()
         if camera.recording {
             captureActivity = .processing
             busy = true
@@ -447,7 +477,9 @@ final class CameraViewModel: ObservableObject {
         engine.setDualEnabled(true, mode: mode)
     }
     func focus(at point: CGPoint, locked: Bool) {
-        guard camera.running, !busy, !configuring else { return }
+        guard camera.running, canConfigure else { return }
+        // Send all pending edits first; focus then overrides only its own settings.
+        flushPendingControls()
         if !exposurePointOnly { controls.automaticFocus = true; controls.facePriority = false }
         else { controls.automaticExposure = true }
         engine.focus(at: point, locked: locked, exposureOnly: exposurePointOnly)
@@ -458,14 +490,23 @@ final class CameraViewModel: ObservableObject {
         engine.focus(at: point, locked: locked, dualIndex: index, exposureOnly: exposurePointOnly)
     }
 
+    func flushPendingControls() {
+        guard controlsNeedApply else { return }
+        controlsTask?.cancel(); controlsTask = nil
+        applyControls()
+    }
+
     func applyControls() {
         guard !busy, !configuring, !hasPendingCapture, !camera.dualEnabled else { return }
-        captureStyle = "Auto"
-        engine.setControls(controls)
+        if captureStyle != "Long Exposure" { captureStyle = "Auto" }
+        engine.setControls(controls, changedOnly: controlsNeedApply)
+        controlsNeedApply = false
     }
 
     func scheduleControls() {
+        controlsNeedApply = true
         controlsTask?.cancel()
+        guard active else { controlsTask = nil; return }
         controlsTask = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 120_000_000) } catch { return }
             self?.applyControls()
@@ -589,7 +630,7 @@ final class CameraViewModel: ObservableObject {
         engine.setDepthEnabled(false)
     }
 
-    func enteredBackground() { saveSetup(); nightWork?.cancel(); panoramaWake?.yield(()) }
+    func enteredBackground() { saveSetup(); nightWork?.cancel(); panoramaWake?.yield(()); longExposureDelay?.cancel() }
 
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         CameraLaunchPreferences.prepareOnce()
@@ -600,7 +641,7 @@ final class CameraViewModel: ObservableObject {
         }
         restoredLens = launchSetup != nil
         settingsObservation = objectWillChange.sink { [weak self] _ in
-            Task { @MainActor [weak self] in self?.saveSetup() }
+            self?.scheduleSetupSave()
         }
         engine.onCaptureProgress = { [weak self] progress in
             Task { @MainActor [weak self] in
@@ -615,7 +656,10 @@ final class CameraViewModel: ObservableObject {
                 self.guides.image = image; self.guides.histogram = bins
             }
         }
-        Task { await restoreCaptures() }
+        Task {
+            await PanoramaFileStore.cleanupAbandonedStacks()
+            await restoreCaptures()
+        }
         engine.onMeter = { [weak self] meter in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -630,11 +674,12 @@ final class CameraViewModel: ObservableObject {
                 self.camera = updated
                 let advice = self.mode == .photo && self.camera.running
                     ? SceneAdvice.text(shutter: meter.currentShutter, iso: meter.currentISO,
-                                       dual: self.camera.dualEnabled, night: self.captureStyle == "Night") : nil
+                                       dual: self.camera.dualEnabled, night: self.captureStyle == "Night", panorama: self.panoramaSelected) : nil
                 if advice == self.adviceCandidate { self.adviceSamples += 1 }
                 else { self.adviceCandidate = advice; self.adviceSamples = 1 }
                 if self.adviceSamples >= 3 { self.sceneAdvice = advice }
                 self.restoreSetupIfReady()
+                if self.active && self.controlsNeedApply && self.canConfigure { self.applyControls() }
                 if self.resetOnReturn, self.active, self.canConfigure {
                     self.resetOnReturn = false
                     self.resetTemporarySettings()
@@ -721,7 +766,7 @@ final class CameraViewModel: ObservableObject {
     func setActive(_ value: Bool) {
         if !value {
             saveSetup()
-            nightWork?.cancel(); panoramaWake?.yield(())
+            nightWork?.cancel(); panoramaWake?.yield(()); longExposureDelay?.cancel()
             controlsTask?.cancel(); controlsTask = nil
             messageTask?.cancel(); messageTask = nil
             if let message, Self.isBriefStatus(message) { self.message = nil }
@@ -748,6 +793,7 @@ final class CameraViewModel: ObservableObject {
         permission = AVCaptureDevice.authorizationStatus(for: .video)
         if active && permission == .authorized && !editingPhoto && !(nightWork != nil && captureActivity == .processing) {
             engine.start()
+            if controlsNeedApply && canConfigure { applyControls() }
         } else { engine.stop() }
     }
 
@@ -1052,7 +1098,11 @@ final class CameraViewModel: ObservableObject {
     @Published var longExposureSeconds = 30.0
     @Published private(set) var longExposureRunning = false
     private var finishLongExposureRequested = false
-    func finishLongExposure() { finishLongExposureRequested = true }
+    private var longExposureDelay: Task<Void, Error>?
+    func finishLongExposure() {
+        finishLongExposureRequested = true
+        longExposureDelay?.cancel()
+    }
     func enableLongExposure() {
         guard canConfigure, mode == .photo, !camera.dualEnabled, !panoramaSelected else { return }
         burstEnabled = false
@@ -1076,6 +1126,7 @@ final class CameraViewModel: ObservableObject {
             defer {
                 if sequenceBegan { self.engine.endLongExposure() }
                 PanoramaFileStore.remove(directory)
+                self.longExposureDelay?.cancel(); self.longExposureDelay = nil
                 self.nightWork = nil; self.longExposureRunning = false
                 if self.active { self.engine.start() }
             }
@@ -1100,8 +1151,17 @@ final class CameraViewModel: ObservableObject {
                     guard bytes + photo.data.count <= LongExposureLimits.diskBytes else { break }
                     let written = try await PanoramaFileStore.write([photo.data], directory: directory, frame: files.count)
                     files.append(contentsOf: written); bytes += photo.data.count
+                    guard self.active, !work.cancelled else { throw CancellationError() }
                     let interval = max(0, duration / Double(LongExposureLimits.frameCount) - (ProcessInfo.processInfo.systemUptime - frameStart))
-                    if interval > 0 { try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000)) }
+                    if interval > 0 && !self.finishLongExposureRequested {
+                        let delay = Task { try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000)) }
+                        self.longExposureDelay = delay
+                        do { try await delay.value }
+                        catch {
+                            guard self.finishLongExposureRequested && self.active && !work.cancelled else { throw CancellationError() }
+                        }
+                        self.longExposureDelay = nil
+                    }
                 }
                 self.longExposureRunning = false; self.captureActivity = .processing
                 self.engine.stop()
@@ -1185,7 +1245,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     var canSavePanoramaPhoto: Bool {
-        !busy && panoramaRecovery?.saved == false && panoramaRecovery?.readyToSave == false && pendingPhoto != nil
+        canUseRecovery && panoramaRecovery?.saved == false && panoramaRecovery?.readyToSave == false && pendingPhoto != nil
     }
     func saveAvailablePanoramaPhoto() async {
         guard canSavePanoramaPhoto, var journal = panoramaRecovery else { return }
@@ -1203,7 +1263,9 @@ final class CameraViewModel: ObservableObject {
     }
 
     func retrySave() async {
-        guard !busy else { return }
+        guard canUseRecovery else { return }
+        recoveryActionRunning = true
+        defer { recoveryActionRunning = false }
         if recoveryReadFailed { restoring = true; await restoreCaptures(); return }
         if panoramaRecovery?.saved == true {
             do {
@@ -1362,7 +1424,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     func discard() {
-        guard !busy else { return }
+        guard canUseRecovery else { return }
         busy = true
         Task {
             do {

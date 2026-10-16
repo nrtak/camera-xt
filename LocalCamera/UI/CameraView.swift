@@ -260,7 +260,7 @@ struct CameraView: View {
                     .font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
             }
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
-                if sceneHints, model.canConfigure, model.mode == .photo, model.message == nil, let advice = model.sceneAdvice {
+                if sceneHints, model.canConfigure, !model.panoramaSelected, model.mode == .photo, model.message == nil, let advice = model.sceneAdvice {
                     Button { openTool(.shoot) } label: {
                         Label(advice, systemImage: "moon").font(.caption).padding(8).frame(minHeight: 44)
                     }
@@ -333,7 +333,7 @@ struct CameraView: View {
                         .font(.callout).accessibilityLabel(message)
                     if model.busy && showHelp { Text(message).font(.caption) }
                 }
-                if model.hasPendingCapture && !model.busy {
+                if model.hasPendingCapture && model.canUseRecovery {
                     ViewThatFits(in: .horizontal) {
                         HStack { saveRecovery }
                         VStack { saveRecovery }
@@ -357,11 +357,17 @@ struct CameraView: View {
                 }
             } else {
                 if model.mode == .photo {
-                    quickControl("Flash", icon: model.controls.flash == .off ? "bolt.slash" : "bolt.fill",
-                                 value: model.controls.flash == .off ? "Off" : model.controls.flash == .auto ? "Auto" : "On",
-                                 active: model.controls.flash != .off) {
-                        model.controls.flash = model.controls.flash == .off ? .auto : model.controls.flash == .auto ? .on : .off
-                    }.disabled(!model.camera.flashAvailable || model.camera.dualEnabled)
+                    if !model.panoramaSelected {
+                        quickControl("Flash", icon: model.controls.flash == .off ? "bolt.slash" : "bolt.fill",
+                                     value: model.controls.flash == .off ? "Off" : model.controls.flash == .auto ? "Auto" : "On",
+                                     active: model.controls.flash != .off) {
+                            model.controlBinding.flash.wrappedValue = model.controls.flash == .off ? .auto : model.controls.flash == .auto ? .on : .off
+                        }.disabled(!model.camera.flashAvailable || model.camera.dualEnabled)
+                    } else {
+                        quickControl("Direction", icon: model.panoramaDirection.symbol, value: model.panoramaDirection.rawValue) {
+                            model.panoramaDirection = model.panoramaDirection == .right ? .left : .right
+                        }
+                    }
                     quickControl("Timer", icon: "timer", value: model.timerSeconds == 0 ? "Off" : "\(model.timerSeconds)s", active: model.timerSeconds > 0) {
                         model.timerSeconds = model.timerSeconds == 0 ? 3 : model.timerSeconds == 3 ? 10 : 0
                     }
@@ -1202,12 +1208,12 @@ private struct ManualCameraControls: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             if page == .exposure {
-                Toggle("Automatic exposure", isOn: $model.controls.automaticExposure)
+                Toggle("Automatic exposure", isOn: model.controlBinding.automaticExposure)
                     .disabled(!model.camera.customExposureAvailable)
                 if !model.controls.automaticExposure && model.camera.customExposureAvailable {
                     LabeledContent("ISO", value: "\(Int(model.controls.iso))")
-                    Slider(value: $model.controls.iso, in: model.camera.minISO...max(model.camera.minISO + 1, model.camera.maxISO), step: 1).accessibilityLabel("ISO")
-                    Picker("Shutter", selection: $model.controls.shutterSeconds) {
+                    Slider(value: model.controlBinding.iso, in: model.camera.minISO...max(model.camera.minISO + 1, model.camera.maxISO), step: 1).accessibilityLabel("ISO")
+                    Picker("Shutter", selection: model.controlBinding.shutterSeconds) {
                         ForEach(shutters, id: \.self) { denominator in
                             Text(denominator == 1 ? "1 second" : "1/\(denominator) s").tag(1.0 / Double(denominator))
                         }
@@ -1221,30 +1227,30 @@ private struct ManualCameraControls: View {
                         Slider(value: $model.exposureBias, in: -2...2, step: 0.1).accessibilityLabel("Exposure compensation")
                     }
                 }
-                if model.mode == .photo && model.camera.flashAvailable {
-                    Picker("Flash", selection: $model.controls.flash) {
+                if model.mode == .photo && model.camera.flashAvailable && !model.panoramaSelected {
+                    Picker("Flash", selection: model.controlBinding.flash) {
                         Text("Off").tag(AVCaptureDevice.FlashMode.off); Text("Auto").tag(AVCaptureDevice.FlashMode.auto); Text("On").tag(AVCaptureDevice.FlashMode.on)
                     }.pickerStyle(.segmented)
                 }
             } else if page == .color {
-                Toggle("Automatic color", isOn: $model.controls.automaticWhiteBalance)
+                Toggle("Automatic color", isOn: model.controlBinding.automaticWhiteBalance)
                     .disabled(!model.camera.whiteBalanceAvailable)
                 if !model.controls.automaticWhiteBalance && model.camera.whiteBalanceAvailable {
                     LabeledContent("Temperature", value: "\(Int(model.controls.temperature)) K")
-                    Slider(value: $model.controls.temperature, in: 2500...10000, step: 100).accessibilityLabel("White balance temperature")
+                    Slider(value: model.controlBinding.temperature, in: 2500...10000, step: 100).accessibilityLabel("White balance temperature")
                     LabeledContent("Tint", value: "\(Int(model.controls.tint))")
-                    Slider(value: $model.controls.tint, in: -100...100, step: 1).accessibilityLabel("White balance tint")
+                    Slider(value: model.controlBinding.tint, in: -100...100, step: 1).accessibilityLabel("White balance tint")
                 }
                 Text("Automatic color adjusts to the light around you.").font(.footnote)
             } else {
-                Toggle("Automatic focus", isOn: $model.controls.automaticFocus)
+                Toggle("Automatic focus", isOn: model.controlBinding.automaticFocus)
                     .disabled(!model.camera.manualFocusAvailable)
                 if model.controls.automaticFocus {
-                    Toggle("Prefer faces", isOn: $model.controls.facePriority)
+                    Toggle("Prefer faces", isOn: model.controlBinding.facePriority)
                 } else if model.camera.manualFocusAvailable {
                     HStack {
                         Text("Near")
-                        Slider(value: $model.controls.lensPosition, in: 0...1).accessibilityLabel("Focus distance")
+                        Slider(value: model.controlBinding.lensPosition, in: 0...1).accessibilityLabel("Focus distance")
                         Text("Far")
                     }
                 }
@@ -1253,7 +1259,6 @@ private struct ManualCameraControls: View {
             Text("Changes appear in the preview.").font(.caption).foregroundStyle(.secondary)
             Button("Reset to automatic", action: model.resetControls).buttonStyle(.bordered)
         }.disabled(!model.canConfigure)
-            .onChange(of: model.controls) { _, _ in model.scheduleControls() }
     }
 }
 
