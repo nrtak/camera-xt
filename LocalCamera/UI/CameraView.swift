@@ -303,9 +303,12 @@ struct CameraView: View {
                     }
                     if model.panoramaRunning {
                         HStack {
-                            Text("\(model.panoramaFrames) photos · \(model.panoramaElapsed)s / \(model.panoramaMethod.maximumSeconds)s").font(.caption.monospacedDigit())
+                            Text(model.panoramaMethod == .stitch ? "\(model.panoramaFrames) photos / 36" : "\(model.panoramaFrames) photos · \(model.panoramaElapsed)s / \(model.panoramaMethod.maximumSeconds)s").font(.caption.monospacedDigit())
                             Spacer()
                             if model.panoramaMethod == .stitch {
+                                Button("Undo") { model.undoPanorama() }
+                                    .frame(minWidth: 44, minHeight: 44).disabled(!model.canUndoPanorama)
+                                    .accessibilityLabel("Remove last panorama photo")
                                 Button("Finish") { model.finishPanorama() }
                                     .fontWeight(.semibold).frame(minWidth: 60, minHeight: 44)
                             }
@@ -675,7 +678,7 @@ struct CameraView: View {
     }
 
     @ViewBuilder private var saveRecovery: some View {
-        Button("Retry save") { Task { await model.retrySave() } }
+        Button(model.panoramaRecovery?.saved == true ? "Finish cleanup" : model.panoramaRecovery?.readyToSave == false ? "Finish panorama" : "Retry save") { Task { await model.retrySave() } }
         Button("Settings", action: openSettings)
         Button("Discard", role: .destructive) { confirmDiscard = true }
     }
@@ -806,7 +809,7 @@ struct CameraView: View {
                     }.pickerStyle(.segmented)
                     Text(model.panoramaMethod.instructions)
                     Text("Beta: saves JPEG panoramas separately for each lens. Capture is limited to 36 photos (45 seconds for Sweep, 3 minutes for Stitch); stitching runs one lens at a time afterward. Up to 32 MP per result, depending on sweep and cropping. Not a 360° capture. Moving subjects, close objects and large turns may show seams.").font(.caption)
-                    Text("If stitching fails, the starting photo or pair is saved instead.").font(.caption)
+                    Text("Accepted shots stay on this iPhone until saved or discarded. In Dual, a failed view keeps a reference photo while the successful panorama is retained.").font(.caption)
                     Button("Use panorama") { model.enablePanorama(); showsCaptureInfo = false }
                         .buttonStyle(.borderedProminent).foregroundStyle(.black).disabled(!model.canConfigure || model.mode != .photo)
                 }
