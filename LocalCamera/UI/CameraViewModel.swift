@@ -59,12 +59,12 @@ final class PhotoRescueModel: ObservableObject {
         result = nil
         source = nil
         saved = false
-        message = "Loading photoÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+        message = "Loading photo…"
         do {
             guard let data = try await item.loadTransferable(type: Data.self) else { throw CameraFailure.noPhoto }
             if work.cancelled { throw CancellationError() }
             source = data
-            message = "Adjusting on this iPhoneÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+            message = "Adjusting on this iPhone…"
             result = try await PhotoRescueProcessor.process(data, strength: strength, look: look, cancellation: work)
             message = nil
         } catch is CancellationError { message = "Processing paused. Choose the photo again when ready." }
@@ -76,7 +76,7 @@ final class PhotoRescueModel: ObservableObject {
         let work = NightWorkCancellation(); processingWork = work
         defer { processingWork = nil }
         busy = true
-        message = "Adjusting on this iPhoneÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+        message = "Adjusting on this iPhone…"
         do {
             result = try await PhotoRescueProcessor.process(source, strength: strength, look: look, cancellation: work)
             saved = false
@@ -287,8 +287,8 @@ final class CameraViewModel: ObservableObject {
     var canShutter: Bool { camera.recording ? !busy : (camera.running && !busy && !configuring && preparingMode == nil && !hasPendingCapture && !resetOnReturn) }
 
     var videoButtonTitle: String {
-        if busy { return captureActivity == .saving ? "SavingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" : camera.recording || captureActivity == .processing ? "FinishingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" : "StartingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" }
-        if configuring || preparingMode != nil { return "PreparingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" }
+        if busy { return captureActivity == .saving ? "Saving…" : camera.recording || captureActivity == .processing ? "Finishing…" : "Starting…" }
+        if configuring || preparingMode != nil { return "Preparing…" }
         return camera.recording ? "Stop recording" : "Start video"
     }
 
@@ -357,7 +357,7 @@ final class CameraViewModel: ObservableObject {
                 let status = AVCaptureDevice.authorizationStatus(for: .audio)
                 if status == .notDetermined { _ = await AVCaptureDevice.requestAccess(for: .audio) }
                 guard active else { busy = false; recordingRequested = false; return }
-                message = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized ? "Starting recordingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" : "Starting without sound Ãƒâ€šÃ‚Â· microphone access is off"
+                message = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized ? "Starting recording…" : "Starting without sound · microphone access is off"
                 backgroundTask = UIApplication.shared.beginBackgroundTask { [weak self] in
                     self?.engine.stopRecording()
                     self?.endBackgroundTask()
@@ -463,7 +463,7 @@ final class CameraViewModel: ObservableObject {
         timerSeconds = 0
         applyControls()
         captureStyle = "Action"
-        message = "Action Ãƒâ€šÃ‚Â· 3 shots at 1/500 s. Dim light may look noisy or dark."
+        message = "Action · 3 shots at 1/500 s. Dim light may look noisy or dark."
     }
 
     func nightPreset() { setNightEnabled(true) }
@@ -482,7 +482,7 @@ final class CameraViewModel: ObservableObject {
         }
         if enabled && camera.dualEnabled { setDualMode(.detail) }
         captureStyle = enabled ? "Night" : "Auto"
-        message = enabled ? "Night Ãƒâ€šÃ‚Â· Beta. Hold still. Matching frames are combined; a reference original is retained." : nil
+        message = enabled ? "Night · Beta. Hold still. Matching frames are combined; a reference original is retained." : nil
     }
 
     var canConfigure: Bool { !busy && !configuring && !hasPendingCapture && !camera.recording }
@@ -760,7 +760,7 @@ final class CameraViewModel: ObservableObject {
         if captureStyle == "Long Exposure" && !camera.dualEnabled { captureLongExposure(); return }
         if captureStyle == "Night" { captureNight(); return }
         if burstEnabled && !camera.dualEnabled {
-            message = "Capturing burstÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+            message = "Capturing burst…"
             engine.captureBurst { [weak self] result in
                 switch result {
                 case .failure(let error):
@@ -797,7 +797,7 @@ final class CameraViewModel: ObservableObject {
             }
             return
         }
-        message = "CapturingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+        message = "Capturing…"
         expectingCaptureProgress = true
         let captureStarted = ProcessInfo.processInfo.systemUptime
         engine.capture { [weak self] result in
@@ -858,12 +858,12 @@ final class CameraViewModel: ObservableObject {
                     guard self.active, !work.cancelled else { throw CancellationError() }
                     if !files.isEmpty && (self.finishLongExposureRequested || ProcessInfo.processInfo.systemUptime - started >= duration) { break }
                     let frameStart = ProcessInfo.processInfo.systemUptime
-                    self.message = "\(style.rawValue) Ãƒâ€šÃ‚Â· \(Int(frameStart - started)) / \(Int(duration)) s Ãƒâ€šÃ‚Â· \(files.count) frames"
+                    self.message = "\(style.rawValue) · \(Int(frameStart - started)) / \(Int(duration)) s · \(files.count) frames"
                     let photo: CapturedPhoto = try await withCheckedThrowingContinuation { continuation in
                         self.engine.capture(night: true) { continuation.resume(with: $0) }
                     }
                     if reference == nil {
-                        var original = photo; original.lensLabel = "\(photo.lensLabel ?? "Camera") Ãƒâ€šÃ‚Â· Reference"
+                        var original = photo; original.lensLabel = "\(photo.lensLabel ?? "Camera") · Reference"
                         reference = original; self.pendingPhoto = original
                         try await self.store.stage(original); self.recoveryProtected = true
                     }
@@ -877,7 +877,7 @@ final class CameraViewModel: ObservableObject {
                 }
                 self.longExposureRunning = false; self.captureActivity = .processing
                 self.engine.stop()
-                self.message = "Combining \(files.count) frames on this iPhoneÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+                self.message = "Combining \(files.count) frames on this iPhone…"
                 var output = try await LongExposureRenderer.process(files, style: style, cancellation: work)
                 if let reference { output.companions = [reference] }
                 self.pendingPhoto = output
@@ -899,7 +899,7 @@ final class CameraViewModel: ObservableObject {
         let work = NightWorkCancellation()
         nightWork = work
         expectingCaptureProgress = true
-        message = "Night Ãƒâ€šÃ‚Â· hold still"
+        message = "Night · hold still"
         engine.captureNight(cancellation: work) { [weak self] result in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -928,7 +928,7 @@ final class CameraViewModel: ObservableObject {
                     // Release live camera work while the bounded image merge runs.
                     self.engine.stop()
                     if !self.active { work.cancel() }
-                    self.message = "Night Ãƒâ€šÃ‚Â· checking alignment and preserving detailÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+                    self.message = "Night · checking alignment and preserving detail…"
                     self.captureActivity = .processing
                     if let photo = await NightPhotoProcessor.process(frames, cancellation: work) {
                         self.pendingPhoto = photo
@@ -966,7 +966,7 @@ final class CameraViewModel: ObservableObject {
         guard pendingVideo != nil || pendingPhoto != nil else { return }
         captureActivity = .saving
         busy = true
-        message = "Saving Ãƒâ€šÃ‚Â· protecting a local recovery copyÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+        message = "Saving · protecting a local recovery copy…"
         defer { busy = false }
         do {
             if let video = pendingVideo {
@@ -980,7 +980,7 @@ final class CameraViewModel: ObservableObject {
             message = "Could not protect this capture on disk. Keep Camera XT open, free storage, then retry. \(error.localizedDescription)"
             return
         }
-        message = "Saving to PhotosÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+        message = "Saving to Photos…"
         let saveStarted = ProcessInfo.processInfo.systemUptime
         do {
             let thumbnail: Data?
