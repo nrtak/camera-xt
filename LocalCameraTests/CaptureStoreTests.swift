@@ -4,6 +4,25 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testPanoramaPreferencesRoundTripAndOlderSettingsDecode() throws {
+        var setup = SavedCameraSetup(lensID: nil, video: false, dual: true, dualMode: "Fast",
+            style: "Auto", controls: CameraControls(), bias: 0, dualBrightness: [0, 0], zooms: [],
+            timer: 0, burst: false, videoWidth: 1920, videoFPS: 30, stabilization: true,
+            depth: false, eye: false, analysis: "Off", exposurePointOnly: false)
+        setup.panorama = true; setup.panoramaMethod = "Stitch"; setup.panoramaDirection = "Left"
+        let data = try JSONEncoder().encode(setup)
+        let restored = try JSONDecoder().decode(SavedCameraSetup.self, from: data)
+        XCTAssertEqual(restored.panorama, true)
+        XCTAssertEqual(restored.panoramaMethod, "Stitch")
+        XCTAssertEqual(restored.panoramaDirection, "Left")
+        var old = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        for key in ["panorama", "panoramaMethod", "panoramaDirection"] { old.removeValue(forKey: key) }
+        old["style"] = "Panorama"
+        let legacy = try JSONDecoder().decode(SavedCameraSetup.self, from: JSONSerialization.data(withJSONObject: old))
+        XCTAssertNil(legacy.panorama)
+        XCTAssertEqual(legacy.style, "Panorama")
+    }
+
     func testPanoramaPolicyRejectsReverseFastAndVerticalMovement() {
         let size = CGSize(width: 512, height: 384)
         XCTAssertTrue(PanoramaPolicy.accepts(CGAffineTransform(translationX: 80, y: 2), size: size, direction: .right))
@@ -38,6 +57,19 @@ final class CaptureStoreTests: XCTestCase {
             let data = try XCTUnwrap(UIImage(cgImage: crop).pngData())
             let file = directory.appendingPathComponent("\(offset).png"); try data.write(to: file); files.append(file)
         }
+        let next = try Data(contentsOf: files[1])
+        let same = try Data(contentsOf: files[0])
+        let accepted = try await PanoramaStitcher.checkOverlap(previous: [files[0], files[0]], next: [next, next], direction: .right, cancellation: NightWorkCancellation())
+        XCTAssertTrue(accepted)
+        let oneStationary = try await PanoramaStitcher.checkOverlap(previous: [files[0], files[0]], next: [next, same], direction: .right, cancellation: NightWorkCancellation())
+        XCTAssertFalse(oneStationary, "Both lenses must overlap and move before accepting the pair")
+        let reversed = try await PanoramaStitcher.checkOverlap(previous: [files[0]], next: [next], direction: .left, cancellation: NightWorkCancellation())
+        XCTAssertFalse(reversed)
+        let staged = try await PanoramaFileStore.write([next, same], directory: directory.appendingPathComponent("staged"), frame: 1)
+        XCTAssertEqual(try Data(contentsOf: staged[0]), next)
+        XCTAssertEqual(try Data(contentsOf: staged[1]), same)
+        let thumbnail = try await PanoramaFileStore.thumbnail(next)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(UIImage(data: thumbnail)).size.width, 240)
         for direction in PanoramaDirection.allCases {
             let ordered = direction == .right ? files : Array(files.reversed())
             let result = try await PanoramaStitcher.process(files: [ordered, ordered], labels: ["Main", "Ultra Wide"], direction: direction, cancellation: NightWorkCancellation())
