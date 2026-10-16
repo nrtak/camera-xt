@@ -10,7 +10,7 @@ enum PanoramaMethod: String, CaseIterable {
     var instructions: String {
         self == .sweep
             ? "Move slowly in the arrow direction. Tap the shutter again to finish."
-            : "Take overlapping photos in the arrow direction, keeping at least two-thirds of the scene shared. Tap Finish to combine them."
+            : "Take at least 3 overlapping photos in the arrow direction, keeping at least two-thirds of the scene shared. Tap Finish to combine them."
     }
 }
 
@@ -44,6 +44,10 @@ enum PanoramaPolicy {
     static let maximumPixels = 32_000_000
     static let maximumDiskBytes = 256_000_000
     static let sourceDimension = 3072
+    static let minimumFrames = 3
+    static func canFinish(frames: Int, takingPhoto: Bool) -> Bool {
+        frames >= minimumFrames && !takingPhoto
+    }
     static let maximumFrames = 36
     static let maximumSeconds = 45.0
     static func accepts(_ offset: CGAffineTransform, size: CGSize, direction: PanoramaDirection) -> Bool {
@@ -243,7 +247,7 @@ final class PanoramaStitcher {
     }
 
     private func finish() throws -> CapturedPhoto {
-        guard let strip = strips.first, strip.frames >= 3,
+        guard let strip = strips.first, strip.frames >= PanoramaPolicy.minimumFrames,
               strip.bounds.width > strip.commonY.width * 1.2 else { throw PanoramaFailure.tooShort }
         let crop = CGRect(x: 0, y: ceil(strip.commonY.minY - strip.bounds.minY),
             width: CGFloat(strip.canvas.width), height: floor(strip.commonY.height) - 1)
@@ -270,6 +274,7 @@ enum PanoramaFileStore {
         var direction: String
         var readyToSave = false
         var saved = false
+        var stopNotice: String? = nil
         func urls(in directory: URL) -> [[URL]] { files.map { $0.map { directory.appendingPathComponent($0) } } }
     }
     static var recoveryDirectory: URL {

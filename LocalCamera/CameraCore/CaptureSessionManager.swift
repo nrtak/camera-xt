@@ -890,17 +890,23 @@ final class CaptureSessionManager {
         }
     }
 
-    func setControls(_ value: CameraControls, changedOnly: Bool = false) {
+    func setControls(_ value: CameraControls, changedOnly: Bool = false, completion: ((Bool) -> Void)? = nil) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
-                  let device = self.input?.device else { return }
+                  let device = self.input?.device else { completion?(false); return }
+            let previous = self.controls
             do {
-                let changes = CameraControlChanges(from: self.controls, to: value)
+                let changes = CameraControlChanges(from: previous, to: value)
                 self.controls = value
-                if !value.automaticFocus && (!changedOnly || changes.focus) { self.disableEyeFocus() }
                 try self.applyControls(to: device, changes: changedOnly ? changes : nil)
+                if !value.automaticFocus && (!changedOnly || changes.focus) { self.disableEyeFocus() }
                 self.publish()
-            } catch { self.publish(message: error.localizedDescription) }
+                completion?(true)
+            } catch {
+                self.controls = previous
+                self.publish(message: error.localizedDescription)
+                completion?(false)
+            }
         }
     }
 
@@ -908,9 +914,9 @@ final class CaptureSessionManager {
         let updateFocus = automatic || changes?.focus != false
         let updateExposure = automatic || changes?.exposure != false
         let updateWhiteBalance = automatic || changes?.whiteBalance != false
-        if updateFocus { focusRequests[device.uniqueID] = nil }
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
+        if updateFocus { focusRequests[device.uniqueID] = nil }
         if automatic {
             if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5) }
             if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5) }
