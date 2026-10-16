@@ -1075,7 +1075,7 @@ final class CameraViewModel: ObservableObject {
             var sequenceBegan = false
             defer {
                 if sequenceBegan { self.engine.endLongExposure() }
-                try? FileManager.default.removeItem(at: directory)
+                PanoramaFileStore.remove(directory)
                 self.nightWork = nil; self.longExposureRunning = false
                 if self.active { self.engine.start() }
             }
@@ -1182,6 +1182,24 @@ final class CameraViewModel: ObservableObject {
         reviewingBurst = false
         await savePending()
         if active { engine.start() }
+    }
+
+    var canSavePanoramaPhoto: Bool {
+        !busy && panoramaRecovery?.saved == false && panoramaRecovery?.readyToSave == false && pendingPhoto != nil
+    }
+    func saveAvailablePanoramaPhoto() async {
+        guard canSavePanoramaPhoto, var journal = panoramaRecovery else { return }
+        busy = true
+        do {
+            journal.readyToSave = true
+            try await PanoramaFileStore.checkpoint(journal)
+            panoramaRecovery = journal
+            pendingPhoto?.warning = "Available photo saved. Panorama could not be completed."
+            await savePending()
+        } catch {
+            message = "Could not prepare the recovered photo. Your shots are still protected."
+        }
+        busy = false
     }
 
     func retrySave() async {
