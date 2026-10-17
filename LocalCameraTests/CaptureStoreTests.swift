@@ -4,6 +4,80 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testShutterChoicesRespectVideoFrameDurationAndKeepSelectionValid() {
+        let choices = ShutterOptions.values(minimum: 1.0 / 8000, maximum: 1.0 / 120, requested: 1)
+        XCTAssertTrue(choices.allSatisfy { $0 >= 1.0 / 8000 && $0 <= 1.0 / 120 })
+        XCTAssertTrue(choices.contains(1.0 / 120))
+        XCTAssertEqual(Set(choices).count, choices.count)
+        XCTAssertTrue(ShutterOptions.values(minimum: 0, maximum: 1, requested: 1).isEmpty)
+        XCTAssertTrue(ShutterOptions.values(minimum: 1, maximum: 0.5, requested: 1).isEmpty)
+        XCTAssertTrue(ShutterOptions.values(minimum: 0.001, maximum: 1, requested: .nan).allSatisfy { $0.isFinite })
+    }
+
+    func testVideoPresetRecoversAfterSwitchingToLessCapableLens() {
+        let options = [VideoQuality(width: 1920, fps: 60), VideoQuality(width: 1920, fps: 30)]
+        XCTAssertEqual(VideoQuality.resolve(width: 3840, fps: 120, from: options), options[0])
+        XCTAssertEqual(VideoQuality.resolve(width: 1920, fps: 120, from: options), options[0])
+        XCTAssertEqual(VideoQuality.resolve(width: 1920, fps: 30, from: options), options[1])
+        XCTAssertEqual(VideoQuality.resolve(width: 0, fps: 0, from: options), options[0])
+        XCTAssertNil(VideoQuality.resolve(width: 3840, fps: 60, from: []))
+    }
+
+    func testResolutionChangePreservesCompatibleRateAndFallsBackSafely() {
+        let options = [VideoQuality(width: 3840, fps: 60), VideoQuality(width: 3840, fps: 30),
+                       VideoQuality(width: 1920, fps: 120), VideoQuality(width: 1920, fps: 30)]
+        XCTAssertEqual(VideoQuality.selectWidth(3840, keepingFPS: 30, from: options)?.fps, 30)
+        XCTAssertEqual(VideoQuality.selectWidth(3840, keepingFPS: 120, from: options)?.fps, 60)
+        XCTAssertEqual(VideoQuality.selectWidth(1920, keepingFPS: nil, from: options)?.fps, 120)
+        XCTAssertNil(VideoQuality.selectWidth(1280, keepingFPS: 30, from: options))
+        XCTAssertNil(VideoQuality.selectWidth(3840, keepingFPS: 60, from: []))
+    }
+
+    func testAdaptiveToolPanelLeavesPreviewVisibleAndAvoidsShutterArea() {
+        let bounds = CGRect(x: 0, y: 0, width: 820, height: 280)
+        let image = CGRect(x: 40, y: 0, width: 740, height: 402)
+        let side = PreviewGeometry.panelRect(image: image, bounds: bounds, preferredHeight: 460, sidePanel: true)
+        XCTAssertTrue(image.intersection(bounds).contains(side))
+        XCTAssertLessThanOrEqual(side.width, 340)
+        XCTAssertGreaterThan(side.minX, image.midX)
+        XCTAssertEqual(side.maxY, bounds.maxY - 10)
+        let portrait = PreviewGeometry.panelRect(image: image, bounds: bounds, preferredHeight: 120)
+        XCTAssertEqual(portrait.maxY, bounds.maxY - 10)
+        XCTAssertEqual(portrait.height, 120)
+    }
+
+    func testVideoQualityPrefersResolutionThenFrameRate() {
+        let options = [VideoQuality(width: 1920, fps: 240), VideoQuality(width: 3840, fps: 30),
+                       VideoQuality(width: 3840, fps: 120), VideoQuality(width: 3840, fps: 120)]
+        let ranked = VideoQuality.ranked(options)
+        XCTAssertEqual(ranked.first, VideoQuality(width: 3840, fps: 120))
+        XCTAssertEqual(ranked.count, 3)
+        XCTAssertEqual(VideoQuality.ranked([VideoQuality(width: 1280, fps: 30)]).first?.width, 1280)
+        XCTAssertTrue(VideoQuality.ranked([]).isEmpty)
+    }
+
+    func testToolPanelStaysInsideVisibleImageAcrossOrientations() {
+        for bounds in [CGRect(x: 0, y: 0, width: 402, height: 820), CGRect(x: 0, y: 0, width: 820, height: 402)] {
+            let image = bounds.insetBy(dx: 20, dy: 80)
+            for height in [CGFloat(360), 620, .infinity] {
+                let panel = PreviewGeometry.panelRect(image: image, bounds: bounds, preferredHeight: height)
+                XCTAssertTrue(PreviewGeometry.isValid(panel))
+                XCTAssertTrue(image.contains(panel), "Menus must not extend into letterboxing")
+                XCTAssertLessThanOrEqual(panel.height, image.height - 20)
+            }
+        }
+    }
+
+    func testToolPanelHandlesCameraStartupAndInvalidFrames() {
+        let bounds = CGRect(x: 0, y: 0, width: 402, height: 820)
+        for image in [CGRect.zero, CGRect.null, CGRect(x: 900, y: 900, width: 100, height: 100)] {
+            let panel = PreviewGeometry.panelRect(image: image, bounds: bounds, preferredHeight: 360)
+            XCTAssertTrue(PreviewGeometry.isValid(panel))
+            XCTAssertTrue(bounds.contains(panel))
+        }
+        XCTAssertEqual(PreviewGeometry.panelRect(image: .zero, bounds: .zero, preferredHeight: 360), .zero)
+    }
+
     @MainActor
     func testFocusThenShutterShareOneControlAcknowledgment() {
         let waiters = ControlUpdateWaiters()
