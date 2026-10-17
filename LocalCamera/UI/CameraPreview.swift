@@ -14,6 +14,7 @@ struct CameraPreview: UIViewRepresentable {
     var exposureOnly = false
     var showsGrid = false
     var guideImage: UIImage?
+    var onImageFrame: ((CGRect) -> Void)?
 
     final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
@@ -21,6 +22,8 @@ struct CameraPreview: UIViewRepresentable {
         let grid = CAShapeLayer()
         let guide = UIImageView()
         private var gridFrame = CGRect.null
+        private var visibleImageFrame = CGRect.zero
+        var imageFrameChanged: ((CGRect) -> Void)?
         var orientationChanged: ((AVCaptureVideoOrientation) -> Void)?
         private var lastOrientation: UIInterfaceOrientation = .unknown
         override func layoutSubviews() {
@@ -32,14 +35,25 @@ struct CameraPreview: UIViewRepresentable {
             }
             updateOverlays()
         }
+        private func publishImageFrame(_ frame: CGRect) {
+            let valid = PreviewGeometry.isValid(frame) ? frame : .zero
+            guard visibleImageFrame != valid else { return }
+            visibleImageFrame = valid
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.imageFrameChanged?(self.visibleImageFrame)
+            }
+        }
         func updateOverlays() {
             if grid.superlayer == nil { layer.addSublayer(grid) }
             if guide.superview == nil { guide.isUserInteractionEnabled = false; guide.contentMode = .scaleAspectFit; addSubview(guide) }
             let frame = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
             guard PreviewGeometry.isValid(frame) else {
                 grid.path = nil; guide.frame = .zero; gridFrame = .null
+                publishImageFrame(.zero)
                 return
             }
+            publishImageFrame(frame.intersection(bounds))
             guard gridFrame != frame else { return }
             gridFrame = frame
             guide.frame = frame
@@ -102,6 +116,7 @@ struct CameraPreview: UIViewRepresentable {
             engine?.setInterfaceOrientation(orientation) { view?.updateOverlays() }
         }
         view.clipsToBounds = true
+        view.imageFrameChanged = onImageFrame
         view.previewLayer.videoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if allowsFocus {
             let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:)))
@@ -116,6 +131,7 @@ struct CameraPreview: UIViewRepresentable {
         let gravity: AVLayerVideoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if view.previewLayer.videoGravity != gravity { view.previewLayer.videoGravity = gravity }
         context.coordinator.onFocus = onFocus
+        view.imageFrameChanged = onImageFrame
         context.coordinator.showsFocusFeedback = showsFocusFeedback
         context.coordinator.exposureOnly = exposureOnly
         context.coordinator.marker?.isHidden = !showsFocusFeedback
@@ -129,6 +145,16 @@ struct CameraPreview: UIViewRepresentable {
 
 /// Reject transient invalid camera geometry before assigning CALayer/UIView frames.
 enum PreviewGeometry {
+    static func panelRect(image: CGRect, bounds: CGRect, preferredHeight: CGFloat, sidePanel: Bool = false) -> CGRect {
+        guard isValid(bounds) else { return .zero }
+        let intersection = image.intersection(bounds)
+        let visible = isValid(intersection) ? intersection : bounds
+        let inset = visible.insetBy(dx: min(10, visible.width / 4), dy: min(10, visible.height / 4))
+        let height = min(inset.height, max(0, preferredHeight))
+        let width = sidePanel ? min(340, inset.width * 0.48) : inset.width
+        return CGRect(x: sidePanel ? inset.maxX - width : inset.minX, y: inset.maxY - height, width: width, height: height)
+    }
+
     static func focusRect(at point: CGPoint, in frame: CGRect) -> CGRect? {
         guard isValid(frame), point.x.isFinite, point.y.isFinite, frame.contains(point) else { return nil }
         let width = min(64, frame.width), height = min(64, frame.height)

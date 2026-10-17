@@ -223,10 +223,11 @@ final class CameraViewModel: ObservableObject {
         }
         if launchStage == 1 {
             launchStage = 2
-            videoWidth = saved.videoWidth; videoFPS = saved.videoFPS; stabilization = saved.stabilization
+            // Each launch starts at the best supported recording preset.
+            videoWidth = 0; videoFPS = 0; stabilization = saved.stabilization
             if saved.dual && camera.dualAvailable {
                 configuring = true
-                engine.setDualEnabled(true, mode: saved.style == "Night" ? .detail : DualShotMode(rawValue: saved.dualMode) ?? .fast)
+                engine.setDualEnabled(true, mode: .detail)
                 return
             } else if saved.video {
                 configuring = true
@@ -319,8 +320,8 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var mode: CaptureMode = .photo
     @Published private(set) var preparingMode: CaptureMode?
     @Published private(set) var pendingVideo: URL?
-    @Published var videoWidth: Int32 = 1920
-    @Published var videoFPS: Int32 = 30
+    @Published var videoWidth: Int32 = 0
+    @Published var videoFPS: Int32 = 0
     @Published var stabilization = true
     @Published var timerSeconds = 0
     @Published private(set) var countdown = 0
@@ -402,6 +403,11 @@ final class CameraViewModel: ObservableObject {
                 guard let self else { return }
                 self.camera = snapshot
                 self.mode = snapshot.videoMode ? .video : .photo
+                if snapshot.videoMode, let quality = snapshot.videoQuality {
+                    self.videoWidth = quality.width
+                    self.videoFPS = quality.fps
+                    self.stabilization = snapshot.stabilized
+                }
                 self.preparingMode = nil
                 self.configuring = false
                 if let panorama = self.requestedPanorama {
@@ -413,6 +419,11 @@ final class CameraViewModel: ObservableObject {
         }
     }
     func applyVideoSettings() { selectMode(.video) }
+    func selectVideoQuality(_ quality: VideoQuality) {
+        guard canConfigure, mode == .video, camera.videoQualities.contains(quality) else { return }
+        videoWidth = quality.width; videoFPS = quality.fps
+        applyVideoSettings()
+    }
     func shutter() {
         if panoramaRunning {
             guard active else { return }
