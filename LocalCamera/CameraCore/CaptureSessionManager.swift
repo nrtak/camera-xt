@@ -45,6 +45,34 @@ struct CameraZoom: Codable, Equatable {
     var maximum: Double = 1
 }
 
+struct VideoQuality: Equatable, Hashable, Identifiable {
+    let width: Int32
+    let fps: Int32
+    var id: String { "\(width)-\(fps)" }
+    var label: String { "\(width == 3840 ? "4K" : width == 1920 ? "1080p" : "720p") · \(fps) fps" }
+    static func resolve(width: Int32, fps: Int32, from options: [VideoQuality]) -> VideoQuality? {
+        selectWidth(width, keepingFPS: fps, from: options) ?? ranked(options).first
+    }
+
+    static func selectWidth(_ width: Int32, keepingFPS fps: Int32?, from options: [VideoQuality]) -> VideoQuality? {
+        let matches = ranked(options.filter { $0.width == width })
+        return matches.first(where: { $0.fps == fps }) ?? matches.first
+    }
+
+    static func ranked(_ options: [VideoQuality]) -> [VideoQuality] {
+        Array(Set(options)).sorted { $0.width == $1.width ? $0.fps > $1.fps : $0.width > $1.width }
+    }
+}
+
+enum ShutterOptions {
+    static func values(minimum: Double, maximum: Double, requested: Double) -> [Double] {
+        guard minimum.isFinite, maximum.isFinite, minimum > 0, maximum >= minimum else { return [] }
+        let standard = [8000.0, 4000, 2000, 1000, 500, 250, 125, 60, 30, 15, 8, 4, 2, 1].map { 1 / $0 }
+        let selected = min(maximum, max(minimum, requested.isFinite ? requested : minimum))
+        return Array(Set(standard.filter { $0 >= minimum && $0 <= maximum } + [selected])).sorted()
+    }
+}
+
 struct CameraSnapshot {
     var zooms: [CameraZoom] = []
 
@@ -55,7 +83,7 @@ struct CameraSnapshot {
     var message: String?
     var dualAvailable = false
     var dualEnabled = false
-    var dualMode: DualShotMode = .fast
+    var dualMode: DualShotMode = .detail
     var dualFocusSupported = [false, false]
     var focusStates = ["Auto focus", "Auto focus"]
     var cooling = false
@@ -64,7 +92,9 @@ struct CameraSnapshot {
     var focusLocked = false
     var videoMode = false
     var recording = false
-    var videoLabel = "1080p · 30 fps"
+    var videoLabel = "Best available"
+    var videoQualities: [VideoQuality] = []
+    var videoQuality: VideoQuality?
     var stabilized = false
     var exposureLabel = ""
     var focusLabel = "Auto focus"
@@ -75,6 +105,8 @@ struct CameraSnapshot {
     var whiteBalanceAvailable = false
     var flashAvailable = false
     var currentISO: Float = 100
+    var minimumShutter = 1.0 / 8000
+    var maximumShutter = 1.0
     var currentShutter = 1.0 / 250
     var depthAvailable = false
     var depthEnabled = false
@@ -317,11 +349,11 @@ final class CaptureSessionManager {
         output.isDepthDataDeliveryEnabled = output.isDepthDataDeliverySupported
         snapshot.depthAvailable = output.isDepthDataDeliverySupported
         if !snapshot.depthAvailable { snapshot.depthEnabled = false }
-        // A modest native photo size keeps this first build responsive.
+        // Single photos use the largest native size exposed by this format.
         let sizes = device.activeFormat.supportedMaxPhotoDimensions.sorted {
             Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height)
         }
-        if let size = sizes.last(where: { Int64($0.width) * Int64($0.height) <= 12_500_000 }) ?? sizes.first {
+        if let size = sizes.last {
             output.maxPhotoDimensions = size
             snapshot.resolution = "Up to \(size.width) × \(size.height)"
         }
@@ -358,7 +390,7 @@ final class CaptureSessionManager {
             }
             let codec: AVVideoCodecType = self.output.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
-            if night || panorama {
+            if night || panorama || speed {
                 guard let device = self.input?.device,
                       let size = NightCapturePolicy.photoSize(device.activeFormat.supportedMaxPhotoDimensions,
                                                              maximum: self.output.maxPhotoDimensions) else {
@@ -762,7 +794,19 @@ final class CaptureSessionManager {
         }
     }
 
-    func setVideoMode(_ enabled: Bool, width: Int32 = 1920, fps: Int32 = 30, stabilized: Bool = true,
+    private func videoQualities(for device: AVCaptureDevice) -> [VideoQuality] {
+        VideoQuality.ranked(device.formats.flatMap { format -> [VideoQuality] in
+            let size = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            guard [Int32(3840), 1920, 1280].contains(size.width), size.width * 9 == size.height * 16,
+                  CMFormatDescriptionGetMediaSubType(format.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else { return [] }
+            return [Int32(240), 120, 60, 30, 24].compactMap { rate in
+                format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= Double(rate) && $0.maxFrameRate >= Double(rate) }
+                    ? VideoQuality(width: size.width, fps: rate) : nil
+            }
+        })
+    }
+
+    func setVideoMode(_ enabled: Bool, width: Int32 = 0, fps: Int32 = 0, stabilized: Bool = true,
                       completion: ((CameraSnapshot) -> Void)? = nil) {
         queue.async {
             defer { completion?(self.snapshot) }
@@ -775,7 +819,10 @@ final class CaptureSessionManager {
             var failure: Error?
             do {
                 if enabled {
-                    let height: Int32 = width == 3840 ? 2160 : 1080
+                    let qualities = self.videoQualities(for: device)
+                    guard let quality = VideoQuality.resolve(width: width, fps: fps, from: qualities) else { throw VideoFailure.unsupported }
+                    let width = quality.width, fps = quality.fps
+                    let height = width * 9 / 16
                     guard let format = device.formats.first(where: {
                         let size = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
                         return size.width == width && size.height == height &&
@@ -800,7 +847,9 @@ final class CaptureSessionManager {
                         self.session.addInput(audio)
                         self.audioInput = audio
                     }
-                    self.snapshot.videoLabel = "\(width == 3840 ? "4K" : "1080p") · \(fps) fps"
+                    self.snapshot.videoQualities = qualities
+                    self.snapshot.videoQuality = quality
+                    self.snapshot.videoLabel = quality.label
                     self.snapshot.stabilized = false
                     if let connection = self.movie.connection(with: .video) {
                         if connection.isVideoOrientationSupported { connection.videoOrientation = self.interfaceOrientation }
@@ -993,6 +1042,11 @@ final class CaptureSessionManager {
         snapshot.exposureLabel = "\(shutter) · ISO \(Int(device.iso.rounded()))"
         snapshot.currentISO = device.iso
         snapshot.currentShutter = seconds
+        snapshot.minimumShutter = CMTimeGetSeconds(device.activeFormat.minExposureDuration)
+        snapshot.maximumShutter = CMTimeGetSeconds(device.activeFormat.maxExposureDuration)
+        if snapshot.videoMode {
+            snapshot.maximumShutter = min(snapshot.maximumShutter, CMTimeGetSeconds(device.activeVideoMaxFrameDuration))
+        }
         snapshot.focusLabel = device.isAdjustingFocus ? "Focusing" : device.focusMode == .locked ? "Focus locked" : controls.facePriority ? "Face-priority AF" : "Auto focus"
         if snapshot.eyeFocusEnabled { snapshot.focusLabel = eyeStatus }
         snapshot.eyeFocusAvailable = !snapshot.dualEnabled && !snapshot.videoMode && device.position == .back && device.isFocusPointOfInterestSupported && device.isFocusModeSupported(.continuousAutoFocus)
