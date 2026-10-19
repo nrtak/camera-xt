@@ -4,6 +4,133 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testPreviewRecoveryWaitsForFiveChecksAndDoesNotInterruptCapture() {
+        var health = PreviewHealth()
+        for time in 0..<4 { XCTAssertFalse(health.shouldRestart(previewing: false, eligible: true, now: Double(time))) }
+        XCTAssertFalse(health.shouldRestart(previewing: false, eligible: false, now: 4))
+        for time in 5..<9 { XCTAssertFalse(health.shouldRestart(previewing: false, eligible: true, now: Double(time))) }
+        XCTAssertTrue(health.shouldRestart(previewing: false, eligible: true, now: 9))
+        XCTAssertFalse(health.shouldRestart(previewing: true, eligible: true, now: 10))
+        XCTAssertEqual(health.missedChecks, 0)
+    }
+
+    func testPreviewRecoveryHasCooldownAndStopsAfterTwoAttempts() {
+        var health = PreviewHealth()
+        var restarts: [Int] = []
+        for time in 0..<60 {
+            if health.shouldRestart(previewing: false, eligible: true, now: Double(time)) { restarts.append(time) }
+        }
+        XCTAssertEqual(restarts, [4, 19])
+        XCTAssertEqual(health.attempts, 2)
+    }
+
+    func testCaptureLabelsUseActualZoomAndRejectInvalidValues() {
+        XCTAssertEqual(CaptureLensLabel.make(name: "Main", base: 1, factor: 2), "Main · 2.00×")
+        XCTAssertEqual(CaptureLensLabel.make(name: "Ultra Wide", base: 0.5, factor: 1.5), "Ultra Wide · 0.75×")
+        XCTAssertEqual(CaptureLensLabel.make(name: "Main", base: 1, factor: .nan), "Main")
+    }
+
+    func testRecentSummaryDoesNotKeepPhotoBytesButReviewLoadsOriginals() async throws {
+        let store = CaptureStore(root: root)
+        try await store.stage(photo())
+        _ = try await store.finish(thumbnail: Data([7]))
+        let summary = try await store.load("recent.plist", includingPhotos: false)
+        XCTAssertEqual(summary?.photos.first?.data.count, 0)
+        XCTAssertNotNil(summary?.photos.first?.fileName)
+        XCTAssertEqual(summary?.thumbnail, Data([7]))
+        let full = try await store.load("recent.plist")
+        XCTAssertEqual(full?.photos.first?.data, Data([1, 2, 3]))
+    }
+
+    func testUncertainSaveAndConfirmedSaveSurviveRelaunch() async throws {
+        let store = CaptureStore(root: root)
+        try await store.stage(photo())
+        try await store.beginSave()
+        let attempted = try await CaptureStore(root: root).load("pending.plist")
+        XCTAssertEqual(attempted?.saveAttempted, true)
+        XCTAssertEqual(attempted?.saved, false)
+        try await store.markSaved()
+        let saved = try await CaptureStore(root: root).load("pending.plist")
+        XCTAssertEqual(saved?.saved, true)
+        XCTAssertEqual(saved?.photos.first?.data, Data([1, 2, 3]))
+    }
+
+    func testSavedReceiptCannotMarkADifferentCaptureSaved() async throws {
+        let store = CaptureStore(root: root)
+        try await store.stage(photo())
+        try await store.beginSave(); try await store.markSaved()
+        try await store.stage(photo("Next", bytes: [9]))
+        let pending = try await CaptureStore(root: root).load("pending.plist")
+        XCTAssertEqual(pending?.saved, false)
+        XCTAssertNotEqual(pending?.saveAttempted, true)
+        XCTAssertEqual(pending?.photos.first?.data, Data([9]))
+    }
+
+    func testCorruptReceiptDoesNotOfferBlindRetry() async throws {
+        let store = CaptureStore(root: root)
+        try await store.stage(photo())
+        try Data([1, 2]).write(to: root.appendingPathComponent("save-receipt.plist"))
+        do { _ = try await store.load("pending.plist"); XCTFail("Unreadable save outcome must not be ignored") }
+        catch { }
+    }
+
+    func testLegacyEmbeddedPhotoRecoveryCanStillBeFinished() async throws {
+        let legacy = CaptureStore.Record(photos: [CaptureStore.Photo(photo(), index: 0)])
+        try PropertyListEncoder().encode(legacy).write(to: root.appendingPathComponent("pending.plist"))
+        let store = CaptureStore(root: root)
+        let recovered = try await store.load("pending.plist")
+        XCTAssertEqual(recovered?.photos.first?.data, Data([1, 2, 3]))
+        try await store.beginSave(); try await store.markSaved()
+        _ = try await store.finish(thumbnail: Data([7]))
+        let recent = try await store.load("recent.plist")
+        XCTAssertEqual(recent?.photos.first?.data, Data([1, 2, 3]))
+        XCTAssertEqual(recent?.saved, true)
+    }
+
+    func testClearingRecentDeletesOnlyItsOriginalFiles() async throws {
+        let store = CaptureStore(root: root)
+        try await store.stage(photo())
+        _ = try await store.finish(thumbnail: nil)
+        try await store.stage(photo("Pending", bytes: [9]))
+        try await store.clearRecent()
+        let pending = try await store.load("pending.plist")
+        XCTAssertEqual(pending?.photos.first?.data, Data([9]))
+        let files = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasSuffix(".photo") }
+        XCTAssertEqual(files.count, 1)
+    }
+    func testDiagnosticHistoryIsBoundedAndSurvivesEncoding() throws {
+        var history = CameraDiagnosticHistory()
+        for index in 0..<150 { history.append("event-\(index)") }
+        XCTAssertEqual(history.entries.count, 120)
+        XCTAssertEqual(history.entries.first, "event-30")
+        XCTAssertEqual(history.entries.last, "event-149")
+        history.append(String(repeating: "x", count: 1000))
+        XCTAssertEqual(history.entries.last?.count, 240)
+        let restored = try JSONDecoder().decode(CameraDiagnosticHistory.self, from: JSONEncoder().encode(history))
+        XCTAssertEqual(restored.entries, history.entries)
+    }
+
+    func testRecoveryNeverRestartsDuringCaptureInterruptionOrBackground() {
+        XCTAssertFalse(CameraRecoveryPolicy.mayAttempt(active: false, interrupted: false, busy: false, attempts: 0, lastAttempt: nil, now: 100))
+        XCTAssertFalse(CameraRecoveryPolicy.mayAttempt(active: true, interrupted: true, busy: false, attempts: 0, lastAttempt: nil, now: 100))
+        XCTAssertFalse(CameraRecoveryPolicy.mayAttempt(active: true, interrupted: false, busy: true, attempts: 0, lastAttempt: nil, now: 100))
+        XCTAssertTrue(CameraRecoveryPolicy.mayAttempt(active: true, interrupted: false, busy: false, attempts: 0, lastAttempt: nil, now: 100))
+    }
+
+    func testRecoveryBackoffAndRetryLimit() {
+        XCTAssertFalse(CameraRecoveryPolicy.mayAttempt(active: true, interrupted: false, busy: false, attempts: 1, lastAttempt: 95, now: 100))
+        XCTAssertTrue(CameraRecoveryPolicy.mayAttempt(active: true, interrupted: false, busy: false, attempts: 1, lastAttempt: 90, now: 100))
+        XCTAssertFalse(CameraRecoveryPolicy.mayAttempt(active: true, interrupted: false, busy: false, attempts: 2, lastAttempt: 80, now: 100))
+    }
+
+    func testPanoramaGuidancePrioritizesMotionAndRejectsInvalidSamples() {
+        XCTAssertNil(PanoramaPolicy.motionWarning(speed: 0.1, tilt: 0.1))
+        XCTAssertEqual(PanoramaPolicy.motionWarning(speed: 0.4, tilt: 0.3), "Slow down")
+        XCTAssertEqual(PanoramaPolicy.motionWarning(speed: 0.1, tilt: 0.3), "Keep level")
+        XCTAssertNotNil(PanoramaPolicy.motionWarning(speed: .nan, tilt: 0))
+        XCTAssertNotNil(PanoramaPolicy.motionWarning(speed: 0, tilt: .infinity))
+    }
+
     func testShutterChoicesRespectVideoFrameDurationAndKeepSelectionValid() {
         let choices = ShutterOptions.values(minimum: 1.0 / 8000, maximum: 1.0 / 120, requested: 1)
         XCTAssertTrue(choices.allSatisfy { $0 >= 1.0 / 8000 && $0 <= 1.0 / 120 })
@@ -578,7 +705,9 @@ final class CaptureStoreTests: XCTestCase {
         }
         let recent = try await CaptureStore(root: root).load("recent.plist")
         XCTAssertEqual(recent?.photos.map(\.data), [Data([19]), Data([19, 1])])
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).sorted(), ["recent.plist"])
+        let files = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        XCTAssertEqual(files.filter { $0.hasSuffix(".photo") }.count, 2)
+        XCTAssertEqual(files.filter { !$0.hasSuffix(".photo") }, ["recent.plist"])
     }
 
     func testEyeFocusCoordinatesReturnToSensorSpaceForEveryOrientation() {
