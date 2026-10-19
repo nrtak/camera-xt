@@ -3,6 +3,136 @@ import Vision
 import CoreImage
 import UIKit
 
+// Only fixed event names and numeric measurements are stored: no image data,
+// filenames, location, device identifiers or free-form error descriptions.
+enum CameraDiagnosticEvent: String {
+    case launch, sessionStart, sessionStop, memoryWarning, sample
+    case interrupted, interruptionEnded, runtimeError, recoveryAttempt, recoverySucceeded, previewStalled, previewRestart
+    case photoMode, videoMode, dualMode, transitionFinished, capture, processing, saving, saved, saveFailed
+}
+
+struct CameraDiagnosticHistory: Codable {
+    private(set) var entries: [String] = []
+    mutating func append(_ entry: String) {
+        entries.append(String(entry.prefix(240)))
+        entries = Array(entries.suffix(120))
+    }
+}
+
+final class CameraDiagnostics {
+    static let shared = CameraDiagnostics()
+    private let queue = DispatchQueue(label: "camera.local.diagnostics", qos: .utility)
+    private var history = CameraDiagnosticHistory()
+    private var loaded = false
+    private var storageAvailable = true
+    private let file = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("CameraDiagnostics.json")
+
+    private func load() {
+        guard !loaded else { return }
+        loaded = true
+        if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 65536,
+           let data = try? Data(contentsOf: file),
+           let previous = try? JSONDecoder().decode(CameraDiagnosticHistory.self, from: data) {
+            for entry in previous.entries.suffix(120) { history.append(entry) }
+        }
+    }
+
+    func record(_ event: CameraDiagnosticEvent, value: Int? = nil, configuration: CameraDiagnosticConfiguration? = nil) {
+        queue.async {
+            self.load()
+            let memory = Self.memoryBytes().map { String($0 / 1_048_576) } ?? "unknown"
+            let metric = value.map { " value=\($0)" } ?? ""
+            self.history.append("\(ISO8601DateFormatter().string(from: Date())) \(event.rawValue)\(metric) memoryMB=\(memory) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) \(configuration?.summary ?? "")")
+            do {
+                try FileManager.default.createDirectory(at: self.file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(self.history).write(to: self.file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                var url = self.file
+                var values = URLResourceValues(); values.isExcludedFromBackup = true
+                try url.setResourceValues(values)
+                self.storageAvailable = true
+            } catch { self.storageAvailable = false }
+        }
+    }
+
+    func report() async -> String {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                self.load()
+                let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+                let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+                let header = "Camera XT \(version) (\(build)) · iOS \(ProcessInfo.processInfo.operatingSystemVersionString)\nLocal event history; not a crash report. Sampled memory may miss peaks.\ntransitionFinished and saved values: milliseconds. Error values: numeric codes. Thermal: 0 normal, 1 warm, 2 hot, 3 critical. Session events include temporary pauses for processing.\n"
+                let warning = self.storageAvailable ? "" : "History could not be saved to disk; current events may be lost on exit.\n"
+                continuation.resume(returning: header + warning + self.history.entries.joined(separator: "\n"))
+            }
+        }
+    }
+
+    func clear() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async {
+                self.loaded = true; self.history = CameraDiagnosticHistory()
+                do {
+                    if FileManager.default.fileExists(atPath: self.file.path) { try FileManager.default.removeItem(at: self.file) }
+                    self.storageAvailable = true
+                } catch { self.storageAvailable = false }
+                continuation.resume()
+            }
+        }
+    }
+
+    static func memoryBytes() -> UInt64? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? info.phys_footprint : nil
+    }
+}
+
+enum CameraRecoveryPolicy {
+    static func mayAttempt(active: Bool, interrupted: Bool, busy: Bool, attempts: Int,
+                           lastAttempt: TimeInterval?, now: TimeInterval) -> Bool {
+        active && !interrupted && !busy && attempts < 2 &&
+            (lastAttempt.map { now - $0 >= 10 } ?? true)
+    }
+}
+
+struct CameraDiagnosticConfiguration {
+    enum Mode: String { case photo, dualFast, dualDetail, video }
+    let mode: Mode
+    let width: Int32
+    let height: Int32
+    let fps: Int32
+    var summary: String { "mode=\(mode.rawValue) configured=\(width)x\(height) fps=\(fps)" }
+}
+
+struct PreviewHealth {
+    private(set) var missedChecks = 0
+    private(set) var attempts = 0
+    private var lastAttempt: TimeInterval?
+    mutating func resetObservation() { missedChecks = 0 }
+    mutating func shouldRestart(previewing: Bool, eligible: Bool, now: TimeInterval) -> Bool {
+        guard eligible, !previewing else { missedChecks = 0; return false }
+        missedChecks += 1
+        guard missedChecks >= 5, attempts < 2,
+              lastAttempt.map({ now - $0 >= 15 }) ?? true else { return false }
+        missedChecks = 0; attempts += 1; lastAttempt = now
+        return true
+    }
+}
+
+enum CaptureLensLabel {
+    static func make(name: String, base: Double, factor: Double) -> String {
+        let value = base * factor
+        guard value.isFinite, value > 0 else { return name }
+        return name + " · " + String(format: "%.2f×", value)
+    }
+}
+
 struct CameraControls: Equatable, Codable {
     var automaticExposure = true
     var iso: Float = 100
@@ -150,6 +280,13 @@ final class CaptureSessionManager {
     private var meterTimer: DispatchSourceTimer?
     private var burstRunning = false
     private var pendingMemoryFallback = false
+    private var pendingMemoryCleanup = false
+    private var recoveryPending = false
+    private var recoveryAttempts = 0
+    private var lastRecoveryAttempt: TimeInterval?
+    private var lastDiagnosticSample: TimeInterval = 0
+    private var previewHealth = PreviewHealth()
+    private var previewFailureReported = false
     var onAnalysis: ((UIImage?, [Double]) -> Void)?
     private let analysisOutput = AVCaptureVideoDataOutput()
     private var analyzer: ViewfinderAnalyzer?
@@ -161,29 +298,41 @@ final class CaptureSessionManager {
     private var eyeStatus = "Eye AF · searching"
 
     init() {
+        CameraDiagnostics.shared.record(.launch)
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification,
                                              object: nil, queue: nil) { [weak self] _ in
             self?.queue.async { [weak self] in
-                guard let self, !self.burstRunning, self.processor == nil, self.movieProcessor == nil else { return }
-                self.disableAnalysis()
-                self.disableEyeFocus()
-                if self.snapshot.dualEnabled {
-                    if self.dual.busy { self.pendingMemoryFallback = true; self.dual.cancelRemainingCapture() }
-                    else { self.setDualEnabled(false, reason: "Memory is low · returned to Single Photo.") }
+                guard let self else { return }
+                CameraDiagnostics.shared.record(.memoryWarning)
+                self.pendingMemoryCleanup = true
+                // Stop optional frame work without reconfiguring an in-flight capture.
+                self.analysisOutput.setSampleBufferDelegate(nil, queue: nil)
+                self.eyeOutput.setSampleBufferDelegate(nil, queue: nil)
+                self.analyzer?.releaseBuffers()
+                self.onAnalysis?(nil, [])
+                if self.snapshot.dualEnabled && self.dual.busy {
+                    self.pendingMemoryFallback = true
+                    self.dual.cancelRemainingCapture()
                 }
+                self.finishMemoryCleanupIfIdle()
             }
         })
         observers.append(center.addObserver(forName: AVCaptureSession.wasInterruptedNotification,
                                              object: nil, queue: nil) { [weak self] notification in
             self?.queue.async { [weak self] in
                 guard let self, notification.object as? AVCaptureSession === self.activeSession else { return }
+                CameraDiagnostics.shared.record(.interrupted)
                 self.publish(message: "Camera interrupted. It will resume when available.")
             }
         })
         observers.append(center.addObserver(forName: AVCaptureSession.interruptionEndedNotification,
-                                             object: nil, queue: nil) { [weak self] _ in
-            self?.resume()
+                                             object: nil, queue: nil) { [weak self] notification in
+            self?.queue.async { [weak self] in
+                guard let self, notification.object as? AVCaptureSession === self.activeSession else { return }
+                CameraDiagnostics.shared.record(.interruptionEnded)
+                self.requestRecovery()
+            }
         })
         observers.append(center.addObserver(forName: AVCaptureSession.runtimeErrorNotification,
                                              object: nil, queue: nil) { [weak self] notification in
@@ -191,12 +340,21 @@ final class CaptureSessionManager {
             self?.queue.async { [weak self] in
                 guard let self = self else { return }
                 guard notification.object as? AVCaptureSession === self.activeSession else { return }
-                if error?.code == .mediaServicesWereReset, self.wantsRunning {
-                    self.activeSession.startRunning()
-                }
+                CameraDiagnostics.shared.record(.runtimeError, value: error.map { ($0 as NSError).code })
+                if error?.code == .mediaServicesWereReset { self.requestRecovery() }
                 self.publish(message: self.activeSession.isRunning ? nil : "Camera stopped. Tap Retry camera.")
             }
         })
+    }
+
+    private func finishMemoryCleanupIfIdle() {
+        guard pendingMemoryCleanup, !burstRunning, processor == nil, movieProcessor == nil, !dual.busy else { return }
+        pendingMemoryCleanup = false
+        disableAnalysis()
+        disableEyeFocus()
+        if snapshot.dualEnabled {
+            setDualEnabled(false, reason: "Memory is low · returned to Single Photo.")
+        }
     }
 
     deinit {
@@ -206,10 +364,13 @@ final class CaptureSessionManager {
 
     func start() {
         queue.async {
+            if !self.wantsRunning { self.previewHealth = PreviewHealth(); self.previewFailureReported = false }
+            if !self.wantsRunning { CameraDiagnostics.shared.record(.sessionStart) }
             self.wantsRunning = true
             do {
                 if self.input == nil { try self.configure() }
                 else if !self.snapshot.dualEnabled { try self.restoreSingleCamera() }
+                self.finishMemoryCleanupIfIdle()
                 self.connectPreview()
                 if let analyzer = self.analyzer { self.analysisOutput.setSampleBufferDelegate(analyzer, queue: analyzer.queue) }
                 if let tracker = self.eyeTracker { self.eyeOutput.setSampleBufferDelegate(tracker, queue: tracker.queue) }
@@ -222,7 +383,9 @@ final class CaptureSessionManager {
 
     func stop() {
         queue.async {
+            CameraDiagnostics.shared.record(.sessionStop)
             self.wantsRunning = false
+            self.recoveryPending = false
             self.analysisOutput.setSampleBufferDelegate(nil, queue: nil)
             self.eyeOutput.setSampleBufferDelegate(nil, queue: nil)
             self.analyzer?.releaseBuffers()
@@ -237,10 +400,72 @@ final class CaptureSessionManager {
         }
     }
 
-    private func resume() {
+    // Session queue only. Never restart through a capture, recording or interruption.
+    private func requestRecovery() {
+        guard wantsRunning else { return }
+        if !recoveryPending { recoveryAttempts = 0; lastRecoveryAttempt = nil }
+        recoveryPending = true
+        recoverIfIdle()
+    }
+
+    private func recoverIfIdle() {
+        guard recoveryPending else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard CameraRecoveryPolicy.mayAttempt(active: wantsRunning, interrupted: activeSession.isInterrupted,
+            busy: burstRunning || processor != nil || movieProcessor != nil || dual.busy,
+            attempts: recoveryAttempts, lastAttempt: lastRecoveryAttempt, now: now) else { return }
+        if activeSession.isRunning { recoveryPending = false; publish(); return }
+        recoveryAttempts += 1; lastRecoveryAttempt = now
+        CameraDiagnostics.shared.record(.recoveryAttempt, value: recoveryAttempts)
+        activeSession.startRunning()
+        if activeSession.isRunning {
+            recoveryPending = false
+            CameraDiagnostics.shared.record(.recoverySucceeded)
+        }
+        publish(message: activeSession.isRunning ? nil : "Camera stopped. Tap Retry camera.")
+    }
+
+    private var diagnosticConfiguration: CameraDiagnosticConfiguration {
+        let size = output.maxPhotoDimensions
+        let video = snapshot.videoQuality
+        return CameraDiagnosticConfiguration(mode: snapshot.videoMode ? .video : snapshot.dualEnabled ? (snapshot.dualMode == .detail ? .dualDetail : .dualFast) : .photo,
+            width: snapshot.videoMode ? video?.width ?? 0 : snapshot.dualEnabled ? dual.outputs.first?.maxPhotoDimensions.width ?? 0 : size.width,
+            height: snapshot.videoMode ? (video?.width ?? 0) * 9 / 16 : snapshot.dualEnabled ? dual.outputs.first?.maxPhotoDimensions.height ?? 0 : size.height,
+            fps: snapshot.videoMode ? video?.fps ?? 0 : 0)
+    }
+
+    func restartPreview() {
         queue.async {
-            if self.wantsRunning && !self.activeSession.isRunning { self.activeSession.startRunning() }
-            self.publish()
+            guard self.wantsRunning, !self.activeSession.isInterrupted, !self.burstRunning,
+                  self.processor == nil, self.movieProcessor == nil, !self.dual.busy else { return }
+            guard self.input != nil else { self.start(); return }
+            self.previewHealth = PreviewHealth(); self.previewFailureReported = false
+            self.restartIdlePreview()
+        }
+    }
+
+    private func restartIdlePreview() {
+        recoveryPending = false
+        CameraDiagnostics.shared.record(.previewRestart, configuration: diagnosticConfiguration)
+        activeSession.stopRunning()
+        disconnectPreviews(); connectPreview()
+        activeSession.startRunning()
+        startMetering()
+        publish(message: activeSession.isRunning ? nil : "Camera stopped. Tap Retry camera.")
+    }
+
+    private func checkPreviewHealth() {
+        let layers = [preview, snapshot.dualEnabled ? secondaryPreview : nil].compactMap { $0 }
+        let expected = snapshot.dualEnabled ? 2 : 1
+        let eligible = wantsRunning && activeSession.isRunning && !activeSession.isInterrupted &&
+            !burstRunning && processor == nil && movieProcessor == nil && !dual.busy && layers.count == expected
+        if previewHealth.shouldRestart(previewing: layers.allSatisfy(\.isPreviewing), eligible: eligible,
+                                       now: ProcessInfo.processInfo.systemUptime) {
+            CameraDiagnostics.shared.record(.previewStalled, configuration: diagnosticConfiguration)
+            restartIdlePreview()
+        } else if eligible, previewHealth.attempts >= 2, previewHealth.missedChecks >= 5, !previewFailureReported {
+            previewFailureReported = true
+            publish(message: "Preview unavailable. Tap Retry camera.")
         }
     }
 
@@ -407,6 +632,7 @@ final class CaptureSessionManager {
                 guard let self = self else { return }
                 self.queue.async {
                     self.processor = nil
+                    self.finishMemoryCleanupIfIdle()
                     completion(result.map { original in
                         var photo = original
                         photo.lensLabel = lensLabel
@@ -543,6 +769,7 @@ final class CaptureSessionManager {
     }
 
     private func disableEyeFocus() {
+        guard eyeTracker != nil || snapshot.eyeFocusEnabled || session.outputs.contains(eyeOutput) else { return }
         eyeGeneration = UUID()
         eyeOutput.setSampleBufferDelegate(nil, queue: nil)
         if session.outputs.contains(eyeOutput) {
@@ -597,6 +824,7 @@ final class CaptureSessionManager {
     }
 
     private func connectPreview() {
+        previewHealth.resetObservation()
         let sources: [(AVCaptureVideoPreviewLayer?, AVCaptureDeviceInput?)] = [
             (preview, snapshot.dualEnabled ? dual.inputs.first : input),
             (secondaryPreview, snapshot.dualEnabled && dual.inputs.count > 1 ? dual.inputs[1] : nil)
@@ -667,9 +895,14 @@ final class CaptureSessionManager {
         configureDimensions(input.device)
     }
 
-    func setDualEnabled(_ enabled: Bool, reason: String? = nil, mode: DualShotMode? = nil) {
+    func setDualEnabled(_ enabled: Bool, reason: String? = nil, mode: DualShotMode? = nil,
+                        resumeSingleCamera: Bool = true) {
         queue.async {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, enabled != self.snapshot.dualEnabled || (enabled && mode != nil && mode != self.snapshot.dualMode) else { return }
+            self.recoveryPending = false
+            let transitionStarted = ProcessInfo.processInfo.systemUptime
+            CameraDiagnostics.shared.record(enabled ? .dualMode : .photoMode)
+            defer { CameraDiagnostics.shared.record(.transitionFinished, value: Int((ProcessInfo.processInfo.systemUptime - transitionStarted) * 1000), configuration: self.diagnosticConfiguration) }
             self.disableAnalysis()
             self.disableEyeFocus()
             self.activeSession.stopRunning()
@@ -697,7 +930,8 @@ final class CaptureSessionManager {
                     // Paired capture uses automatic metering independently for each sensor.
                     for input in self.dual.inputs { try self.applyControls(to: input.device, automatic: true) }
                 } else if let device = self.input?.device { try self.applyControls(to: device) }
-                if self.wantsRunning { self.activeSession.startRunning() }
+                // A transition to video will start the single session after configuring it.
+                if self.wantsRunning && (enabled || resumeSingleCamera) { self.activeSession.startRunning() }
                 self.snapshot.focusLocked = !enabled && !self.controls.automaticFocus
                 self.publish()
                 if let reason { self.onWarning?(reason) }
@@ -812,6 +1046,28 @@ final class CaptureSessionManager {
             defer { completion?(self.snapshot) }
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.dual.busy, !self.snapshot.dualEnabled,
                   let device = self.input?.device else { self.publish(); return }
+            self.recoveryPending = false
+            let transitionStarted = ProcessInfo.processInfo.systemUptime
+            CameraDiagnostics.shared.record(enabled ? .videoMode : .photoMode)
+            defer { CameraDiagnostics.shared.record(.transitionFinished, value: Int((ProcessInfo.processInfo.systemUptime - transitionStarted) * 1000), configuration: self.diagnosticConfiguration) }
+            // Reapplying a format (including a stabilization-only edit) does not
+            // require stopping the preview or rebuilding camera outputs.
+            if enabled && self.snapshot.videoMode,
+               let quality = self.snapshot.videoQuality,
+               quality.width == width && quality.fps == fps,
+               let connection = self.movie.connection(with: .video) {
+                if connection.isVideoStabilizationSupported {
+                    connection.preferredVideoStabilizationMode = stabilized ? .auto : .off
+                    self.snapshot.stabilized = stabilized
+                } else { self.snapshot.stabilized = false }
+                self.publish()
+                return
+            }
+            if !enabled && !self.snapshot.videoMode {
+                if self.wantsRunning && !self.session.isRunning { self.session.startRunning() }
+                self.publish()
+                return
+            }
             self.disableAnalysis()
             self.disableEyeFocus()
             self.session.stopRunning()
@@ -1012,7 +1268,16 @@ final class CaptureSessionManager {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .seconds(1), leeway: .milliseconds(200))
         timer.setEventHandler { [weak self] in
-            guard let self, self.activeSession.isRunning else { return }
+            guard let self else { return }
+            self.recoverIfIdle()
+            guard self.activeSession.isRunning else { return }
+            self.checkPreviewHealth()
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - self.lastDiagnosticSample >= 15 {
+                self.lastDiagnosticSample = now
+                CameraDiagnostics.shared.record(.sample, configuration: self.diagnosticConfiguration)
+            }
+            self.finishMemoryCleanupIfIdle()
             self.updateMeter()
             if self.snapshot.cooling && (self.snapshot.analysisMode != "Off" || self.snapshot.eyeFocusEnabled) {
                 self.disableAnalysis()
@@ -1256,7 +1521,7 @@ private final class DualPhotoCamera {
     let session = AVCaptureMultiCamSession()
     private let queue: DispatchQueue
     private(set) var inputs: [AVCaptureDeviceInput] = []
-    private var outputs: [AVCapturePhotoOutput] = []
+    private(set) var outputs: [AVCapturePhotoOutput] = []
     private var originals: [(AVCaptureDevice, AVCaptureDevice.Format, CMTime, CMTime, CGFloat)] = []
     private var processors: [Int: PhotoCaptureProcessor] = [:]
     private var results: [Int: Result<CapturedPhoto, Error>] = [:]
@@ -1466,7 +1731,10 @@ private final class DualPhotoCamera {
         guard results.count == 2 else { return }
         let successful = (0..<2).compactMap { index -> (Int, CapturedPhoto)? in
             guard var photo = try? results[index]?.get() else { return nil }
-            photo.lensLabel = index == 0 ? "Main · 1×" : "Ultra Wide · 0.5×"
+            let device = inputs[index].device
+            let base = CameraDeviceCatalog.lens(for: device).zoomFactor ?? (index == 0 ? 1 : 0.5)
+            photo.lensLabel = CaptureLensLabel.make(name: index == 0 ? "Main" : "Ultra Wide",
+                                                   base: base, factor: Double(device.videoZoomFactor))
             return (index, photo)
         }
         let failure = results.values.compactMap { result -> Error? in

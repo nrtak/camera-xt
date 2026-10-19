@@ -40,6 +40,12 @@ struct PanoramaUpdate {
 }
 
 enum PanoramaPolicy {
+    static func motionWarning(speed: Double, tilt: Double) -> String? {
+        guard speed.isFinite, tilt.isFinite else { return "Hold steady · checking motion" }
+        if speed > 0.35 { return "Slow down" }
+        if tilt > 0.2 { return "Keep level" }
+        return nil
+    }
     static let maximumDimension = 12000
     static let maximumPixels = 32_000_000
     static let maximumDiskBytes = 256_000_000
