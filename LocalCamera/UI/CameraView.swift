@@ -45,6 +45,7 @@ struct CameraView: View {
     @AppStorage("camera.dualCorner") private var dualCorner = 3
     @AppStorage("camera.showHelp") private var showHelp = false
     @State private var showsRecent = false
+    @State private var confirmDuplicateSave = false
     @State private var captureControlsHeight: CGFloat = 205
     @State private var imageFrame = CGRect.zero
     @State private var manualPage: CameraToolPage = .exposure
@@ -132,7 +133,7 @@ struct CameraView: View {
                     let panel = PreviewGeometry.panelRect(image: available, bounds: panelBounds, preferredHeight: toolPanelHeight, sidePanel: landscape && !textSize.isAccessibilitySize && showsCaptureInfo)
                     Group {
                         if showsRecent, let recent = model.recent {
-                            RecentCaptureView(record: recent, close: { showsRecent = false })
+                            RecentCaptureLoader(model: model, close: { showsRecent = false }).id(recent.date)
                                 .background(menuBackground, in: RoundedRectangle(cornerRadius: 12))
                         } else if model.reviewingBurst {
                             BurstReview(model: model)
@@ -183,6 +184,13 @@ struct CameraView: View {
             if $0 == .background { model.enteredBackground() }
             model.setActive($0 == .active)
         }
+        .confirmationDialog("This capture may already be saved", isPresented: $confirmDuplicateSave, titleVisibility: .visible) {
+            Button("Open Photos to check") {
+                if let url = URL(string: "photos-redirect://") { UIApplication.shared.open(url) }
+            }
+            Button("Save another copy") { Task { await model.retrySave(confirmPossibleDuplicate: true) } }
+            Button("Cancel", role: .cancel) { }
+        } message: { Text("The previous save was interrupted before its result could be confirmed. Saving again may create a duplicate.") }
         .confirmationDialog("Discard the unsaved capture?", isPresented: $confirmDiscard, titleVisibility: .visible) {
             Button("Discard capture", role: .destructive, action: model.discard)
         }
@@ -263,6 +271,9 @@ struct CameraView: View {
         VStack(spacing: 12) {
             if let preparing = model.preparingMode {
                 HStack { ProgressView(); Text("Preparing \(preparing.rawValue)…") }
+                    .font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+            } else if model.configuring {
+                HStack { ProgressView(); Text("Preparing camera…") }
                     .font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
             }
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
@@ -521,11 +532,13 @@ struct CameraView: View {
             }
             .highPriorityGesture(zoomButtonGesture { model.selectZoom(choice) })
             .accessibilityLabel("\(zoomText(choice.value)) zoom")
+            .accessibilityHint(model.mode == .video ? "Zooms the current \(model.selectedLens?.name ?? "selected") camera; does not switch lenses" : "Selects this photo perspective")
             .disabled(model.mode == .video ? !model.canConfigure || !model.camera.running : !model.canSwitch)
         }
     }
 
     private var lensSelector: some View {
+        VStack(spacing: 3) {
         HStack(spacing: 4) {
             if model.selectedLens?.isFront == false {
                 ViewThatFits(in: .horizontal) {
@@ -537,6 +550,13 @@ struct CameraView: View {
                 Image(systemName: "magnifyingglass").frame(width: 44, height: 44)
             }.accessibilityLabel("Adjust zoom")
         }.buttonStyle(.plain).disabled(!model.canConfigure)
+        if model.mode == .video {
+            Text("Zoom on \(model.selectedLens?.name ?? "selected") camera")
+                .font(.caption2).foregroundStyle(.white).padding(.horizontal, 8).padding(.vertical, 3)
+                .background(.black.opacity(0.55), in: Capsule())
+                .accessibilityHint("To change the physical camera, select a lens in Photo before switching to Video")
+        }
+        }
     }
 
     private var compositionGrid: some View {
@@ -560,7 +580,7 @@ struct CameraView: View {
             Image(systemName: "camera").font(.largeTitle)
             if model.permission == .authorized {
                 Text(model.camera.message ?? "Camera unavailable.")
-                Button("Retry camera") { model.engine.start() }.disabled(model.busy)
+                Button("Retry camera") { model.engine.restartPreview() }.disabled(model.busy || model.camera.recording)
             } else {
                 Text("Camera access lets you preview and take photos on this iPhone.")
                 if model.permission == .notDetermined {
@@ -628,6 +648,7 @@ struct CameraView: View {
                         .buttonStyle(.plain)
                         .accessibilityAddTraits(selected ? .isSelected : [])
                         .disabled(!model.canConfigure || panelOpen || (dual && !model.camera.dualAvailable))
+                        .accessibilityHint(dual && !model.camera.dualAvailable ? "Two-camera capture is unavailable on the selected camera setup" : dual ? "Capture two perspectives" : "Capture one perspective")
                     }
                 }.padding(.horizontal, 8)
                     .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
@@ -712,7 +733,10 @@ struct CameraView: View {
     }
 
     @ViewBuilder private var saveRecovery: some View {
-        Button(model.panoramaRecovery?.saved == true ? "Finish cleanup" : model.panoramaRecovery?.readyToSave == false ? "Finish panorama" : "Retry save") { Task { await model.retrySave() } }
+        Button(model.saveNeedsConfirmation ? "Check save status" : model.panoramaRecovery?.saved == true ? "Finish cleanup" : model.panoramaRecovery?.readyToSave == false ? "Finish panorama" : "Retry save") {
+            if model.saveNeedsConfirmation { confirmDuplicateSave = true }
+            else { Task { await model.retrySave() } }
+        }
         if model.canSavePanoramaPhoto {
             Button("Save available photo") { Task { await model.saveAvailablePanoramaPhoto() } }
         }
@@ -989,6 +1013,9 @@ struct CameraView: View {
             Text("Standard controls adapt to Photo, Dual Shot and Video. Custom shortcuts replace that row with your three chosen tools. Controls hide while a menu is open.").font(.footnote)
         case .checks:
             Text("iPhone beta checks").font(.headline)
+            Button("Restart camera preview") { model.engine.restartPreview() }
+                .frame(minHeight: 44).disabled(!model.canConfigure || model.camera.recording)
+            Text("Use if the image has frozen. Restart is unavailable during capture or recording.").font(.caption)
             DeviceDiagnosticsView(peak: $diagnosticsPeak, baseline: $diagnosticsBaseline, batteryBaseline: $diagnosticsBatteryBaseline)
             if let value = model.lastCaptureMilliseconds { Text("Last capture processing: \(value) ms").font(.caption) }
             if let value = model.lastSaveMilliseconds { Text("Last save: \(value) ms").font(.caption) }
@@ -1093,6 +1120,9 @@ struct CameraView: View {
         }
     }
     private let deviceChecks = [
+        "Endurance: run 10 rounds of Photo → Dual → Panorama → Video → Photo. Take one photo or pair in each photo mode and a 10-second video. Finish each save before switching. Export diagnostics if the preview freezes or the app closes; after relaunch, export before repeating the test.",
+        "Recovery: lock and unlock the phone, open Photos and return, and interrupt with a phone call while idle. Repeat during capture and recording. The camera must remain off in the background, must not restart an interrupted recording, and must preserve unsaved captures. Never force-close during a save unless testing recovery with disposable photos.",
+        "Quality: use a stationary detailed scene in daylight and low light. From the same position, compare Single, Dual Fast and Dual Detail for both lenses, then Sweep and Stitch panoramas. Check pixel dimensions in Photos, sharpness at equal magnification, color, highlights, seams and ghosting. Repeat each setup three times. Keep original files; a larger pixel count alone is not proof of better quality.",
         "Layout: verify the shutter stays in place when switching Single/Dual, Photo/Video and opening menus. Tapping the selected Photo tab must keep Dual Shot active. Then take 20 Single photos, 20 Fast pairs and 10 Detail pairs; switch modes between groups. Rotate both ways and review each pair. Check for missed captures, mismatched lenses, freezes and save failures.",
         "Resources: open this panel for a baseline, close it, take repeated captures, then reopen it. Compare memory after processing settles. Repeat unplugged for battery/heat checks. Background the app: the camera indicator should turn off, with no active analysis. Use device profiling for capture-time peaks.",
         "Accessibility: use VoiceOver and the largest text sizes in portrait and both landscapes. Check the Single/Dual switch, shutter, timer, each lens, focus lock, all menus and saved-photo comparison. Check Increase Contrast and Reduce Transparency too.",
@@ -1224,13 +1254,15 @@ private struct PhotoRescueView: View {
 
 private struct VideoQualityControls: View {
     @ObservedObject var model: CameraViewModel
+    @Environment(\.dynamicTypeSize) private var textSize
     private var widths: [Int32] { Array(Set(model.camera.videoQualities.map(\.width))).sorted(by: >) }
     private var current: VideoQuality? { model.camera.videoQuality }
     private var rates: [VideoQuality] { model.camera.videoQualities.filter { $0.width == current?.width } }
 
     var body: some View {
+        let layout = textSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 12)) : AnyLayout(HStackLayout(alignment: .top, spacing: 12))
         VStack(spacing: 14) {
-            HStack(alignment: .top, spacing: 12) {
+            layout {
                 VStack(spacing: 6) {
                     Label("Resolution", systemImage: "viewfinder").font(.caption)
                     ForEach(widths, id: \.self) { width in
@@ -1251,6 +1283,8 @@ private struct VideoQualityControls: View {
             Toggle(isOn: Binding(get: { model.stabilization }, set: {
                 model.stabilization = $0; model.applyVideoSettings()
             })) { Label("Stabilization", systemImage: "hand.raised") }
+            Text("Video zoom stays on the selected lens. To use another lens, choose it in Photo, then switch to Video.")
+                .font(.caption).fixedSize(horizontal: false, vertical: true)
             if model.configuring { ProgressView("Applying…").font(.caption) }
         }.disabled(!model.canConfigure)
     }
@@ -1520,6 +1554,39 @@ private struct CameraDesignDetail: View {
 }
 
 
+private struct RecentCaptureLoader: View {
+    @ObservedObject var model: CameraViewModel
+    @Environment(\.openURL) private var openURL
+    let close: () -> Void
+    @State private var record: CaptureStore.Record?
+    @State private var failed = false
+    var body: some View {
+        Group {
+            if let record { RecentCaptureView(record: record, close: close) }
+            else {
+                VStack(spacing: 12) {
+                    if failed {
+                        Text("Preview unavailable. Your saved capture is in Photos.")
+                        Button("Open Photos") {
+                            if let url = URL(string: "photos-redirect://") { openURL(url) }
+                        }.frame(minHeight: 44)
+                    }
+                    else { ProgressView("Loading preview…") }
+                    Button("Close", action: close).frame(minHeight: 44)
+                }.padding()
+            }
+        }
+        .task {
+            do {
+                let loaded = try await model.loadRecentForReview()
+                guard !Task.isCancelled else { return }
+                record = loaded; failed = loaded == nil
+            } catch { if !Task.isCancelled { failed = true } }
+        }
+        .onDisappear { record = nil }
+    }
+}
+
 private struct RecentCaptureView: View {
     let record: CaptureStore.Record
     let close: () -> Void
@@ -1621,10 +1688,22 @@ private struct DeviceDiagnosticsView: View {
     @State private var battery: Float = -1
     @Binding var batteryBaseline: Float?
     @State private var previouslyMonitoring = false
+    @State private var report: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Local device check").font(.subheadline.weight(.semibold))
+            Text("Recent camera events stay on this iPhone. No photos, location or audio are included. Share the report after a freeze or after reopening following a crash.")
+                .foregroundStyle(.secondary)
+            if let report {
+                ShareLink(item: report) { Label("Share diagnostic report", systemImage: "square.and.arrow.up") }
+                    .frame(minHeight: 44)
+            }
+            Button("Refresh report") { Task { report = await CameraDiagnostics.shared.report() } }
+                .frame(minHeight: 44)
+            Button("Clear diagnostic history") {
+                Task { await CameraDiagnostics.shared.clear(); report = await CameraDiagnostics.shared.report() }
+            }.frame(minHeight: 44)
             Text("Thermal state: \(thermal)")
             if let memory {
                 Text("App memory: \(memory / 1_048_576) MB · highest sampled \(peak / 1_048_576) MB")
@@ -1643,6 +1722,7 @@ private struct DeviceDiagnosticsView: View {
             UIDevice.current.isBatteryMonitoringEnabled = true
         }
         .onDisappear { UIDevice.current.isBatteryMonitoringEnabled = previouslyMonitoring }
+        .task { report = await CameraDiagnostics.shared.report() }
         .task(id: scenePhase) {
             guard scenePhase == .active else {
                 UIDevice.current.isBatteryMonitoringEnabled = previouslyMonitoring
@@ -1650,7 +1730,7 @@ private struct DeviceDiagnosticsView: View {
             }
             UIDevice.current.isBatteryMonitoringEnabled = true
             while !Task.isCancelled {
-                memory = Self.memoryFootprint()
+                memory = CameraDiagnostics.memoryBytes()
                 if let memory { peak = max(peak, memory); if baseline == nil { baseline = memory } }
                 battery = UIDevice.current.batteryLevel
                 if batteryBaseline == nil && battery >= 0 { batteryBaseline = battery }
@@ -1666,16 +1746,6 @@ private struct DeviceDiagnosticsView: View {
         }
     }
 
-    private static func memoryFootprint() -> UInt64? {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
-        let result = withUnsafeMutablePointer(to: &info) { pointer in
-            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
-            }
-        }
-        return result == KERN_SUCCESS ? info.phys_footprint : nil
-    }
 }
 
 private struct ZoomableCapture: UIViewRepresentable {

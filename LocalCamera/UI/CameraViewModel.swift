@@ -265,6 +265,14 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var camera = CameraSnapshot()
     @Published private(set) var captureActivity: CaptureActivity = .preparing {
         didSet {
+            if oldValue != captureActivity {
+                switch captureActivity {
+                case .taking: CameraDiagnostics.shared.record(.capture)
+                case .processing: CameraDiagnostics.shared.record(.processing)
+                case .saving: CameraDiagnostics.shared.record(.saving)
+                case .preparing: break
+                }
+            }
             if oldValue != captureActivity && UIAccessibility.isVoiceOverRunning {
                 UIAccessibility.post(notification: .announcement, argument: captureActivity.rawValue)
             }
@@ -283,6 +291,7 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var lastSaveMilliseconds: Int?
     @Published private(set) var lowStorage = false
     @Published private(set) var recoveryProtected = false
+    @Published private(set) var saveNeedsConfirmation = false
     @Published var haptics = UserDefaults.standard.bool(forKey: "camera.haptics") {
         didSet { UserDefaults.standard.set(haptics, forKey: "camera.haptics") }
     }
@@ -392,7 +401,8 @@ final class CameraViewModel: ObservableObject {
         guard !busy, !configuring, !hasPendingCapture, !camera.recording else { return }
         if camera.dualEnabled {
             modeAfterDual = selected
-            setDualEnabled(false)
+            configuring = true
+            engine.setDualEnabled(false, resumeSingleCamera: selected != .video)
             return
         }
         preparingMode = selected
@@ -420,7 +430,8 @@ final class CameraViewModel: ObservableObject {
     }
     func applyVideoSettings() { selectMode(.video) }
     func selectVideoQuality(_ quality: VideoQuality) {
-        guard canConfigure, mode == .video, camera.videoQualities.contains(quality) else { return }
+        guard canConfigure, mode == .video, camera.videoQualities.contains(quality),
+              quality != camera.videoQuality else { return }
         videoWidth = quality.width; videoFPS = quality.fps
         applyVideoSettings()
     }
@@ -734,13 +745,18 @@ final class CameraViewModel: ObservableObject {
                 updated.focusLocked = meter.focusLocked
                 updated.focusStates = meter.focusStates
                 updated.cooling = meter.cooling
-                self.camera = updated
+                if self.camera.exposureLabel != updated.exposureLabel || self.camera.focusLabel != updated.focusLabel ||
+                    self.camera.currentISO != updated.currentISO || self.camera.currentShutter != updated.currentShutter ||
+                    self.camera.focusLocked != updated.focusLocked || self.camera.focusStates != updated.focusStates ||
+                    self.camera.cooling != updated.cooling {
+                    self.camera = updated
+                }
                 let advice = self.mode == .photo && self.camera.running
                     ? SceneAdvice.text(shutter: meter.currentShutter, iso: meter.currentISO,
                                        dual: self.camera.dualEnabled, night: self.captureStyle == "Night", panorama: self.panoramaSelected) : nil
                 if advice == self.adviceCandidate { self.adviceSamples += 1 }
                 else { self.adviceCandidate = advice; self.adviceSamples = 1 }
-                if self.adviceSamples >= 3 { self.sceneAdvice = advice }
+                if self.adviceSamples >= 3 && self.sceneAdvice != advice { self.sceneAdvice = advice }
                 self.restoreSetupIfReady()
                 if self.active && self.controlsNeedApply && self.canConfigure { self.applyControls(preserveStyle: true) }
                 if self.resetOnReturn, self.active, self.canConfigure {
@@ -770,6 +786,11 @@ final class CameraViewModel: ObservableObject {
                     if !snapshot.recording { self.recordingStarted = nil }
                 }
                 self?.camera = snapshot
+                if snapshot.videoMode, let quality = snapshot.videoQuality {
+                    self?.videoWidth = quality.width
+                    self?.videoFPS = quality.fps
+                    self?.stabilization = snapshot.stabilized
+                }
                 if self?.preparingMode == nil { self?.configuring = false }
                 self?.mode = snapshot.videoMode ? .video : .photo
                 if let self {
@@ -1096,8 +1117,8 @@ final class CameraViewModel: ObservableObject {
                         let speed = sqrt(rate.x * rate.x + rate.y * rate.y + rate.z * rate.z)
                         let g = initialGravity ?? motion.gravity
                         let tilt = sqrt(pow(g.x - motion.gravity.x, 2) + pow(g.y - motion.gravity.y, 2) + pow(g.z - motion.gravity.z, 2))
-                        if speed > 0.35 || tilt > 0.2 {
-                            self.message = speed > 0.35 ? "Slow down to keep detail sharp" : "Keep the phone level"
+                        if let warning = PanoramaPolicy.motionWarning(speed: speed, tilt: tilt) {
+                            self.message = warning
                             try await Task.sleep(nanoseconds: 120_000_000); continue
                         }
                     }
@@ -1146,7 +1167,7 @@ final class CameraViewModel: ObservableObject {
                     bytes += added; self.panoramaFrames += 1
                     if method == .stitch {
                         self.panoramaTakingPhoto = false
-                        self.message = "Move a little " + direction.rawValue.lowercased() + ", overlap two-thirds, then tap the shutter. Finish when done."
+                        self.message = "Overlap two-thirds · tap shutter for next photo"
                     }
                     let pause = max(0, 0.45 - (ProcessInfo.processInfo.systemUptime - captureStart))
                     if pause > 0 { try await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000)) }
@@ -1336,7 +1357,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     var canSavePanoramaPhoto: Bool {
-        canUseRecovery && panoramaRecovery?.saved == false && panoramaRecovery?.readyToSave == false && pendingPhoto != nil
+        canUseRecovery && !saveNeedsConfirmation && panoramaRecovery?.saved == false && panoramaRecovery?.readyToSave == false && pendingPhoto != nil
     }
     func saveAvailablePanoramaPhoto() async {
         guard canSavePanoramaPhoto, var journal = panoramaRecovery else { return }
@@ -1353,8 +1374,13 @@ final class CameraViewModel: ObservableObject {
         busy = false
     }
 
-    func retrySave() async {
+    func retrySave(confirmPossibleDuplicate: Bool = false) async {
         guard canUseRecovery else { return }
+        guard !saveNeedsConfirmation || confirmPossibleDuplicate else {
+            message = "This capture may already be in Photos. Check before saving another copy."
+            return
+        }
+        saveNeedsConfirmation = false
         recoveryActionRunning = true
         defer { recoveryActionRunning = false }
         if recoveryReadFailed { restoring = true; await restoreCaptures(); return }
@@ -1391,7 +1417,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     private func savePending() async {
-        guard pendingVideo != nil || pendingPhoto != nil else { return }
+        guard !saveNeedsConfirmation, pendingVideo != nil || pendingPhoto != nil else { return }
         captureActivity = .saving
         busy = true
         message = "Saving · protecting a local recovery copy…"
@@ -1405,6 +1431,7 @@ final class CameraViewModel: ObservableObject {
             recoveryProtected = true
         } catch {
             recoveryProtected = false
+            CameraDiagnostics.shared.record(.saveFailed, value: (error as NSError).code)
             message = "Could not protect this capture on disk. Keep Camera XT open, free storage, then retry. \(error.localizedDescription)"
             return
         }
@@ -1415,14 +1442,20 @@ final class CameraViewModel: ObservableObject {
             let savedMessage: String
             if let video = pendingVideo {
                 thumbnail = await CaptureStore.videoThumbnail(video)
+                try await store.beginSave()
                 try await saver.saveVideo(video)
                 savedMessage = "Video saved"
             } else if let photo = pendingPhoto {
                 thumbnail = await CapturePreviewDecoder.thumbnail(photo.data)
+                try await store.beginSave()
                 try await saver.save(photo)
                 savedMessage = photo.warning ?? (photo.companions.isEmpty ? "Saved" : "Saved \(1 + photo.companions.count) photos")
             } else { return }
             lastSaveMilliseconds = Int((ProcessInfo.processInfo.systemUptime - saveStarted) * 1000)
+            CameraDiagnostics.shared.record(.saved, value: lastSaveMilliseconds)
+            // If this tiny receipt fails, the pre-save attempt remains ambiguous
+            // on relaunch. Never interpret that as permission to save twice.
+            try? await store.markSaved()
             // Photos has committed. Cache failures must never offer an automatic duplicate save.
             pendingPhoto = nil; pendingVideo = nil
             if var journal = panoramaRecovery {
@@ -1432,7 +1465,8 @@ final class CameraViewModel: ObservableObject {
             }
             var localSaveCompleted = false
             do {
-                recent = try await store.finish(thumbnail: thumbnail)
+                _ = try await store.finish(thumbnail: thumbnail)
+                recent = try await store.load("recent.plist", includingPhotos: false)
                 localSaveCompleted = true
                 await updateRecentThumbnail()
                 message = savedMessage
@@ -1447,6 +1481,7 @@ final class CameraViewModel: ObservableObject {
             if haptics { UINotificationFeedbackGenerator().notificationOccurred(.success) }
             if UIAccessibility.isVoiceOverRunning { UIAccessibility.post(notification: .announcement, argument: "Saved to Photos") }
         } catch {
+            CameraDiagnostics.shared.record(.saveFailed, value: (error as NSError).code)
             message = "Not saved to Photos. A recovery copy is on this iPhone. \(error.localizedDescription)"
             if haptics { UINotificationFeedbackGenerator().notificationOccurred(.error) }
         }
@@ -1454,10 +1489,11 @@ final class CameraViewModel: ObservableObject {
 
     private func restoreCaptures() async {
         defer { restoring = false }
-        recent = try? await store.load("recent.plist")
+        recent = try? await store.load("recent.plist", includingPhotos: false)
         await updateRecentThumbnail()
         do {
             recoveryReadFailed = false
+            saveNeedsConfirmation = false
             panoramaRecovery = try await PanoramaFileStore.load()
             if panoramaRecovery?.saved == true {
                 try await store.discard()
@@ -1467,16 +1503,19 @@ final class CameraViewModel: ObservableObject {
                 return
             }
             if panoramaRecovery == nil { try await PanoramaFileStore.clear() }
-            if let record = try await store.load("pending.plist") {
+            if let metadata = try await store.load("pending.plist", includingPhotos: false) {
+                var record = metadata
+                if !metadata.saved { record = try await store.load("pending.plist") ?? metadata }
                 if record.saved {
                     try await store.discard()
                     if panoramaRecovery != nil { try await PanoramaFileStore.clear(); panoramaRecovery = nil }
                 }
                 else {
+                    saveNeedsConfirmation = record.saveAttempted == true || record.captureID == nil
                     pendingPhoto = record.captured
                     if record.isVideo { pendingVideo = try await store.videoURL() }
                     recoveryProtected = true
-                    message = "Recovered an unfinished save. Check Photos before retrying to avoid a duplicate."
+                    message = saveNeedsConfirmation ? "This capture may already be in Photos. Check before saving another copy." : "Recovered an unfinished capture. Retry to save it."
                 }
             }
             if let journal = panoramaRecovery {
@@ -1502,6 +1541,10 @@ final class CameraViewModel: ObservableObject {
         lastSavedPhotoCount = record.photos.count
     }
 
+    func loadRecentForReview() async throws -> CaptureStore.Record? {
+        try await store.load("recent.plist")
+    }
+
     func clearRecent() async {
         do {
             try await store.clearRecent()
@@ -1525,6 +1568,7 @@ final class CameraViewModel: ObservableObject {
                 try await store.discard()
                 pendingPhoto = nil; burstPhotos = []; burstPreviews = []; reviewingBurst = false
                 pendingVideo = nil; recoveryProtected = false; recoveryReadFailed = false
+                saveNeedsConfirmation = false
                 message = "Unsaved capture discarded."
             } catch { message = "Could not discard the recovery copy. Try again." }
             busy = false
