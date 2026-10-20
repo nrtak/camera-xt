@@ -4,6 +4,20 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testPreviewControlsNeverBecomeFocusTaps() {
+        let bounds = CGRect(x: 0, y: 0, width: 390, height: 520)
+        // Reject the entire strip, including gaps between controls.
+        for x in stride(from: 0, through: 389, by: 17) {
+            for y in [476, 490, 519] {
+                XCTAssertFalse(PreviewGeometry.acceptsFocus(at: CGPoint(x: x, y: y), bounds: bounds, controlStripHeight: 44))
+            }
+        }
+        XCTAssertTrue(PreviewGeometry.acceptsFocus(at: CGPoint(x: 195, y: 475), bounds: bounds, controlStripHeight: 44))
+        XCTAssertFalse(PreviewGeometry.acceptsFocus(at: CGPoint(x: 195, y: 400), bounds: bounds, controlStripHeight: 140))
+        XCTAssertFalse(PreviewGeometry.acceptsFocus(at: CGPoint(x: CGFloat.nan, y: 20), bounds: bounds, controlStripHeight: 44))
+        XCTAssertFalse(PreviewGeometry.acceptsFocus(at: .zero, bounds: .zero, controlStripHeight: 44))
+    }
+
     func testPreviewRecoveryWaitsForFiveChecksAndDoesNotInterruptCapture() {
         var health = PreviewHealth()
         for time in 0..<4 { XCTAssertFalse(health.shouldRestart(previewing: false, eligible: true, now: Double(time))) }
