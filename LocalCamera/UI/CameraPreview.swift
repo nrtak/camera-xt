@@ -15,6 +15,7 @@ struct CameraPreview: UIViewRepresentable {
     var showsGrid = false
     var guideImage: UIImage?
     var onImageFrame: ((CGRect) -> Void)?
+    var controlStripHeight: CGFloat = 0
 
     final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
@@ -72,6 +73,7 @@ struct CameraPreview: UIViewRepresentable {
         var showsFocusFeedback = true
         var onFocus: (CGPoint, Bool) -> Void
         var exposureOnly = false
+        var controlStripHeight: CGFloat = 0
         weak var marker: UILabel?
         init(engine: CaptureSessionManager, onFocus: @escaping (CGPoint, Bool) -> Void) { self.engine = engine; self.onFocus = onFocus }
         @objc func tap(_ gesture: UITapGestureRecognizer) { focus(gesture, locked: false) }
@@ -81,6 +83,8 @@ struct CameraPreview: UIViewRepresentable {
         private func focus(_ gesture: UIGestureRecognizer, locked: Bool) {
             guard let view = gesture.view as? PreviewView else { return }
             let point = gesture.location(in: view)
+            // Overlay controls own this strip, including gaps and disabled buttons.
+            guard PreviewGeometry.acceptsFocus(at: point, bounds: view.bounds, controlStripHeight: controlStripHeight) else { return }
             let videoRect = view.previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
             guard PreviewGeometry.isValid(videoRect), point.x.isFinite, point.y.isFinite, videoRect.contains(point) else { return }
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
@@ -134,6 +138,7 @@ struct CameraPreview: UIViewRepresentable {
         view.imageFrameChanged = onImageFrame
         context.coordinator.showsFocusFeedback = showsFocusFeedback
         context.coordinator.exposureOnly = exposureOnly
+        context.coordinator.controlStripHeight = controlStripHeight
         context.coordinator.marker?.isHidden = !showsFocusFeedback
         if focusState == "Focus locked" { context.coordinator.marker?.text = "Locked" }
         else if focusState == "Auto focus", context.coordinator.marker?.text == "Locked" { context.coordinator.marker?.removeFromSuperview() }
@@ -145,6 +150,12 @@ struct CameraPreview: UIViewRepresentable {
 
 /// Reject transient invalid camera geometry before assigning CALayer/UIView frames.
 enum PreviewGeometry {
+    static func acceptsFocus(at point: CGPoint, bounds: CGRect, controlStripHeight: CGFloat) -> Bool {
+        guard isValid(bounds), point.x.isFinite, point.y.isFinite,
+              controlStripHeight.isFinite, bounds.contains(point) else { return false }
+        return point.y < bounds.maxY - max(0, controlStripHeight)
+    }
+
     static func panelRect(image: CGRect, bounds: CGRect, preferredHeight: CGFloat, sidePanel: Bool = false) -> CGRect {
         guard isValid(bounds) else { return .zero }
         let intersection = image.intersection(bounds)
