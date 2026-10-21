@@ -288,6 +288,37 @@ final class CaptureSessionManager {
     private var previewHealth = PreviewHealth()
     private var previewFailureReported = false
     var onAnalysis: ((UIImage?, [Double]) -> Void)?
+    var onLensWarning: ((Int, Bool) -> Void)?
+    private var lensWarningsEnabled = true
+    private var lensWarningsSuspended = false
+    private let lensMonitor = LensObstructionMonitor()
+
+    func setLensWarningsEnabled(_ enabled: Bool) {
+        queue.async {
+            self.lensWarningsEnabled = enabled
+            if !enabled { self.lensMonitor.pause() }
+        }
+    }
+
+    private func updateLensMonitor() {
+        guard processor == nil, !dual.busy, !burstRunning, movieProcessor == nil else {
+            lensMonitor.pause(); return
+        }
+        guard wantsRunning, activeSession.isRunning, !activeSession.isInterrupted,
+              lensWarningsEnabled, !lensWarningsSuspended, !snapshot.cooling,
+              !ProcessInfo.processInfo.isLowPowerModeEnabled,
+              snapshot.analysisMode == "Off", !snapshot.eyeFocusEnabled else {
+            lensMonitor.stop(); return
+        }
+        // Never reconfigure outputs while a capture or recording is in progress.
+        let sources = snapshot.dualEnabled ? dual.inputs : [input].compactMap { $0 }
+        guard !sources.contains(where: { [.serious, .critical, .shutdown].contains($0.device.systemPressureState.level) }) else {
+            lensMonitor.stop(); return
+        }
+        lensMonitor.update(session: activeSession, inputs: sources) { [weak self] index, warning in
+            self?.onLensWarning?(index, warning)
+        }
+    }
     private let analysisOutput = AVCaptureVideoDataOutput()
     private var analyzer: ViewfinderAnalyzer?
     private let eyeOutput = AVCaptureVideoDataOutput()
@@ -306,6 +337,8 @@ final class CaptureSessionManager {
                 guard let self else { return }
                 CameraDiagnostics.shared.record(.memoryWarning)
                 self.pendingMemoryCleanup = true
+                self.lensWarningsSuspended = true
+                self.lensMonitor.pause()
                 // Stop optional frame work without reconfiguring an in-flight capture.
                 self.analysisOutput.setSampleBufferDelegate(nil, queue: nil)
                 self.eyeOutput.setSampleBufferDelegate(nil, queue: nil)
@@ -367,6 +400,7 @@ final class CaptureSessionManager {
             if !self.wantsRunning { self.previewHealth = PreviewHealth(); self.previewFailureReported = false }
             if !self.wantsRunning { CameraDiagnostics.shared.record(.sessionStart) }
             self.wantsRunning = true
+            self.lensWarningsSuspended = false
             do {
                 if self.input == nil { try self.configure() }
                 else if !self.snapshot.dualEnabled { try self.restoreSingleCamera() }
@@ -385,6 +419,7 @@ final class CaptureSessionManager {
         queue.async {
             CameraDiagnostics.shared.record(.sessionStop)
             self.wantsRunning = false
+            self.lensMonitor.pause()
             self.recoveryPending = false
             self.analysisOutput.setSampleBufferDelegate(nil, queue: nil)
             self.eyeOutput.setSampleBufferDelegate(nil, queue: nil)
@@ -593,6 +628,7 @@ final class CaptureSessionManager {
 
     func capture(speed: Bool = false, night: Bool = false, panorama: Bool = false, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         queue.async {
+            self.lensMonitor.pause()
             let orientation = self.burstRunning ? self.sequenceOrientation : self.interfaceOrientation
             if self.snapshot.dualEnabled {
                 self.dual.setOrientation(orientation)
@@ -817,6 +853,7 @@ final class CaptureSessionManager {
     }
 
     private func disconnectPreviews() {
+        lensMonitor.stop()
         for layer in [preview, secondaryPreview].compactMap({ $0 }) {
             if let connection = layer.connection { layer.session?.removeConnection(connection) }
             layer.session = nil
@@ -1071,6 +1108,7 @@ final class CaptureSessionManager {
             self.disableAnalysis()
             self.disableEyeFocus()
             self.session.stopRunning()
+            self.lensMonitor.stop()
             self.session.beginConfiguration()
             var failure: Error?
             do {
@@ -1184,6 +1222,7 @@ final class CaptureSessionManager {
             }
             self.movieProcessor = processor
             self.movie.minFreeDiskSpaceLimit = 100 * 1024 * 1024
+            self.lensMonitor.pause()
             self.movie.startRecording(to: url, recordingDelegate: processor)
         }
     }
@@ -1279,6 +1318,7 @@ final class CaptureSessionManager {
             }
             self.finishMemoryCleanupIfIdle()
             self.updateMeter()
+            self.updateLensMonitor()
             if self.snapshot.cooling && (self.snapshot.analysisMode != "Off" || self.snapshot.eyeFocusEnabled) {
                 self.disableAnalysis()
                 self.disableEyeFocus()
@@ -1856,5 +1896,131 @@ struct FocusSettlingWindow {
         if let idleSince, now - idleSince >= 0.1 { return .ready }
         if now - startedAt >= 1 { return .timedOut }
         return .wait
+    }
+}
+
+/// Conservative edge-hand hint, not a promise that an uncovered lens is clear.
+struct LensWarningEvidence {
+    private(set) var warning = false
+    private var hits = 0
+    private var misses = 0
+    mutating func observe(_ candidate: Bool) -> Bool {
+        hits = candidate ? hits + 1 : 0
+        misses = candidate ? 0 : misses + 1
+        if hits >= 2 { warning = true }
+        if misses >= 2 { warning = false }
+        return warning
+    }
+    static func edgeHand(_ points: [CGPoint]) -> Bool {
+        guard points.count >= 3, points.allSatisfy({ $0.x.isFinite && $0.y.isFinite && (0...1).contains($0.x) && (0...1).contains($0.y) }) else { return false }
+        let xs = points.map(\.x), ys = points.map(\.y)
+        guard let left = xs.min(), let right = xs.max(), let bottom = ys.min(), let top = ys.max() else { return false }
+        // Ignore small/distant hands and hands intentionally centered in a scene.
+        return max(right - left, top - bottom) >= 0.22 &&
+            (left < 0.08 || right > 0.92 || bottom < 0.08 || top > 0.92)
+    }
+}
+
+/// Session-queue ownership. Optional outputs never alter capture format or dimensions.
+private final class LensObstructionMonitor {
+    private weak var session: AVCaptureSession?
+    private var sourceIDs: [String] = []
+    private var outputs: [AVCaptureVideoDataOutput] = []
+    private var samplers: [LensObstructionSampler] = []
+    private var attempted = false
+    private let worker = DispatchQueue(label: "LocalCamera.lensWarning", qos: .utility)
+    private let context = CIContext(options: [.cacheIntermediates: false])
+
+    func pause() {
+        outputs.forEach { $0.setSampleBufferDelegate(nil, queue: nil) }
+        samplers.forEach { $0.cancel() }
+        samplers.removeAll()
+    }
+    func stop() {
+        pause()
+        if let session, !outputs.isEmpty {
+            session.beginConfiguration()
+            for output in outputs where session.outputs.contains(output) { session.removeOutput(output) }
+            session.commitConfiguration()
+        }
+        outputs.removeAll(); sourceIDs.removeAll(); session = nil; attempted = false
+    }
+    func update(session: AVCaptureSession, inputs: [AVCaptureDeviceInput], report: @escaping (Int, Bool) -> Void) {
+        let ids = inputs.map { $0.device.uniqueID }
+        if self.session !== session || sourceIDs != ids {
+            stop(); self.session = session; sourceIDs = ids
+        }
+        guard !inputs.isEmpty else { return }
+        if !attempted {
+            attempted = true
+            session.beginConfiguration()
+            for input in inputs {
+                let output = AVCaptureVideoDataOutput()
+                output.alwaysDiscardsLateVideoFrames = true
+                guard session.canAddOutput(output), let port = input.ports.first(where: { $0.mediaType == .video }) else { break }
+                session.addOutputWithNoConnections(output)
+                let connection = AVCaptureConnection(inputPorts: [port], output: output)
+                guard session.canAddConnection(connection) else { session.removeOutput(output); break }
+                session.addConnection(connection)
+                if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+                outputs.append(output)
+            }
+            // Optional hints must not push a paired-camera session over its budget.
+            let overBudget = (session as? AVCaptureMultiCamSession).map { $0.hardwareCost > 0.9 || $0.systemPressureCost > 0.9 } ?? false
+            if outputs.count != inputs.count || overBudget {
+                outputs.forEach { session.removeOutput($0) }; outputs.removeAll()
+            }
+            session.commitConfiguration()
+        }
+        guard samplers.isEmpty else { return }
+        for (index, output) in outputs.enumerated() {
+            let sampler = LensObstructionSampler(context: context, report: { report(index, $0) })
+            samplers.append(sampler)
+            output.setSampleBufferDelegate(sampler, queue: worker)
+        }
+    }
+}
+
+private final class LensObstructionSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    private let lock = NSLock()
+    private var active = true
+    private var lastSample = -Double.infinity
+    private var evidence = LensWarningEvidence()
+    private let report: (Bool) -> Void
+    private let context: CIContext
+    init(context: CIContext, report: @escaping (Bool) -> Void) { self.context = context; self.report = report }
+    private var isActive: Bool { lock.lock(); defer { lock.unlock() }; return active }
+    func cancel() {
+        lock.lock(); active = false; lock.unlock()
+        DispatchQueue.main.async { [report] in report(false) }
+    }
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard isActive, now - lastSample >= 1.0,
+              let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        lastSample = now
+        autoreleasepool {
+            let input = CIImage(cvPixelBuffer: buffer)
+            let scale = min(1, 320 / max(input.extent.width, input.extent.height))
+            let small = input.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            guard let image = context.createCGImage(small, from: small.extent), isActive else { return }
+            let request = VNDetectHumanHandPoseRequest()
+            request.maximumHandCount = 2
+            var candidate = false
+            do {
+                try VNImageRequestHandler(cgImage: image, orientation: .up).perform([request])
+                for hand in request.results ?? [] {
+                    let points = try hand.recognizedPoints(.all).values.filter { $0.confidence >= 0.5 }.map(\.location)
+                    candidate = candidate || LensWarningEvidence.edgeHand(points)
+                }
+            } catch { candidate = false }
+            let old = evidence.warning
+            let warning = evidence.observe(candidate)
+            guard old != warning else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isActive else { return }
+                self.report(warning)
+            }
+        }
     }
 }
