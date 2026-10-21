@@ -21,6 +21,7 @@ struct CameraView: View {
     @AppStorage("camera.showQuickControls") private var showQuickControls = true
     @AppStorage("camera.adaptiveLayout") private var adaptiveLayout = true
     @AppStorage("camera.sceneHints") private var sceneHints = true
+    @AppStorage("camera.lensWarnings") private var lensWarnings = true
     @AppStorage("camera.advancedTools") private var advancedTools = false
     @AppStorage("camera.rememberSetup") private var rememberSetup = true
     @AppStorage("camera.pin1") private var pin1 = "Exposure"
@@ -105,6 +106,7 @@ struct CameraView: View {
                         .simultaneousGesture(zoomGesture(nil))
                         .allowsHitTesting(!panelOpen)
                         .accessibilityHidden(panelOpen)
+                        .overlay(alignment: .top) { lensWarningBadge(0).padding(.top, 8) }
                         .padding(.top, 52)
                         .padding(.bottom, captureControlsHeight + 8)
                 }
@@ -183,6 +185,7 @@ struct CameraView: View {
             if height.isFinite && height > 0 { zoomControlsHeight = height }
         }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsZoom = false; zoomDismissTask?.cancel() }
+        .onChange(of: lensWarnings) { _, enabled in model.engine.setLensWarningsEnabled(enabled) }
         .onChange(of: panelOpen) { _, open in
             if open { showsZoom = false; zoomDismissTask?.cancel() }
         }
@@ -190,7 +193,10 @@ struct CameraView: View {
         .foregroundStyle(ink)
         .tint(selection)
         .preferredColorScheme(.dark)
-        .task { model.setActive(scenePhase == .active) }
+        .task {
+            model.engine.setLensWarningsEnabled(lensWarnings)
+            model.setActive(scenePhase == .active)
+        }
         .onChange(of: scenePhase) {
             if $0 == .background { model.enteredBackground() }
             model.setActive($0 == .active)
@@ -207,6 +213,17 @@ struct CameraView: View {
         }
     }
 
+    @ViewBuilder private func lensWarningBadge(_ index: Int) -> some View {
+        if lensWarnings && !panelOpen && scenePhase == .active && model.lensWarnings.contains(index) {
+            Label("Check lens", systemImage: "hand.raised.fill")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(.black.opacity(0.65), in: Capsule())
+                .accessibilityLabel("Camera \(index + 1): a hand may be covering the lens")
+                .allowsHitTesting(false)
+        }
+    }
+
     private func dualViewfinder(_ title: String, index: Int) -> some View {
         CameraPreview(engine: model.engine, onFocus: { point, locked in
             guard !panelOpen else { return }
@@ -217,6 +234,7 @@ struct CameraView: View {
             focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
             exposureOnly: model.exposurePointOnly, controlStripHeight: showsZoom ? 140 : 52)
         .background(.black)
+        .overlay(alignment: .top) { lensWarningBadge(index).padding(8) }
         .simultaneousGesture(zoomGesture(index))
         .overlay { Rectangle().strokeBorder(!panelOpen && selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
         .overlay(alignment: .bottom) {
@@ -233,6 +251,7 @@ struct CameraView: View {
                         }
                         .font(.caption.weight(.semibold)).foregroundStyle(selectedDualIndex == index ? selection : .white)
                         .frame(minHeight: 44).padding(.horizontal, 8)
+                        .background(overlayColor, in: Capsule())
                     }
                     .accessibilityLabel("Adjust camera \(index + 1), \(title)")
                     .accessibilityValue(model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Fixed focus")
@@ -242,6 +261,7 @@ struct CameraView: View {
                     } label: {
                         Image(systemName: enlargedDualIndex == index ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                             .frame(width: 44, height: 44)
+                            .background(overlayColor, in: Circle())
                     }
                     .accessibilityLabel(enlargedDualIndex == index ? "Show both cameras equally" : "Enlarge \(title)")
                     if enlargedDualIndex == nil || enlargedDualIndex == index {
@@ -252,6 +272,7 @@ struct CameraView: View {
                             showsZoom = true
                         } label: {
                             Image(systemName: "magnifyingglass").frame(width: 44, height: 44)
+                                .background(overlayColor, in: Circle())
                         }
                         .accessibilityLabel("Zoom camera \(index + 1), \(title)")
                         Button {
@@ -259,6 +280,7 @@ struct CameraView: View {
                             openTool(.exposure)
                         } label: {
                             Image(systemName: "sun.max").frame(width: 44, height: 44)
+                                .background(overlayColor, in: Circle())
                         }
                         .accessibilityLabel("Brightness camera \(index + 1), \(title)")
                     }
@@ -267,7 +289,6 @@ struct CameraView: View {
             }
             .padding(.horizontal, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(overlayColor, in: RoundedRectangle(cornerRadius: 10))
             .contentShape(Rectangle())
             .onTapGesture {}
             .buttonStyle(.plain)
@@ -1054,6 +1075,8 @@ struct CameraView: View {
             Toggle("Rotate layout", isOn: $adaptiveLayout)
             Toggle("Composition grid", isOn: $showsGrid)
             Toggle("Low-light hints", isOn: $sceneHints)
+            Toggle("Finger warning", isOn: $lensWarnings)
+            Text("Shows Check lens when a hand stays near the edge. May miss blurred fingers or other obstructions. Pauses during capture, Low Power Mode or when the phone is warm.").font(.caption).foregroundStyle(.secondary)
             Toggle("Capture vibrations", isOn: $model.haptics)
             Toggle("Remember controls", isOn: $rememberSetup)
             Text("Quality starts at the highest supported preset on each launch. Recording never resumes automatically.").font(.caption).foregroundStyle(.secondary)

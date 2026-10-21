@@ -706,6 +706,8 @@ final class CameraViewModel: ObservableObject {
 
     func enteredBackground() { saveSetup(); nightWork?.cancel(); panoramaWake?.yield(()); longExposureDelay?.cancel() }
 
+    @Published var lensWarnings: Set<Int> = []
+
     init(saver: PhotoSaving = PhotoLibrarySaver()) {
         CameraLaunchPreferences.prepareOnce()
         self.saver = saver
@@ -724,6 +726,13 @@ final class CameraViewModel: ObservableObject {
             }
         }
         engine.onWarning = { [weak self] warning in Task { @MainActor [weak self] in self?.message = warning } }
+        engine.onLensWarning = { [weak self] index, warning in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if warning && self.active { self.lensWarnings.insert(index) }
+                else { self.lensWarnings.remove(index) }
+            }
+        }
         engine.onAnalysis = { [weak self] image, bins in
             Task { @MainActor [weak self] in
                 guard let self, self.active else { return }
