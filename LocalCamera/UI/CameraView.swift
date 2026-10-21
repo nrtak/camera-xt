@@ -15,6 +15,7 @@ struct CameraView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.dynamicTypeSize) private var textSize
     @AppStorage("camera.quickAccess") private var quickAccess = false
@@ -52,6 +53,11 @@ struct CameraView: View {
     @State private var imageFrame = CGRect.zero
     @State private var manualPage: CameraToolPage = .exposure
     @State private var selectedDualIndex = 0
+    @State private var visibleTransition: String?
+    private var transitionLabel: String? {
+        if let mode = model.preparingMode { return "Preparing \(mode.rawValue)…" }
+        return model.configuring ? "Preparing camera…" : nil
+    }
     private var panelOpen: Bool { showsCaptureInfo || showsRecent || model.reviewingBurst }
     private var enlargedDualIndex: Int? {
         get { (0...1).contains(dualLayout) ? dualLayout : nil }
@@ -186,6 +192,13 @@ struct CameraView: View {
         }
         .onChange(of: model.camera.dualEnabled) { _, _ in showsZoom = false; zoomDismissTask?.cancel() }
         .onChange(of: lensWarnings) { _, enabled in model.engine.setLensWarningsEnabled(enabled) }
+        .task(id: transitionLabel) {
+            visibleTransition = nil
+            guard let label = transitionLabel else { return }
+            do { try await Task.sleep(nanoseconds: 180_000_000) } catch { return }
+            guard !Task.isCancelled, transitionLabel == label else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { visibleTransition = label }
+        }
         .onChange(of: panelOpen) { _, open in
             if open { showsZoom = false; zoomDismissTask?.cancel() }
         }
@@ -239,7 +252,7 @@ struct CameraView: View {
         .overlay { Rectangle().strokeBorder(!panelOpen && selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
         .overlay(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 0) {
+                HStack(spacing: 4) {
                     Button {
                         selectedDualIndex = index
                         zoomDismissTask?.cancel()
@@ -254,6 +267,7 @@ struct CameraView: View {
                         .background(overlayColor, in: Capsule())
                     }
                     .accessibilityLabel("Adjust camera \(index + 1), \(title)")
+                    .accessibilityHint(index == 0 ? "Adjusts the Main lens only" : "Adjusts the Ultra Wide lens only")
                     .accessibilityValue(model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Fixed focus")
                     .accessibilityAddTraits(selectedDualIndex == index ? .isSelected : [])
                     Button {
@@ -324,12 +338,11 @@ struct CameraView: View {
 
     private var captureStatus: some View {
         VStack(spacing: 12) {
-            if let preparing = model.preparingMode {
-                HStack { ProgressView(); Text("Preparing \(preparing.rawValue)…") }
-                    .font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
-            } else if model.configuring {
-                HStack { ProgressView(); Text("Preparing camera…") }
-                    .font(.callout).padding(8).background(overlayColor, in: RoundedRectangle(cornerRadius: 8))
+            if let label = visibleTransition, transitionLabel != nil {
+                HStack(spacing: 8) { ProgressView(); Text(label) }
+                    .font(.caption.weight(.medium)).padding(8).background(overlayColor, in: Capsule())
+                    .accessibilityElement(children: .combine)
+                    .allowsHitTesting(false)
             }
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
                 if sceneHints, model.canConfigure, !model.panoramaSelected, model.mode == .photo, model.message == nil, let advice = model.sceneAdvice {
@@ -428,7 +441,7 @@ struct CameraView: View {
                     if model.camera.cooling { Text("iPhone is warm · processing reduced").font(.caption) }
                     if let message = model.message, !model.panoramaSelected {
                         Label(model.busy ? model.captureActivity.rawValue : message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
-                            .font(.callout).accessibilityLabel(message)
+                            .font(CameraViewModel.isBriefStatus(message) ? .caption : .callout).accessibilityLabel(message)
                         if model.busy && showHelp { Text(message).font(.caption) }
                     }
                     if model.hasPendingCapture && model.canUseRecovery {
@@ -486,9 +499,12 @@ struct CameraView: View {
     private func quickControl(_ title: String, icon: String, value: String, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: 2) {
-                Image(systemName: icon).font(.body)
-                Text(value == "Open" ? title : value).font(.caption2)
-                    .lineLimit(1).minimumScaleFactor(0.8)
+                Image(systemName: icon).font(.system(size: 19, weight: .medium)).frame(height: 22)
+                if value != "Off" && value != "On" {
+                    Text(value == "Open" ? title : value).font(.caption2)
+                        .lineLimit(textSize.isAccessibilitySize ? 2 : 1).minimumScaleFactor(0.8)
+                        .multilineTextAlignment(.center)
+                }
             }
             .frame(maxWidth: .infinity, minHeight: 44)
             .contentShape(Rectangle())
@@ -663,8 +679,8 @@ struct CameraView: View {
                     let selected = model.mode == .video ? index == 2 : index == (model.panoramaSelected ? 1 : 0)
                     Button { showsCaptureInfo = false; showsRecent = false; model.chooseCaptureMode(index) } label: {
                         Text(["PHOTO", "PANORAMA", "VIDEO"][index])
-                            .font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
-                            .frame(minWidth: 70, minHeight: 44)
+                            .font(.caption.weight(.semibold)).lineLimit(textSize.isAccessibilitySize ? 2 : 1).minimumScaleFactor(0.8)
+                            .frame(minWidth: 60, maxWidth: .infinity, minHeight: 44)
                             .foregroundStyle(selected ? selection : .white)
                     }.buttonStyle(.plain)
                         .accessibilityAddTraits(selected ? .isSelected : [])
@@ -784,8 +800,8 @@ struct CameraView: View {
     }
 
     private var toolPanelHeight: CGFloat {
-        if showsRecent { return model.recent?.isVideo == true ? 370 : .infinity }
         if model.reviewingBurst || textSize.isAccessibilitySize { return .infinity }
+        if showsRecent { return model.recent?.isVideo == true ? 400 : .infinity }
         let base: CGFloat
         switch toolPath.last {
         case nil: return (advancedTools ? 510 : 360) + (hasAdjustments && advancedTools ? 44 : 0)
@@ -1600,23 +1616,28 @@ private struct RecentCaptureLoader: View {
     let close: () -> Void
     @State private var record: CaptureStore.Record?
     @State private var failed = false
+    @State private var attempt = 0
     var body: some View {
         Group {
             if let record { RecentCaptureView(record: record, close: close) }
             else {
                 VStack(spacing: 12) {
                     if failed {
-                        Text("Preview unavailable. Your saved capture is in Photos.")
+                        Image(systemName: "photo.badge.exclamationmark").font(.title2)
+                        Text("Preview unavailable").font(.headline)
+                        Text("Try loading it again, or review your saved capture in Photos.").font(.caption)
+                        Button("Try again") { failed = false; attempt += 1 }.frame(minHeight: 44)
                         Button("Open Photos") {
                             if let url = URL(string: "photos-redirect://") { openURL(url) }
                         }.frame(minHeight: 44)
                     }
                     else { ProgressView("Loading preview…") }
                     Button("Close", action: close).frame(minHeight: 44)
-                }.padding()
+                }.padding().frame(maxWidth: .infinity, minHeight: 180)
+                    .multilineTextAlignment(.center)
             }
         }
-        .task {
+        .task(id: attempt) {
             do {
                 let loaded = try await model.loadRecentForReview()
                 guard !Task.isCancelled else { return }
@@ -1631,12 +1652,20 @@ private struct RecentCaptureView: View {
     let record: CaptureStore.Record
     let close: () -> Void
     @Environment(\.openURL) private var openURL
+    @Environment(\.dynamicTypeSize) private var textSize
     @State private var selection = 0
     @State private var comparing = true
     @State private var comparisonFirst = 0
     @State private var comparisonSecond = 1
     @AppStorage("camera.captureDetails") private var showDetails = false
     var body: some View {
+        Group {
+            if record.isVideo || textSize.isAccessibilitySize {
+                ScrollView { content }
+            } else { content }
+        }
+    }
+    private var content: some View {
         VStack(spacing: 8) {
             HStack {
                 Text(record.isVideo ? "Last video" : record.photos.count > 1 ? "Saved photos" : "Last photo").font(.headline)
@@ -1644,22 +1673,31 @@ private struct RecentCaptureView: View {
                 Button(action: close) { Image(systemName: "xmark").frame(width: 44, height: 44) }
                     .accessibilityLabel("Close recent capture")
             }
-            if record.isVideo, let data = record.thumbnail, let image = UIImage(data: data) {
-                Image(uiImage: image).resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: 220).clipped()
+            if record.isVideo {
+                if let data = record.thumbnail, let image = UIImage(data: data) {
+                    Image(uiImage: image).resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: 180)
+                        .accessibilityLabel("Video thumbnail")
+                } else {
+                    Image(systemName: "video.fill").font(.largeTitle).frame(maxWidth: .infinity, minHeight: 80)
+                    Text("Video preview unavailable").font(.caption)
+                }
                 Label("Saved in Photos", systemImage: "checkmark.circle").font(.caption)
+                Text("Play the full video in Photos.").font(.caption).foregroundStyle(.secondary)
             } else if record.photos.indices.contains(selection) {
                 if comparing && record.photos.count >= 2 {
-                    HStack(spacing: 6) {
+                    let comparisonLayout = textSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 8)) : AnyLayout(HStackLayout(spacing: 6))
+                    comparisonLayout {
                         ForEach([comparisonFirst, comparisonSecond], id: \.self) { index in
                             VStack {
                                 ZoomableCapture(data: record.photos[index].data, maxSize: 1500, label: record.photos[index].label)
                                     .id(index)
+                                    .frame(minHeight: 180)
                                 Button("Enlarge \(record.photos[index].label)") { selection = index; comparing = false }
                                     .font(.caption).frame(minHeight: 44)
                             }
                         }
                     }
-                } else { ZoomableCapture(data: record.photos[selection].data, label: record.photos[selection].label).id(selection) }
+                } else { ZoomableCapture(data: record.photos[selection].data, label: record.photos[selection].label).id(selection).frame(minHeight: 220) }
                 let photo = record.photos[selection]
                 if !comparing || record.photos.count < 2 {
                     Text("\(photo.label) · \(photo.width) × \(photo.height)").font(.caption)
@@ -1687,10 +1725,10 @@ private struct RecentCaptureView: View {
                     }.pickerStyle(.menu).frame(minHeight: 44)
                 }
                 Text("Pinch or double-tap to inspect. Preview is reduced to protect memory.").font(.caption)
-            } else { Text("Open Photos to review this video.") }
-            Button("Open Photos") {
+            } else { Text("This preview is unavailable. Open Photos to review the saved capture.").font(.caption) }
+            Button(record.isVideo ? "Play in Photos" : "Open Photos") {
                 if let url = URL(string: "photos-redirect://") { openURL(url) }
-            }.frame(minHeight: 44)
+            }.frame(minHeight: 44).buttonStyle(.bordered)
         }.padding(12)
         .onAppear {
             comparisonSecond = RecentComparison.secondIndex(labels: record.photos.map(\.label))
@@ -1813,6 +1851,8 @@ private struct ZoomableCapture: UIViewRepresentable {
     }
     final class ZoomView: UIScrollView {
         weak var picture: UIImageView?
+        let loading = UIActivityIndicatorView(style: .medium)
+        let previewStatus = UILabel()
         private var previousSize = CGSize.zero
         override func layoutSubviews() {
             super.layoutSubviews()
@@ -1822,6 +1862,8 @@ private struct ZoomableCapture: UIViewRepresentable {
                 contentOffset = .zero
             }
             if zoomScale == 1 { picture?.frame = CGRect(origin: .zero, size: bounds.size); contentSize = bounds.size }
+            loading.center = CGPoint(x: bounds.midX, y: bounds.midY - 18)
+            previewStatus.frame = CGRect(x: bounds.minX + 12, y: bounds.midY + 4, width: max(0, bounds.width - 24), height: 70)
         }
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -1831,10 +1873,14 @@ private struct ZoomableCapture: UIViewRepresentable {
         view.delegate = context.coordinator
         context.coordinator.scrollView = view
         let image = context.coordinator.imageView
-        context.coordinator.decodeTask = Task { @MainActor [weak image] in
+        context.coordinator.decodeTask = Task { @MainActor [weak image, weak view] in
             let decoded = await CapturePreviewDecoder.image(data, maxSize: maxSize)
             guard !Task.isCancelled else { return }
             image?.image = decoded
+            view?.loading.stopAnimating()
+            view?.previewStatus.text = decoded == nil ? "Preview unavailable. Open Photos to view the original." : nil
+            view?.previewStatus.isHidden = decoded != nil
+            image?.isAccessibilityElement = decoded != nil
         }
         image.contentMode = .scaleAspectFit
         image.isUserInteractionEnabled = true
@@ -1847,12 +1893,24 @@ private struct ZoomableCapture: UIViewRepresentable {
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTap(_:)))
         tap.numberOfTapsRequired = 2; image.addGestureRecognizer(tap)
         view.addSubview(image); view.picture = image
+        view.loading.color = .white
+        view.loading.hidesWhenStopped = true
+        view.previewStatus.text = "Loading photo…"
+        view.previewStatus.font = .preferredFont(forTextStyle: .caption1)
+        view.previewStatus.adjustsFontForContentSizeCategory = true
+        view.previewStatus.textColor = .white
+        view.previewStatus.textAlignment = .center
+        view.previewStatus.numberOfLines = 0
+        view.previewStatus.isUserInteractionEnabled = false
+        view.addSubview(view.loading); view.addSubview(view.previewStatus)
+        view.loading.startAnimating()
         return view
     }
     static func dismantleUIView(_ view: ZoomView, coordinator: Coordinator) {
         coordinator.decodeTask?.cancel()
         coordinator.decodeTask = nil
         coordinator.imageView.image = nil
+        view.loading.stopAnimating()
         view.delegate = nil
     }
     func updateUIView(_ uiView: ZoomView, context: Context) {}

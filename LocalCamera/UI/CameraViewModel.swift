@@ -315,7 +315,8 @@ final class CameraViewModel: ObservableObject {
             guard let message, Self.isBriefStatus(message) else { return }
             messageTask = Task { [weak self] in
                 do { try await Task.sleep(nanoseconds: 2_500_000_000) } catch { return }
-                self?.message = nil
+                guard let self, self.message == message else { return }
+                self.message = nil
             }
         }
     }
