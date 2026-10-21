@@ -4,6 +4,36 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testLensWarningNeedsPersistentEvidenceAndClears() {
+        var evidence = LensWarningEvidence()
+        XCTAssertFalse(evidence.observe(true))
+        XCTAssertFalse(evidence.observe(false))
+        XCTAssertFalse(evidence.observe(true))
+        XCTAssertTrue(evidence.observe(true))
+        XCTAssertTrue(evidence.observe(false))
+        XCTAssertFalse(evidence.observe(false))
+    }
+
+    func testLensWarningRejectsCenteredSmallAndInvalidHands() {
+        XCTAssertFalse(LensWarningEvidence.edgeHand([CGPoint(x: 0.3, y: 0.3), CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.7, y: 0.7)]))
+        XCTAssertFalse(LensWarningEvidence.edgeHand([CGPoint(x: 0.01, y: 0.3), CGPoint(x: 0.02, y: 0.32), CGPoint(x: 0.04, y: 0.34)]))
+        XCTAssertFalse(LensWarningEvidence.edgeHand([CGPoint(x: CGFloat.nan, y: 0.3), .zero, CGPoint(x: 0.4, y: 0.4)]))
+        XCTAssertFalse(LensWarningEvidence.edgeHand([.zero]))
+    }
+
+    func testLensWarningDetectsEachEdgeAndKeepsLensesIndependent() {
+        for points in [
+            [CGPoint(x: 0.02, y: 0.3), CGPoint(x: 0.2, y: 0.4), CGPoint(x: 0.3, y: 0.5)],
+            [CGPoint(x: 0.98, y: 0.3), CGPoint(x: 0.8, y: 0.4), CGPoint(x: 0.7, y: 0.5)],
+            [CGPoint(x: 0.3, y: 0.02), CGPoint(x: 0.4, y: 0.2), CGPoint(x: 0.5, y: 0.3)],
+            [CGPoint(x: 0.3, y: 0.98), CGPoint(x: 0.4, y: 0.8), CGPoint(x: 0.5, y: 0.7)]
+        ] { XCTAssertTrue(LensWarningEvidence.edgeHand(points)) }
+        var main = LensWarningEvidence(), ultra = LensWarningEvidence()
+        _ = main.observe(true)
+        XCTAssertTrue(main.observe(true))
+        XCTAssertFalse(ultra.observe(false))
+    }
+
     func testPreviewControlsNeverBecomeFocusTaps() {
         let bounds = CGRect(x: 0, y: 0, width: 390, height: 520)
         // Reject the entire strip, including gaps between controls.
