@@ -1981,6 +1981,56 @@ private final class LensObstructionMonitor {
     }
 }
 
+/// Detects a broad, smooth, warm-colored region entering from an image edge.
+/// Requires surrounding scene detail: color or darkness alone never triggers a hint.
+struct NearLensObstruction {
+    static let side = 64
+    static func candidate(rgba: [UInt8]) -> Bool {
+        guard rgba.count == side * side * 4 else { return false }
+        struct Tile { var warm = 0.0; var texture = 0.0; var red = 0.0 }
+        var tiles = Array(repeating: Tile(), count: 64)
+        func color(_ x: Int, _ y: Int) -> (Double, Double, Double) {
+            let i = (y * side + x) * 4
+            return (Double(rgba[i]) / 255, Double(rgba[i + 1]) / 255, Double(rgba[i + 2]) / 255)
+        }
+        for y in 0..<side {
+            for x in 0..<side {
+                let (r, g, b) = color(x, y)
+                let l = (r + g + b) / 3
+                let i = (y / 8) * 8 + x / 8
+                tiles[i].red += (r - b) / 64
+                if r > g * 1.08 && g > b * 1.04 && r - b > 0.06 && l > 0.035 && l < 0.9 { tiles[i].warm += 1 / 64.0 }
+                // Compare within each tile so its boundary does not count as texture.
+                if x % 8 < 7 && y % 8 < 7 {
+                    let a = color(x + 1, y), c = color(x, y + 1)
+                    tiles[i].texture += (abs(r - a.0) + abs(g - a.1) + abs(b - a.2) + abs(r - c.0) + abs(g - c.1) + abs(b - c.2)) / (6 * 49)
+                }
+            }
+        }
+        let eligible = tiles.map { $0.warm >= 0.8 && $0.texture < 0.025 }
+        var visited = Set<Int>()
+        for start in 0..<64 where eligible[start] && !visited.contains(start) {
+            var component = [start]; visited.insert(start)
+            var cursor = 0
+            while cursor < component.count {
+                let i = component[cursor]; cursor += 1
+                let neighbors = [(i % 8 > 0 ? i - 1 : -1), (i % 8 < 7 ? i + 1 : -1), (i >= 8 ? i - 8 : -1), (i < 56 ? i + 8 : -1)]
+                for n in neighbors where n >= 0 && eligible[n] && !visited.contains(n) { visited.insert(n); component.append(n) }
+            }
+            guard component.count >= 8 && component.count <= 48,
+                  component.filter({ $0 % 8 == 0 || $0 % 8 == 7 || $0 < 8 || $0 >= 56 }).count >= 3 else { continue }
+            let region = Set(component)
+            let other = (0..<64).filter { !region.contains($0) }
+            let texture = component.reduce(0.0) { $0 + tiles[$1].texture } / Double(component.count)
+            let detailed = other.filter { tiles[$0].texture > max(0.012, texture * 2.5) }
+            let redness = component.reduce(0.0) { $0 + tiles[$1].red } / Double(component.count)
+            let backgroundRed = other.reduce(0.0) { $0 + tiles[$1].red } / Double(other.count)
+            if detailed.count >= 6 && redness - backgroundRed > 0.035 { return true }
+        }
+        return false
+    }
+}
+
 private final class LensObstructionSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let lock = NSLock()
     private var active = true
@@ -1988,6 +2038,7 @@ private final class LensObstructionSampler: NSObject, AVCaptureVideoDataOutputSa
     private var evidence = LensWarningEvidence()
     private let report: (Bool) -> Void
     private let context: CIContext
+    private var pixels = [UInt8](repeating: 0, count: NearLensObstruction.side * NearLensObstruction.side * 4)
     init(context: CIContext, report: @escaping (Bool) -> Void) { self.context = context; self.report = report }
     private var isActive: Bool { lock.lock(); defer { lock.unlock() }; return active }
     func cancel() {
@@ -2006,14 +2057,23 @@ private final class LensObstructionSampler: NSObject, AVCaptureVideoDataOutputSa
             guard let image = context.createCGImage(small, from: small.extent), isActive else { return }
             let request = VNDetectHumanHandPoseRequest()
             request.maximumHandCount = 2
-            var candidate = false
+            let dimension = CGFloat(NearLensObstruction.side)
+            let probe = input.transformed(by: CGAffineTransform(scaleX: dimension / input.extent.width, y: dimension / input.extent.height))
+            pixels.withUnsafeMutableBytes { bytes in
+                if let address = bytes.baseAddress {
+                    context.render(probe, toBitmap: address, rowBytes: NearLensObstruction.side * 4,
+                                   bounds: CGRect(x: 0, y: 0, width: dimension, height: dimension), format: .RGBA8,
+                                   colorSpace: CGColorSpaceCreateDeviceRGB())
+                }
+            }
+            var candidate = NearLensObstruction.candidate(rgba: pixels)
             do {
                 try VNImageRequestHandler(cgImage: image, orientation: .up).perform([request])
                 for hand in request.results ?? [] {
                     let points = try hand.recognizedPoints(.all).values.filter { $0.confidence >= 0.5 }.map(\.location)
                     candidate = candidate || LensWarningEvidence.edgeHand(points)
                 }
-            } catch { candidate = false }
+            } catch { /* Keep independent near-lens evidence if hand pose fails. */ }
             let old = evidence.warning
             let warning = evidence.observe(candidate)
             guard old != warning else { return }
