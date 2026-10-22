@@ -716,22 +716,6 @@ struct CameraView: View {
         }
     }
 
-    private var compositionGrid: some View {
-        GeometryReader { geometry in
-            Path { path in
-                for fraction in [CGFloat(1.0 / 3), CGFloat(2.0 / 3)] {
-                    let x = geometry.size.width * fraction
-                    let y = geometry.size.height * fraction
-                    path.move(to: CGPoint(x: x, y: 0))
-                    path.addLine(to: CGPoint(x: x, y: geometry.size.height))
-                    path.move(to: CGPoint(x: 0, y: y))
-                    path.addLine(to: CGPoint(x: geometry.size.width, y: y))
-                }
-            }
-            .stroke(.white.opacity(0.30), lineWidth: 0.5)
-        }
-    }
-
     private var cameraNotice: some View {
         VStack(spacing: 16) {
             Image(systemName: "camera").font(.largeTitle)
