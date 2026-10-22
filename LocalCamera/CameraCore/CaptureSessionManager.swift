@@ -2003,7 +2003,9 @@ struct NearLensObstruction {
                 // Compare within each tile so its boundary does not count as texture.
                 if x % 8 < 7 && y % 8 < 7 {
                     let a = color(x + 1, y), c = color(x, y + 1)
-                    tiles[i].texture += (abs(r - a.0) + abs(g - a.1) + abs(b - a.2) + abs(r - c.0) + abs(g - c.1) + abs(b - c.2)) / (6 * 49)
+                    let horizontal: Double = abs(r - a.0) + abs(g - a.1) + abs(b - a.2)
+                    let vertical: Double = abs(r - c.0) + abs(g - c.1) + abs(b - c.2)
+                    tiles[i].texture += (horizontal + vertical) / 294.0
                 }
             }
         }
