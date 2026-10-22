@@ -17,7 +17,6 @@ enum PanoramaMethod: String, CaseIterable {
 enum PanoramaDirection: String, CaseIterable {
     case right = "Right", left = "Left"
     var sign: CGFloat { self == .right ? 1 : -1 }
-    var symbol: String { self == .right ? "arrow.right" : "arrow.left" }
 }
 
 enum PanoramaFailure: LocalizedError {
@@ -31,12 +30,6 @@ enum PanoramaFailure: LocalizedError {
         case .limit: return "Panorama size limit reached."
         }
     }
-}
-
-struct PanoramaUpdate {
-    let frames: Int
-    let progress: Double
-    let hint: String
 }
 
 enum PanoramaPolicy {

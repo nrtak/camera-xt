@@ -7,10 +7,6 @@ struct CameraLens: Identifiable, Equatable {
     var zoomFactor: Double? = nil
     var maximumZoom: Double = 1
     var secondaryZooms: [Double] = []
-    var zoomLabel: String {
-        guard let zoomFactor else { return name }
-        return zoomFactor.rounded() == zoomFactor ? String(format: "%.0f×", zoomFactor) : String(format: "%.1f×", zoomFactor)
-    }
 }
 
 enum CameraDeviceCatalog {
