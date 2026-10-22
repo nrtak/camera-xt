@@ -4,6 +4,57 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    private func obstructionFixture(_ obstructed: (Int, Int) -> Bool) -> [UInt8] {
+        var bytes = [UInt8]()
+        for y in 0..<64 {
+            for x in 0..<64 {
+                let detail: UInt8 = (x + y).isMultiple(of: 2) ? 90 : 140
+                bytes += obstructed(x, y) ? [180, 90, 60, 255] : [detail, detail, detail, 255]
+            }
+        }
+        return bytes
+    }
+
+    func testBlurredObstructionAtEveryEdge() {
+        for edge in 0..<4 {
+            let bytes = obstructionFixture { x, y in
+                switch edge {
+                case 0: return x < 16
+                case 1: return x >= 48
+                case 2: return y < 16
+                default: return y >= 48
+                }
+            }
+            XCTAssertTrue(NearLensObstruction.candidate(rgba: bytes))
+        }
+    }
+
+    func testObstructionRejectsUniformCenteredAndInvalidScenes() {
+        XCTAssertFalse(NearLensObstruction.candidate(rgba: []))
+        XCTAssertFalse(NearLensObstruction.candidate(rgba: [UInt8](repeating: 0, count: 64 * 64 * 4)))
+        XCTAssertFalse(NearLensObstruction.candidate(rgba: obstructionFixture { _, _ in true }))
+        XCTAssertFalse(NearLensObstruction.candidate(rgba: obstructionFixture { _, _ in false }))
+        XCTAssertFalse(NearLensObstruction.candidate(rgba: obstructionFixture { x, y in
+            (16..<48).contains(x) && (16..<48).contains(y)
+        }))
+    }
+
+    func testOverlayChromeProtectsTopAndBottomWithoutBlockingComposition() {
+        let frame = CGRect(x: 0, y: 0, width: 390, height: 760)
+        for x in stride(from: 0, through: 389, by: 17) {
+            for y in [0, 30, 59, 540, 650, 759] {
+                XCTAssertFalse(PreviewGeometry.acceptsFocus(at: CGPoint(x: x, y: y), bounds: frame,
+                    controlStripHeight: 220, topControlStripHeight: 60))
+            }
+        }
+        XCTAssertTrue(PreviewGeometry.acceptsFocus(at: CGPoint(x: 195, y: 300), bounds: frame,
+            controlStripHeight: 220, topControlStripHeight: 60))
+        XCTAssertFalse(PreviewGeometry.acceptsFocus(at: CGPoint(x: 195, y: 100), bounds: frame,
+            controlStripHeight: 220, topControlStripHeight: 156))
+        XCTAssertFalse(PreviewGeometry.acceptsFocus(at: CGPoint(x: 195, y: 300), bounds: frame,
+            controlStripHeight: 220, topControlStripHeight: .nan))
+    }
+
     func testLensWarningNeedsPersistentEvidenceAndClears() {
         var evidence = LensWarningEvidence()
         XCTAssertFalse(evidence.observe(true))
