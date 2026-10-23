@@ -55,6 +55,31 @@ final class CaptureStoreTests: XCTestCase {
             controlStripHeight: 220, topControlStripHeight: .nan))
     }
 
+    func testAmbiguousLensWarningRequiresFourConsecutiveSamples() {
+        var evidence = LensWarningEvidence()
+        for _ in 0..<3 { XCTAssertFalse(evidence.observe(true, requiredHits: 4)) }
+        XCTAssertFalse(evidence.observe(false, requiredHits: 4))
+        for _ in 0..<3 { XCTAssertFalse(evidence.observe(true, requiredHits: 4)) }
+        XCTAssertTrue(evidence.observe(true, requiredHits: 4))
+        XCTAssertTrue(evidence.observe(false, requiredHits: 4))
+        XCTAssertFalse(evidence.observe(false, requiredHits: 4))
+    }
+
+    func testWarmSceneWithSimilarColoredEdgeDoesNotTriggerLensWarning() {
+        var bytes = obstructionFixture { x, _ in x < 16 }
+        for y in 0..<64 {
+            for x in 0..<16 {
+                let offset = (y * 64 + x) * 4
+                bytes[offset] = 180; bytes[offset + 1] = 160; bytes[offset + 2] = 140
+            }
+            for x in 16..<64 {
+                let offset = (y * 64 + x) * 4
+                bytes[offset] += 30; bytes[offset + 1] += 15
+            }
+        }
+        XCTAssertFalse(NearLensObstruction.candidate(rgba: bytes))
+    }
+
     func testLensWarningNeedsPersistentEvidenceAndClears() {
         var evidence = LensWarningEvidence()
         XCTAssertFalse(evidence.observe(true))
