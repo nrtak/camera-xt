@@ -23,6 +23,7 @@ struct CameraView: View {
     @AppStorage("camera.adaptiveLayout") private var adaptiveLayout = true
     @AppStorage("camera.sceneHints") private var sceneHints = true
     @AppStorage("camera.lensWarnings") private var lensWarnings = true
+    @State private var dismissedLensWarnings: Set<Int> = []
     @AppStorage("camera.advancedTools") private var advancedTools = false
     @AppStorage("camera.rememberSetup") private var rememberSetup = true
     @AppStorage("camera.pin1") private var pin1 = "Exposure"
@@ -75,12 +76,12 @@ struct CameraView: View {
     }
 
     private let ink = Color.white
-    private var overlayColor: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.75 : 0.55) }
+    private var overlayColor: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.85 : 0.72) }
     private var menuBackground: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.92 : 0.78) }
     private var separateControlBands: Bool { textSize.isAccessibilitySize }
     private var previewTopInset: CGFloat { separateControlBands ? headerHeight : 0 }
     private var previewBottomInset: CGFloat { separateControlBands ? captureControlsHeight + 8 : 0 }
-    private var chromeShade: Double { reduceTransparency ? 1 : contrast == .increased ? 0.85 : 0.60 }
+    private var chromeShade: Double { reduceTransparency ? 1 : contrast == .increased ? 0.90 : 0.72 }
     private let selection = CameraAppearance.selection
 
     var body: some View {
@@ -231,6 +232,10 @@ struct CameraView: View {
         }
         .onChange(of: enlargedDualIndex) { _, _ in closeBrightness() }
         .onChange(of: lensWarnings) { _, enabled in model.engine.setLensWarningsEnabled(enabled) }
+        .onChange(of: model.lensWarnings) { _, warnings in
+            // A dismissal lasts until this obstruction clears, independently per lens.
+            dismissedLensWarnings.formIntersection(warnings)
+        }
         .task(id: transitionLabel) {
             visibleTransition = nil
             guard let label = transitionLabel else { return }
@@ -267,13 +272,17 @@ struct CameraView: View {
     }
 
     @ViewBuilder private func lensWarningBadge(_ index: Int) -> some View {
-        if lensWarnings && !panelOpen && scenePhase == .active && model.lensWarnings.contains(index) {
-            Label("Check lens", systemImage: "hand.raised.fill")
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 10).padding(.vertical, 6)
-                .background(.black.opacity(0.65), in: Capsule())
-                .accessibilityLabel("Camera \(index + 1): a hand may be covering the lens")
-                .allowsHitTesting(false)
+        if lensWarnings && !panelOpen && scenePhase == .active && model.lensWarnings.contains(index) && !dismissedLensWarnings.contains(index) {
+            Button { dismissedLensWarnings.insert(index) } label: {
+                HStack(spacing: 8) {
+                    Label("Check lens", systemImage: "hand.raised.fill")
+                    Image(systemName: "xmark").font(.caption2)
+                }
+                .font(.caption.weight(.semibold)).foregroundStyle(.white)
+                .padding(.horizontal, 12).frame(minHeight: 44)
+                .background(overlayColor, in: Capsule())
+            }.buttonStyle(.plain)
+                .accessibilityLabel("Camera \(index + 1): a hand may be covering the lens. Dismiss warning")
         }
     }
 
@@ -296,7 +305,14 @@ struct CameraView: View {
             lensWarningBadge(index).padding(.top, imageTop + 48 + (brightnessTarget == index || (showsZoom && selectedDualIndex == index) ? 96 : 0))
         }
         .simultaneousGesture(zoomGesture(index))
-        .overlay { Rectangle().strokeBorder(!panelOpen && selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
+        .overlay(alignment: .topLeading) {
+            if !panelOpen && selectedDualIndex == index && PreviewGeometry.isValid(visibleImage) {
+                Rectangle().strokeBorder(selection.opacity(0.8), lineWidth: 1)
+                    .frame(width: visibleImage.width, height: visibleImage.height)
+                    .offset(x: visibleImage.minX, y: visibleImage.minY)
+                    .allowsHitTesting(false)
+            }
+        }
         .overlay(alignment: .top) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
@@ -413,6 +429,8 @@ struct CameraView: View {
             Button { if showsCaptureInfo { showsCaptureInfo = false } else { openTool() } } label: {
                 Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44)
                     .foregroundStyle(showsCaptureInfo ? selection : ink)
+                    .padding(.vertical, 4)
+                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
             }.accessibilityLabel(showsCaptureInfo ? "Close camera controls" : "Camera controls")
         }
         .disabled(!model.canConfigure)
@@ -548,7 +566,7 @@ struct CameraView: View {
     }
 
     private var viewfinderQuickControls: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: !quickAccess && model.panoramaSelected && model.mode == .photo ? 1 : 3), spacing: 4) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: !quickAccess && model.panoramaSelected && model.mode == .photo ? 1 : 3), spacing: 8) {
             if quickAccess {
                 ForEach(Array([pin1, pin2, pin3].enumerated()), id: \.offset) { _, name in
                     if let page = CameraToolPage(rawValue: name) {
@@ -595,6 +613,8 @@ struct CameraView: View {
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 44)
+            .padding(.vertical, 4)
+            .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -748,20 +768,6 @@ struct CameraView: View {
         let layout = landscape ? AnyLayout(HStackLayout(spacing: 12)) : AnyLayout(VStackLayout(spacing: 6))
         let modeLayout = landscape ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 12))
         return layout {
-            modeLayout {
-                ForEach(0..<3) { index in
-                    let selected = model.mode == .video ? index == 2 : index == (model.panoramaSelected ? 1 : 0)
-                    Button { showsCaptureInfo = false; showsRecent = false; model.chooseCaptureMode(index) } label: {
-                        Text(["PHOTO", "PANORAMA", "VIDEO"][index])
-                            .font(.caption.weight(.semibold)).lineLimit(textSize.isAccessibilitySize ? 2 : 1).minimumScaleFactor(0.8)
-                            .frame(minWidth: 60, maxWidth: .infinity, minHeight: 44)
-                            .foregroundStyle(selected ? selection : .white)
-                    }.buttonStyle(.plain)
-                        .accessibilityAddTraits(selected ? .isSelected : [])
-                        .disabled(!model.canConfigure)
-                }
-            }
-            .padding(.horizontal, 8)
             if model.mode == .photo {
                 HStack(spacing: 4) {
                     ForEach([false, true], id: \.self) { dual in
@@ -780,14 +786,29 @@ struct CameraView: View {
                         .accessibilityHint(dual && !model.camera.dualAvailable ? "Two-camera capture is unavailable on the selected camera setup" : dual ? "Capture two perspectives" : "Capture one perspective")
                     }
                 }.padding(4)
-                    .frame(maxWidth: textSize.isAccessibilitySize ? 320 : 232)
-                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    .frame(maxWidth: textSize.isAccessibilitySize ? 320 : 260)
+                    .frame(width: landscape ? 260 : nil)
+                    .background(overlayColor, in: RoundedRectangle(cornerRadius: 12))
                     .accessibilityElement(children: .contain).accessibilityLabel("Cameras")
-            } else {
-                // Keep the mode row and shutter in place when switching to video.
-                Color.clear.frame(width: landscape ? 232 : nil, height: 52)
+            } else if landscape {
+                // Preserve horizontal positions without adding an empty portrait row.
+                Color.clear.frame(width: 260, height: 52)
                     .allowsHitTesting(false).accessibilityHidden(true)
             }
+            modeLayout {
+                ForEach(0..<3) { index in
+                    let selected = model.mode == .video ? index == 2 : index == (model.panoramaSelected ? 1 : 0)
+                    Button { showsCaptureInfo = false; showsRecent = false; model.chooseCaptureMode(index) } label: {
+                        Text(["PHOTO", "PANORAMA", "VIDEO"][index])
+                            .font(.caption.weight(.semibold)).lineLimit(textSize.isAccessibilitySize ? 2 : 1).minimumScaleFactor(0.8)
+                            .frame(minWidth: 60, maxWidth: .infinity, minHeight: 44)
+                            .foregroundStyle(selected ? selection : .white)
+                    }.buttonStyle(.plain)
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                        .disabled(!model.canConfigure)
+                }
+            }
+            .padding(.horizontal, 8)
 
             HStack {
                 Button {
@@ -801,6 +822,7 @@ struct CameraView: View {
                                     Image(uiImage: thumbnail).resizable().scaledToFill()
                                 } else {
                                     Image(systemName: "photo.on.rectangle").font(.title3)
+                                        .foregroundStyle(.white)
                                 }
                             }
                             .frame(width: 48, height: 48).clipped()
@@ -810,6 +832,12 @@ struct CameraView: View {
                                 Text("\(model.lastSavedPhotoCount)").font(.caption2.bold()).padding(3)
                                     .foregroundStyle(.black).background(.white, in: RoundedRectangle(cornerRadius: 8))
                             }
+                            // Keep the library affordance visible even for a dark thumbnail.
+                            Image(systemName: "photo.on.rectangle")
+                                .font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                                .padding(4).background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
+                                .frame(width: 48, height: 48, alignment: .bottomLeading)
+                                .accessibilityHidden(true)
                         }
                     }
                 }
@@ -856,7 +884,7 @@ struct CameraView: View {
         .padding(.horizontal, 18).padding(.top, 10).padding(.bottom, 8)
         .frame(maxWidth: .infinity)
         .background {
-            LinearGradient(colors: reduceTransparency || separateControlBands ? [.black, .black] : [.clear, .black.opacity(chromeShade)], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: reduceTransparency || separateControlBands ? [.black, .black] : [.black.opacity(chromeShade), .black.opacity(chromeShade)], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea(edges: .bottom).allowsHitTesting(false)
         }
         .contentShape(Rectangle())
