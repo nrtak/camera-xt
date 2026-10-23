@@ -545,7 +545,10 @@ final class CaptureSessionManager {
             guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.snapshot.videoMode, !self.dual.busy, !self.snapshot.dualEnabled, let oldInput = self.input,
                   let device = self.devices.first(where: { $0.uniqueID == id }) else { return }
             if oldInput.device.uniqueID == device.uniqueID {
-                do { try self.applyZoom(zoom, to: device); self.publish() }
+                do {
+                    try self.applyZoom(zoom, to: device, animated: !UIAccessibility.isReduceMotionEnabled)
+                    self.publishZoomWhenSettled(device)
+                }
                 catch { self.publish(message: error.localizedDescription) }
                 return
             }
@@ -560,10 +563,22 @@ final class CaptureSessionManager {
                     self.input = newInput
                     self.configureDimensions(device)
                     self.snapshot.selectedID = id
-                    self.session.commitConfiguration()
-                    try self.applyControls(to: device)
-                    try self.applyZoom(zoom, to: device)
+                    // Set the initial crop and reconnect before exposing the new graph.
+                    do {
+                        try self.applyControls(to: device)
+                        try self.applyZoom(zoom, to: device)
+                    } catch {
+                        self.session.removeInput(newInput)
+                        self.session.addInput(oldInput)
+                        self.input = oldInput
+                        self.snapshot.selectedID = oldInput.device.uniqueID
+                        self.configureDimensions(oldInput.device)
+                        self.connectPreview()
+                        self.session.commitConfiguration()
+                        throw error
+                    }
                     self.connectPreview()
+                    self.session.commitConfiguration()
                     self.publish()
                 } else {
                     self.session.addInput(oldInput)
@@ -574,15 +589,32 @@ final class CaptureSessionManager {
         }
     }
 
-    private func applyZoom(_ factor: Double, to device: AVCaptureDevice) throws {
+    private func applyZoom(_ factor: Double, to device: AVCaptureDevice, animated: Bool = false) throws {
         guard factor.isFinite else { return }
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
         guard let value = ZoomLimits.clamp(factor, minimum: Double(device.minAvailableVideoZoomFactor), maximum: Double(device.maxAvailableVideoZoomFactor)) else { return }
-        if abs(Double(device.videoZoomFactor) - value) > 0.0001 { device.videoZoomFactor = CGFloat(value) }
+        device.cancelVideoZoomRamp()
+        let current = Double(device.videoZoomFactor)
+        guard abs(current - value) > 0.0001 else { return }
+        if animated {
+            // AVFoundation expresses the ramp rate in powers of two per second.
+            let rate = Float(max(0.1, abs(log2(value / current)) / 0.25))
+            device.ramp(toVideoZoomFactor: CGFloat(value), withRate: rate)
+        } else {
+            device.videoZoomFactor = CGFloat(value)
+        }
     }
 
-    func setZoom(_ displayed: Double, deviceID: String, dualIndex: Int? = nil) {
+    private func publishZoomWhenSettled(_ device: AVCaptureDevice, attempts: Int = 0) {
+        guard input?.device === device || dual.inputs.contains(where: { $0.device === device }) else { return }
+        guard device.isRampingVideoZoom, attempts < 40 else { publish(); return }
+        queue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.publishZoomWhenSettled(device, attempts: attempts + 1)
+        }
+    }
+
+    func setZoom(_ displayed: Double, deviceID: String, dualIndex: Int? = nil, animated: Bool = false) {
         queue.async {
             guard displayed.isFinite, !self.burstRunning, self.processor == nil,
                   self.movieProcessor == nil, !self.dual.busy else { return }
@@ -599,8 +631,8 @@ final class CaptureSessionManager {
             guard let target = ZoomLimits.clamp(displayed / base, minimum: Double(device.minAvailableVideoZoomFactor), maximum: Double(device.maxAvailableVideoZoomFactor)),
                   abs(Double(device.videoZoomFactor) - target) > 0.0001 else { return }
             do {
-                try self.applyZoom(target, to: device)
-                self.publish()
+                try self.applyZoom(target, to: device, animated: animated)
+                self.publishZoomWhenSettled(device)
             } catch { self.onWarning?(error.localizedDescription) }
         }
     }
