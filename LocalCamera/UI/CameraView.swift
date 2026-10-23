@@ -279,8 +279,12 @@ struct CameraView: View {
         }
     }
 
+    private var undismissedLensWarnings: Set<Int> {
+        lensWarnings ? model.lensWarnings.subtracting(dismissedLensWarnings) : []
+    }
+
     @ViewBuilder private func lensWarningBadge(_ index: Int) -> some View {
-        if lensWarnings && !panelOpen && scenePhase == .active && model.lensWarnings.contains(index) && !dismissedLensWarnings.contains(index) {
+        if !panelOpen && scenePhase == .active && undismissedLensWarnings.contains(index) {
             Button { dismissedLensWarnings.insert(index) } label: {
                 HStack(spacing: 8) {
                     Label("Check lens", systemImage: "hand.raised.fill")
@@ -306,6 +310,7 @@ struct CameraView: View {
             model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
             focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
             exposureOnly: model.exposurePointOnly,
+            showsGrid: showsGrid && !panelOpen,
             onImageFrame: { dualImageFrames[index] = $0 },
             controlStripHeight: bottomInset, topControlStripHeight: imageTop + 48 + (brightnessTarget == index || (showsZoom && selectedDualIndex == index) ? 96 : 0))
         .background(.black)
@@ -457,7 +462,7 @@ struct CameraView: View {
                     .allowsHitTesting(false)
             }
             if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
-                if sceneHints, model.lensWarnings.isEmpty, brightnessTarget == nil, !showsZoom,
+                if sceneHints, undismissedLensWarnings.isEmpty, brightnessTarget == nil, !showsZoom,
                    !model.lowStorage, !model.camera.cooling, model.canConfigure, !model.panoramaSelected,
                    model.mode == .photo, model.message == nil, let advice = model.sceneAdvice {
                     Button { openTool(.shoot) } label: {
@@ -840,12 +845,14 @@ struct CameraView: View {
                                 Text("\(model.lastSavedPhotoCount)").font(.caption2.bold()).padding(3)
                                     .foregroundStyle(.black).background(.white, in: RoundedRectangle(cornerRadius: 8))
                             }
-                            // Keep the library affordance visible even for a dark thumbnail.
-                            Image(systemName: "photo.on.rectangle")
-                                .font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
-                                .padding(4).background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
-                                .frame(width: 48, height: 48, alignment: .bottomLeading)
-                                .accessibilityHidden(true)
+                            if model.lastSavedThumbnail != nil {
+                                // Keep the library affordance visible even for a dark thumbnail.
+                                Image(systemName: "photo.on.rectangle")
+                                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                                    .padding(4).background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
+                                    .frame(width: 48, height: 48, alignment: .bottomLeading)
+                                    .accessibilityHidden(true)
+                            }
                         }
                     }
                 }
