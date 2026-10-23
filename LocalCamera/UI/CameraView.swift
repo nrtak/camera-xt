@@ -54,6 +54,7 @@ struct CameraView: View {
     @State private var brightnessTarget: Int?
     @State private var brightnessDismissTask: Task<Void, Never>?
     @State private var imageFrame = CGRect.zero
+    @State private var dualImageFrames = [CGRect.zero, CGRect.zero]
     @State private var manualPage: CameraToolPage = .exposure
     @State private var selectedDualIndex = 0
     @State private var visibleTransition: String?
@@ -85,6 +86,7 @@ struct CameraView: View {
     var body: some View {
         GeometryReader { geometry in
             cameraScreen(landscape: adaptiveLayout && geometry.size.width > geometry.size.height)
+                .frame(width: geometry.size.width, height: geometry.size.height)
         }
     }
 
@@ -276,17 +278,22 @@ struct CameraView: View {
     }
 
     private func dualViewfinder(_ title: String, index: Int, topInset: CGFloat, bottomInset: CGFloat) -> some View {
-        CameraPreview(engine: model.engine, onFocus: { point, locked in
+        let visibleImage = dualImageFrames[index]
+        let imageTop = PreviewGeometry.isValid(visibleImage) ? max(topInset, visibleImage.minY + 6) : topInset
+        let imageSide = PreviewGeometry.isValid(visibleImage) ? max(6, visibleImage.minX + 6) : 6
+        return CameraPreview(engine: model.engine, onFocus: { point, locked in
             guard !panelOpen else { return }
             selectedDualIndex = index
             model.focusDual(at: point, index: index, locked: locked)
         }, fillView: false, secondary: index == 1, showsFocusFeedback: !panelOpen && model.canConfigure &&
             model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index],
             focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
-            exposureOnly: model.exposurePointOnly, controlStripHeight: bottomInset, topControlStripHeight: topInset + 48 + (brightnessTarget == index || (showsZoom && selectedDualIndex == index) ? 96 : 0))
+            exposureOnly: model.exposurePointOnly,
+            onImageFrame: { dualImageFrames[index] = $0 },
+            controlStripHeight: bottomInset, topControlStripHeight: imageTop + 48 + (brightnessTarget == index || (showsZoom && selectedDualIndex == index) ? 96 : 0))
         .background(.black)
         .overlay(alignment: .top) {
-            lensWarningBadge(index).padding(.top, topInset + 48 + (brightnessTarget == index || (showsZoom && selectedDualIndex == index) ? 96 : 0))
+            lensWarningBadge(index).padding(.top, imageTop + 48 + (brightnessTarget == index || (showsZoom && selectedDualIndex == index) ? 96 : 0))
         }
         .simultaneousGesture(zoomGesture(index))
         .overlay { Rectangle().strokeBorder(!panelOpen && selectedDualIndex == index ? selection.opacity(0.8) : .clear, lineWidth: 1).allowsHitTesting(false) }
@@ -322,15 +329,6 @@ struct CameraView: View {
                         Spacer(minLength: 0)
                         Button {
                             selectedDualIndex = index
-                            zoomDismissTask?.cancel()
-                            showsZoom = true
-                        } label: {
-                            Image(systemName: "magnifyingglass").frame(width: 44, height: 44)
-                                .background(overlayColor, in: Circle())
-                        }
-                        .accessibilityLabel("Zoom camera \(index + 1), \(title)")
-                        Button {
-                            selectedDualIndex = index
                             openBrightness(index)
                         } label: {
                             Image(systemName: "sun.max").frame(width: 44, height: 44)
@@ -342,8 +340,8 @@ struct CameraView: View {
                 if brightnessTarget == index { brightnessAdjustment(index) }
                 if showsZoom && selectedDualIndex == index { zoomSlider }
             }
-            .padding(.horizontal, 6)
-            .padding(.top, topInset)
+            .padding(.horizontal, imageSide)
+            .padding(.top, imageTop)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture {}
@@ -1204,6 +1202,8 @@ struct CameraView: View {
                 Button("Device health & testing") { toolPath.append(.checks) }.frame(minHeight: 44)
             }
         case .details:
+            LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown")
+            LabeledContent("Build", value: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "Unknown")
             Text("The preview shows the entire camera frame without cropping it to fill the screen. Space around it preserves the photo or video’s proportions.").font(.caption)
             Text("Zoom shortcuts follow this phone’s lenses and reported sensor-crop capabilities. Intermediate zoom can crop or enlarge the image; greater magnification does not always mean more detail.").font(.caption)
             LabeledContent("Capture status", value: model.shutterStatus)

@@ -113,6 +113,13 @@ struct CameraPreview: UIViewRepresentable {
         }
     }
     func makeCoordinator() -> Coordinator { Coordinator(engine: engine, onFocus: onFocus) }
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: PreviewView, context: Context) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height,
+              width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+        // The preview layer has no intrinsic content size. Always use the space
+        // offered by SwiftUI; resizeAspect preserves the complete sensor frame.
+        return CGSize(width: width, height: height)
+    }
     static func dismantleUIView(_ view: PreviewView, coordinator: Coordinator) {
         coordinator.engine.detachPreview(view.previewLayer)
     }
