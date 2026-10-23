@@ -914,7 +914,7 @@ final class CameraViewModel: ObservableObject {
         if mode == .video {
             guard canConfigure, camera.running, let zoom = camera.zooms.first,
                   choice.value >= zoom.minimum, choice.value <= zoom.maximum else { return }
-            engine.setZoom(choice.value, deviceID: zoom.deviceID)
+            engine.setZoom(choice.value, deviceID: zoom.deviceID, animated: !UIAccessibility.isReduceMotionEnabled)
         } else { select(choice.lens, zoom: choice.multiplier) }
     }
 
