@@ -1904,10 +1904,10 @@ struct LensWarningEvidence {
     private(set) var warning = false
     private var hits = 0
     private var misses = 0
-    mutating func observe(_ candidate: Bool) -> Bool {
+    mutating func observe(_ candidate: Bool, requiredHits: Int = 2) -> Bool {
         hits = candidate ? hits + 1 : 0
         misses = candidate ? 0 : misses + 1
-        if hits >= 2 { warning = true }
+        if hits >= max(2, requiredHits) { warning = true }
         if misses >= 2 { warning = false }
         return warning
     }
@@ -2027,7 +2027,7 @@ struct NearLensObstruction {
             let detailed = other.filter { tiles[$0].texture > max(0.012, texture * 2.5) }
             let redness = component.reduce(0.0) { $0 + tiles[$1].red } / Double(component.count)
             let backgroundRed = other.reduce(0.0) { $0 + tiles[$1].red } / Double(other.count)
-            if detailed.count >= 6 && redness - backgroundRed > 0.035 { return true }
+            if detailed.count >= 6 && redness - backgroundRed > 0.05 { return true }
         }
         return false
     }
@@ -2069,15 +2069,18 @@ private final class LensObstructionSampler: NSObject, AVCaptureVideoDataOutputSa
                 }
             }
             var candidate = NearLensObstruction.candidate(rgba: pixels)
+            var recognizedEdgeHand = false
             do {
                 try VNImageRequestHandler(cgImage: image, orientation: .up).perform([request])
                 for hand in request.results ?? [] {
                     let points = try hand.recognizedPoints(.all).values.filter { $0.confidence >= 0.5 }.map(\.location)
-                    candidate = candidate || LensWarningEvidence.edgeHand(points)
+                    recognizedEdgeHand = recognizedEdgeHand || LensWarningEvidence.edgeHand(points)
                 }
             } catch { /* Keep independent near-lens evidence if hand pose fails. */ }
+            candidate = candidate || recognizedEdgeHand
             let old = evidence.warning
-            let warning = evidence.observe(candidate)
+            // Color/blur is ambiguous (wood, desks, warm lighting); require a longer run.
+            let warning = evidence.observe(candidate, requiredHits: recognizedEdgeHand ? 2 : 4)
             guard old != warning else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.isActive else { return }
