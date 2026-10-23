@@ -91,7 +91,7 @@ struct CameraView: View {
         }
     }
 
-    private func cameraScreen(landscape: Bool) -> some View {
+    private func cameraPreviewContent(landscape: Bool) -> some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if model.permission == .authorized {
@@ -140,6 +140,10 @@ struct CameraView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+    }
+
+    private func cameraPresentation(landscape: Bool) -> some View {
+        cameraPreviewContent(landscape: landscape)
         .overlay(alignment: .bottom) {
             if !panelOpen && !model.camera.dualEnabled {
                 viewfinderControls
@@ -206,6 +210,10 @@ struct CameraView: View {
                     }
                 }
         }
+    }
+
+    private func cameraScreen(landscape: Bool) -> some View {
+        cameraPresentation(landscape: landscape)
         .onPreferenceChange(CaptureControlsHeightKey.self) { height in
             if height.isFinite && height > 0 { captureControlsHeight = height }
         }
