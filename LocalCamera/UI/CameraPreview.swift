@@ -17,6 +17,7 @@ struct CameraPreview: UIViewRepresentable {
     var onImageFrame: ((CGRect) -> Void)?
     var controlStripHeight: CGFloat = 0
     var topControlStripHeight: CGFloat = 0
+    var focusExclusionRects: [CGRect] = []
 
     final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
@@ -25,17 +26,29 @@ struct CameraPreview: UIViewRepresentable {
         let guide = UIImageView()
         private var gridFrame = CGRect.null
         private var visibleImageFrame = CGRect.zero
+        weak var focusMarker: UILabel?
+        private var markerBounds = CGRect.null
         var imageFrameChanged: ((CGRect) -> Void)?
         var orientationChanged: ((AVCaptureVideoOrientation) -> Void)?
         private var lastOrientation: UIInterfaceOrientation = .unknown
         override func layoutSubviews() {
             super.layoutSubviews()
+            if markerBounds != bounds {
+                clearFocusMarker()
+                markerBounds = bounds
+            }
             if let orientation = window?.windowScene?.interfaceOrientation,
                orientation != .unknown, orientation != lastOrientation {
+                clearFocusMarker()
                 lastOrientation = orientation
                 orientationChanged?(CameraOrientation.capture(orientation))
             }
             updateOverlays()
+        }
+        // A visual marker belongs to the old preview geometry, not the camera lock.
+        func clearFocusMarker() {
+            focusMarker?.removeFromSuperview()
+            focusMarker = nil
         }
         private func publishImageFrame(_ frame: CGRect) {
             let valid = PreviewGeometry.isValid(frame) ? frame : .zero
@@ -51,12 +64,14 @@ struct CameraPreview: UIViewRepresentable {
             if guide.superview == nil { guide.isUserInteractionEnabled = false; guide.contentMode = .scaleAspectFit; addSubview(guide) }
             let frame = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
             guard PreviewGeometry.isValid(frame) else {
+                clearFocusMarker()
                 grid.path = nil; guide.frame = .zero; gridFrame = .null
                 publishImageFrame(.zero)
                 return
             }
             publishImageFrame(frame.intersection(bounds))
             guard gridFrame != frame else { return }
+            clearFocusMarker()
             gridFrame = frame
             guide.frame = frame
             let path = UIBezierPath()
@@ -71,29 +86,37 @@ struct CameraPreview: UIViewRepresentable {
     }
     final class Coordinator: NSObject {
         let engine: CaptureSessionManager
+        var allowsFocus = true
         var showsFocusFeedback = true
         var onFocus: (CGPoint, Bool) -> Void
         var exposureOnly = false
         var controlStripHeight: CGFloat = 0
         var topControlStripHeight: CGFloat = 0
+        var focusExclusionRects: [CGRect] = []
         weak var marker: UILabel?
         init(engine: CaptureSessionManager, onFocus: @escaping (CGPoint, Bool) -> Void) { self.engine = engine; self.onFocus = onFocus }
         @objc func tap(_ gesture: UITapGestureRecognizer) { focus(gesture, locked: false) }
         @objc func hold(_ gesture: UILongPressGestureRecognizer) {
             if gesture.state == .began { focus(gesture, locked: true) }
         }
+        @discardableResult
+        func requestFocus(at devicePoint: CGPoint, locked: Bool) -> Bool {
+            guard allowsFocus, (0...1).contains(devicePoint.x), (0...1).contains(devicePoint.y) else { return false }
+            onFocus(devicePoint, locked)
+            return true
+        }
         private func focus(_ gesture: UIGestureRecognizer, locked: Bool) {
-            guard let view = gesture.view as? PreviewView else { return }
+            guard allowsFocus, let view = gesture.view as? PreviewView else { return }
             let point = gesture.location(in: view)
             // Overlay controls own this strip, including gaps and disabled buttons.
-            guard PreviewGeometry.acceptsFocus(at: point, bounds: view.bounds, controlStripHeight: controlStripHeight, topControlStripHeight: topControlStripHeight) else { return }
+            guard PreviewGeometry.acceptsFocus(at: point, bounds: view.bounds, controlStripHeight: controlStripHeight,
+                topControlStripHeight: topControlStripHeight, exclusionRects: focusExclusionRects) else { return }
             let videoRect = view.previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
             guard PreviewGeometry.isValid(videoRect), point.x.isFinite, point.y.isFinite, videoRect.contains(point) else { return }
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
-            guard (0...1).contains(devicePoint.x), (0...1).contains(devicePoint.y) else { return }
+            guard requestFocus(at: devicePoint, locked: locked) else { return }
+            view.clearFocusMarker()
             guard showsFocusFeedback else { return }
-            onFocus(devicePoint, locked)
-            marker?.removeFromSuperview()
             let visibleFrame = videoRect.intersection(view.bounds)
             guard let markerFrame = PreviewGeometry.focusRect(at: point, in: visibleFrame) else { return }
             let marker = UILabel(frame: markerFrame)
@@ -104,7 +127,7 @@ struct CameraPreview: UIViewRepresentable {
             marker.isUserInteractionEnabled = false
             marker.layer.borderColor = exposureOnly ? UIColor.white.cgColor : UIColor(CameraAppearance.selection).cgColor
             marker.layer.borderWidth = 1
-            view.addSubview(marker); self.marker = marker
+            view.addSubview(marker); self.marker = marker; view.focusMarker = marker
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak marker] in
                 guard let marker, marker.text != "Locked" else { return }
                 UIView.animate(withDuration: 0.2) { marker.alpha = 0 } completion: { _ in marker.removeFromSuperview() }
@@ -131,12 +154,10 @@ struct CameraPreview: UIViewRepresentable {
         view.clipsToBounds = true
         view.imageFrameChanged = onImageFrame
         view.previewLayer.videoGravity = fillView ? .resizeAspectFill : .resizeAspect
-        if allowsFocus {
-            let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:)))
-            let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.hold(_:)))
-            tap.require(toFail: hold)
-            view.addGestureRecognizer(tap); view.addGestureRecognizer(hold)
-        }
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:)))
+        let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.hold(_:)))
+        tap.require(toFail: hold)
+        view.addGestureRecognizer(tap); view.addGestureRecognizer(hold)
         engine.attachPreview(view.previewLayer, secondary: secondary)
         return view
     }
@@ -144,11 +165,14 @@ struct CameraPreview: UIViewRepresentable {
         let gravity: AVLayerVideoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if view.previewLayer.videoGravity != gravity { view.previewLayer.videoGravity = gravity }
         context.coordinator.onFocus = onFocus
+        context.coordinator.allowsFocus = allowsFocus
+        view.gestureRecognizers?.forEach { $0.isEnabled = allowsFocus }
         view.imageFrameChanged = onImageFrame
         context.coordinator.showsFocusFeedback = showsFocusFeedback
         context.coordinator.exposureOnly = exposureOnly
         context.coordinator.controlStripHeight = controlStripHeight
         context.coordinator.topControlStripHeight = topControlStripHeight
+        context.coordinator.focusExclusionRects = focusExclusionRects
         context.coordinator.marker?.isHidden = !showsFocusFeedback
         if focusState == "Focus locked" { context.coordinator.marker?.text = "Locked" }
         else if focusState == "Auto focus", context.coordinator.marker?.text == "Locked" { context.coordinator.marker?.removeFromSuperview() }
@@ -160,10 +184,32 @@ struct CameraPreview: UIViewRepresentable {
 
 /// Reject transient invalid camera geometry before assigning CALayer/UIView frames.
 enum PreviewGeometry {
-    static func acceptsFocus(at point: CGPoint, bounds: CGRect, controlStripHeight: CGFloat, topControlStripHeight: CGFloat = 0) -> Bool {
+    /// Prefer letterbox space, then move onto the image, clear of global controls.
+    static func controlFrame(image: CGRect, bounds: CGRect, topInset: CGFloat, bottomInset: CGFloat,
+                             height: CGFloat, atTop: Bool) -> CGRect {
+        guard isValid(bounds), topInset.isFinite, bottomInset.isFinite, height.isFinite, height > 0 else { return .zero }
+        let top = min(bounds.maxY, bounds.minY + max(0, topInset))
+        let bottom = max(top, bounds.maxY - max(0, bottomInset))
+        guard bottom > top else { return .zero }
+        let visible = image.intersection(bounds)
+        let frame = isValid(visible) ? visible : bounds
+        let controlHeight = min(height, bottom - top)
+        let y: CGFloat
+        if atTop {
+            y = frame.minY - top >= controlHeight + 6 ? top : max(top, frame.minY + 6)
+        } else {
+            y = bottom - frame.maxY >= controlHeight + 6 ? frame.maxY + 6 : min(bottom, frame.maxY - 6) - controlHeight
+        }
+        let sideInset = min(6, bounds.width / 4)
+        return CGRect(x: bounds.minX + sideInset, y: min(max(top, y), bottom - controlHeight),
+                      width: bounds.width - 2 * sideInset, height: controlHeight)
+    }
+
+    static func acceptsFocus(at point: CGPoint, bounds: CGRect, controlStripHeight: CGFloat, topControlStripHeight: CGFloat = 0, exclusionRects: [CGRect] = []) -> Bool {
         guard isValid(bounds), point.x.isFinite, point.y.isFinite,
               controlStripHeight.isFinite, topControlStripHeight.isFinite, bounds.contains(point) else { return false }
-        return point.y >= bounds.minY + max(0, topControlStripHeight) && point.y < bounds.maxY - max(0, controlStripHeight)
+        return point.y >= bounds.minY + max(0, topControlStripHeight) && point.y < bounds.maxY - max(0, controlStripHeight) &&
+            !exclusionRects.contains(where: { $0.contains(point) })
     }
 
     static func panelRect(image: CGRect, bounds: CGRect, preferredHeight: CGFloat, sidePanel: Bool = false) -> CGRect {
@@ -188,6 +234,31 @@ enum PreviewGeometry {
         !rect.isNull && !rect.isInfinite && !rect.isEmpty &&
         rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite &&
         rect.width > 0 && rect.height > 0
+    }
+
+    static func editorFits(bounds: CGRect, topInset: CGFloat, bottomInset: CGFloat, height: CGFloat) -> Bool {
+        let available = controlFrame(image: .zero, bounds: bounds, topInset: topInset,
+                                     bottomInset: bottomInset, height: height, atTop: true)
+        return isValid(available) && available.height + 0.5 >= height && available.width >= 220
+    }
+}
+
+/// Logarithmic spacing gives the same gesture distance to 1–2× and 2–4×.
+enum ZoomDialScale {
+    static func clamped(_ value: Double, minimum: Double, maximum: Double) -> Double {
+        guard minimum.isFinite, maximum.isFinite, minimum > 0, maximum >= minimum else { return 1 }
+        guard value.isFinite else { return minimum }
+        return min(maximum, max(minimum, value))
+    }
+
+    static func value(start: Double, translation: Double, pointsPerOctave: Double,
+                      minimum: Double, maximum: Double) -> Double {
+        let base = clamped(start, minimum: minimum, maximum: maximum)
+        guard translation.isFinite, pointsPerOctave.isFinite, pointsPerOctave > 0,
+              minimum.isFinite, maximum.isFinite, minimum > 0, maximum >= minimum else { return base }
+        // Clamp in log space before exponentiation, including very long drags.
+        let exponent = min(log2(maximum), max(log2(minimum), log2(base) - translation / pointsPerOctave))
+        return clamped(pow(2, exponent), minimum: minimum, maximum: maximum)
     }
 }
 
