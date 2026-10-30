@@ -4,6 +4,91 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testEditorsFallBackWhenLandscapeSpaceOrPanelWidthIsInsufficient() {
+        let landscapePanel = CGRect(x: 0, y: 0, width: 420, height: 300)
+        // The per-lens row plus brightness editor cannot fit in the 82pt gap.
+        XCTAssertFalse(PreviewGeometry.editorFits(bounds: landscapePanel, topInset: 60, bottomInset: 158, height: 162))
+        XCTAssertFalse(PreviewGeometry.editorFits(bounds: CGRect(x: 0, y: 0, width: 200, height: 700), topInset: 60, bottomInset: 150, height: 162))
+        XCTAssertTrue(PreviewGeometry.editorFits(bounds: CGRect(x: 0, y: 0, width: 390, height: 760), topInset: 60, bottomInset: 150, height: 112))
+        XCTAssertFalse(PreviewGeometry.editorFits(bounds: .zero, topInset: 0, bottomInset: 0, height: 112))
+        XCTAssertFalse(PreviewGeometry.editorFits(bounds: landscapePanel, topInset: 60, bottomInset: 158, height: .nan))
+    }
+
+    @MainActor func testExposureTapReachesCallbackWithoutAutofocusFeedback() {
+        var received: [(CGPoint, Bool)] = []
+        let coordinator = CameraPreview.Coordinator(engine: CaptureSessionManager()) { received.append(($0, $1)) }
+        coordinator.showsFocusFeedback = false
+        coordinator.exposureOnly = true
+        let point = CGPoint(x: 0.25, y: 0.75)
+        XCTAssertTrue(coordinator.requestFocus(at: point, locked: false))
+        XCTAssertEqual(received.count, 1)
+        XCTAssertEqual(received.first?.0, point)
+        XCTAssertEqual(received.first?.1, false)
+        coordinator.allowsFocus = false
+        XCTAssertFalse(coordinator.requestFocus(at: point, locked: true))
+        coordinator.allowsFocus = true
+        XCTAssertFalse(coordinator.requestFocus(at: CGPoint(x: CGFloat.nan, y: 0.5), locked: false))
+        XCTAssertFalse(coordinator.requestFocus(at: CGPoint(x: 1.1, y: 0.5), locked: false))
+        XCTAssertEqual(received.count, 1)
+    }
+
+    @MainActor func testLockedMarkerIsClearedWhenPreviewIsResized() {
+        let view = CameraPreview.PreviewView(frame: CGRect(x: 0, y: 0, width: 390, height: 760))
+        view.layoutSubviews()
+        let marker = UILabel(frame: CGRect(x: 300, y: 460, width: 64, height: 64))
+        marker.text = "Locked"
+        view.addSubview(marker); view.focusMarker = marker
+        view.bounds.size = CGSize(width: 844, height: 300)
+        view.layoutSubviews()
+        XCTAssertNil(marker.superview)
+        XCTAssertNil(view.focusMarker)
+    }
+
+    func testFineZoomUsesConsistentLogarithmicDistanceAndBounds() {
+        XCTAssertEqual(ZoomDialScale.value(start: 1, translation: -160, pointsPerOctave: 160, minimum: 0.5, maximum: 10), 2, accuracy: 0.0001)
+        XCTAssertEqual(ZoomDialScale.value(start: 2, translation: -160, pointsPerOctave: 160, minimum: 0.5, maximum: 10), 4, accuracy: 0.0001)
+        XCTAssertEqual(ZoomDialScale.value(start: 2, translation: 160, pointsPerOctave: 160, minimum: 0.5, maximum: 10), 1, accuracy: 0.0001)
+        for translation in [-Double.greatestFiniteMagnitude, -1_000_000, 1_000_000, Double.greatestFiniteMagnitude] {
+            let value = ZoomDialScale.value(start: 1, translation: translation, pointsPerOctave: 160, minimum: 0.5, maximum: 10)
+            XCTAssertTrue(value.isFinite)
+            XCTAssertTrue((0.5...10).contains(value))
+        }
+    }
+
+    func testFineZoomRejectsInvalidAndFixedRanges() {
+        XCTAssertEqual(ZoomDialScale.value(start: 2, translation: .nan, pointsPerOctave: 160, minimum: 1, maximum: 5), 2)
+        XCTAssertEqual(ZoomDialScale.value(start: 2, translation: 100, pointsPerOctave: 0, minimum: 1, maximum: 5), 2)
+        XCTAssertEqual(ZoomDialScale.value(start: 2, translation: -100, pointsPerOctave: 160, minimum: 1, maximum: 1), 1)
+        XCTAssertEqual(ZoomDialScale.clamped(.nan, minimum: 0.5, maximum: 5), 0.5)
+        XCTAssertEqual(ZoomDialScale.clamped(2, minimum: 0, maximum: 5), 1)
+        XCTAssertEqual(ZoomDialScale.clamped(2, minimum: 5, maximum: 1), 1)
+    }
+
+    func testControlsUseLetterboxSpaceAndKeepTheShutterClear() {
+        let bounds = CGRect(x: 0, y: 0, width: 390, height: 760)
+        let photo = CGRect(x: 0, y: 130, width: 390, height: 420)
+        let top = PreviewGeometry.controlFrame(image: photo, bounds: bounds, topInset: 60, bottomInset: 150, height: 44, atTop: true)
+        let bottom = PreviewGeometry.controlFrame(image: photo, bounds: bounds, topInset: 60, bottomInset: 150, height: 44, atTop: false)
+        XCTAssertLessThanOrEqual(top.maxY, photo.minY)
+        XCTAssertGreaterThanOrEqual(bottom.minY, photo.maxY)
+        XCTAssertLessThanOrEqual(bottom.maxY, bounds.maxY - 150)
+        let dial = PreviewGeometry.controlFrame(image: bounds, bounds: bounds, topInset: 60, bottomInset: 150, height: 140, atTop: false)
+        XCTAssertEqual(dial.maxY, 610, accuracy: 0.001)
+        XCTAssertFalse(PreviewGeometry.acceptsFocus(at: CGPoint(x: 195, y: dial.midY), bounds: bounds,
+            controlStripHeight: 150, topControlStripHeight: 60, exclusionRects: [dial]))
+        XCTAssertTrue(PreviewGeometry.acceptsFocus(at: CGPoint(x: 195, y: 300), bounds: bounds,
+            controlStripHeight: 150, topControlStripHeight: 60, exclusionRects: [dial]))
+    }
+
+    func testControlPlacementFitsSmallAndInvalidLayouts() {
+        for bounds in [CGRect(x: 0, y: 0, width: 150, height: 120), CGRect(x: 20, y: 30, width: 5, height: 10)] {
+            let frame = PreviewGeometry.controlFrame(image: .zero, bounds: bounds, topInset: 1, bottomInset: 1, height: 176, atTop: true)
+            XCTAssertTrue(bounds.contains(frame))
+        }
+        XCTAssertEqual(PreviewGeometry.controlFrame(image: .zero, bounds: .zero, topInset: 0, bottomInset: 0, height: 44, atTop: true), .zero)
+        XCTAssertEqual(PreviewGeometry.controlFrame(image: .zero, bounds: CGRect(x: 0, y: 0, width: 100, height: 50), topInset: 30, bottomInset: 30, height: 44, atTop: true), .zero)
+    }
+
     private func obstructionFixture(_ obstructed: (Int, Int) -> Bool) -> [UInt8] {
         var bytes = [UInt8]()
         for y in 0..<64 {
