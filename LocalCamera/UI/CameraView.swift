@@ -275,7 +275,7 @@ struct CameraView: View {
         }
     }
 
-    private func cameraInteraction(landscape: Bool) -> some View {
+    private func cameraLayoutPreferences(landscape: Bool) -> some View {
         cameraPresentation(landscape: landscape)
         .onPreferenceChange(CaptureControlsHeightKey.self) { height in
             if height.isFinite && height > 0 { captureControlsHeight = height }
@@ -286,6 +286,10 @@ struct CameraView: View {
         .onPreferenceChange(CaptureStatusHeightKey.self) { height in
             if height.isFinite && height >= 0 { captureStatusHeight = height }
         }
+    }
+
+    private func cameraCaptureChanges(landscape: Bool) -> some View {
+        cameraLayoutPreferences(landscape: landscape)
         .onChange(of: model.camera.dualEnabled) { _, _ in showsZoom = false; zoomDismissTask?.cancel(); closeBrightness(); pinchStart = nil; pinchDeviceID = nil }
         .onChange(of: model.mode) { _, _ in closeBrightness(); showsZoom = false; zoomDismissTask?.cancel(); pinchStart = nil; pinchDeviceID = nil }
         .onChange(of: model.panoramaSelected) { _, _ in closeBrightness(); showsZoom = false; zoomDismissTask?.cancel(); pinchStart = nil; pinchDeviceID = nil }
@@ -299,6 +303,10 @@ struct CameraView: View {
             closeBrightness(); showsZoom = false; zoomDismissTask?.cancel()
             pinchStart = nil; pinchDeviceID = nil
         }
+    }
+
+    private func cameraLensInteraction(landscape: Bool) -> some View {
+        cameraCaptureChanges(landscape: landscape)
         .onChange(of: showsZoom) { _, open in
             if open {
                 closeBrightness()
@@ -309,6 +317,10 @@ struct CameraView: View {
             if showsZoom, enlargedDualIndex != nil { enlargedDualIndex = index }
         }
         .onChange(of: enlargedDualIndex) { _, _ in closeBrightness() }
+    }
+
+    private func cameraInteraction(landscape: Bool) -> some View {
+        cameraLensInteraction(landscape: landscape)
         .onChange(of: lensWarnings) { _, enabled in model.engine.setLensWarningsEnabled(enabled) }
         .onChange(of: model.lensWarnings) { _, warnings in
             // A dismissal lasts until this obstruction clears, independently per lens.
