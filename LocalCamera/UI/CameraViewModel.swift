@@ -974,7 +974,7 @@ final class CameraViewModel: ObservableObject {
                             self.selectedBurstIndex = max(0, index)
                             self.recommendedBurstIndex = index
                             self.busy = false
-                            self.message = self.recoveryProtected ? "Choose your favorite" : "Keep Camera XT open: these frames could not be protected on disk. Free storage, then save."
+                            self.message = self.recoveryProtected ? "Choose your favorite" : "Keep Mikalens open: these frames could not be protected on disk. Free storage, then save."
                             self.reviewingBurst = true
                         }
                         }
@@ -1442,7 +1442,7 @@ final class CameraViewModel: ObservableObject {
         } catch {
             recoveryProtected = false
             CameraDiagnostics.shared.record(.saveFailed, value: (error as NSError).code)
-            message = "Could not protect this capture on disk. Keep Camera XT open, free storage, then retry. \(error.localizedDescription)"
+            message = "Could not protect this capture on disk. Keep Mikalens open, free storage, then retry. \(error.localizedDescription)"
             return
         }
         message = "Saving to Photos…"

@@ -7,6 +7,7 @@ struct CameraPreview: UIViewRepresentable {
     let engine: CaptureSessionManager
     var onFocus: (CGPoint, Bool) -> Void
     var fillView = false
+    var alignsImageLeading = false
     var allowsFocus = true
     var secondary = false
     var showsFocusFeedback = true
@@ -20,8 +21,13 @@ struct CameraPreview: UIViewRepresentable {
     var focusExclusionRects: [CGRect] = []
 
     final class PreviewView: UIView {
-        override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-        var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+        let previewLayer = AVCaptureVideoPreviewLayer()
+        var alignsImageLeading = false
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            layer.addSublayer(previewLayer)
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
         let grid = CAShapeLayer()
         let guide = UIImageView()
         private var gridFrame = CGRect.null
@@ -60,9 +66,19 @@ struct CameraPreview: UIViewRepresentable {
             }
         }
         func updateOverlays() {
+            // Move only the letterbox margin. Keep the layer's size and aspect-fit gravity.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            let localBounds = CGRect(origin: .zero, size: bounds.size)
+            if previewLayer.bounds != localBounds { previewLayer.bounds = localBounds }
+            let fitted = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            let offset = alignsImageLeading ? PreviewGeometry.leadingOffset(image: fitted, bounds: localBounds) : 0
+            let layerFrame = bounds.offsetBy(dx: offset, dy: 0)
+            if previewLayer.frame != layerFrame { previewLayer.frame = layerFrame }
+            CATransaction.commit()
             if grid.superlayer == nil { layer.addSublayer(grid) }
             if guide.superview == nil { guide.isUserInteractionEnabled = false; guide.contentMode = .scaleAspectFit; addSubview(guide) }
-            let frame = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            let frame = previewLayer.convert(previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1)), to: layer)
             guard PreviewGeometry.isValid(frame) else {
                 clearFocusMarker()
                 grid.path = nil; guide.frame = .zero; gridFrame = .null
@@ -111,9 +127,10 @@ struct CameraPreview: UIViewRepresentable {
             // Overlay controls own this strip, including gaps and disabled buttons.
             guard PreviewGeometry.acceptsFocus(at: point, bounds: view.bounds, controlStripHeight: controlStripHeight,
                 topControlStripHeight: topControlStripHeight, exclusionRects: focusExclusionRects) else { return }
-            let videoRect = view.previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            let videoRect = view.previewLayer.convert(view.previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1)), to: view.layer)
             guard PreviewGeometry.isValid(videoRect), point.x.isFinite, point.y.isFinite, videoRect.contains(point) else { return }
-            let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
+            let layerPoint = view.previewLayer.convert(point, from: view.layer)
+            let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: layerPoint)
             guard requestFocus(at: devicePoint, locked: locked) else { return }
             view.clearFocusMarker()
             guard showsFocusFeedback else { return }
@@ -147,11 +164,12 @@ struct CameraPreview: UIViewRepresentable {
         coordinator.engine.detachPreview(view.previewLayer)
     }
     func makeUIView(context: Context) -> PreviewView {
-        let view = PreviewView()
+        let view = PreviewView(frame: .zero)
         view.orientationChanged = { [weak engine, weak view] orientation in
             engine?.setInterfaceOrientation(orientation) { view?.updateOverlays() }
         }
         view.clipsToBounds = true
+        view.alignsImageLeading = alignsImageLeading
         view.imageFrameChanged = onImageFrame
         view.previewLayer.videoGravity = fillView ? .resizeAspectFill : .resizeAspect
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:)))
@@ -162,6 +180,7 @@ struct CameraPreview: UIViewRepresentable {
         return view
     }
     func updateUIView(_ view: PreviewView, context: Context) {
+        view.alignsImageLeading = alignsImageLeading
         let gravity: AVLayerVideoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if view.previewLayer.videoGravity != gravity { view.previewLayer.videoGravity = gravity }
         context.coordinator.onFocus = onFocus
@@ -184,6 +203,43 @@ struct CameraPreview: UIViewRepresentable {
 
 /// Reject transient invalid camera geometry before assigning CALayer/UIView frames.
 enum PreviewGeometry {
+    static func pictureInPictureFrame(bounds: CGRect, corner: Int, topInset: CGFloat, bottomInset: CGFloat) -> CGRect {
+        guard isValid(bounds), topInset.isFinite, bottomInset.isFinite, corner >= 0, corner < 4 else { return .zero }
+        let top = min(bounds.maxY, bounds.minY + max(8, topInset))
+        let bottom = max(top, bounds.maxY - max(8, bottomInset))
+        let width = min(bounds.width * 0.38, max(0, bounds.width - 16))
+        let height = min(bounds.height * 0.32, bottom - top)
+        guard width > 0, height > 0 else { return .zero }
+        return CGRect(x: corner % 2 == 0 ? bounds.minX + 8 : bounds.maxX - width - 8,
+                      y: corner < 2 ? top : bottom - height, width: width, height: height)
+    }
+
+    /// Keep the main camera's rail clear of the inset camera, in either right corner.
+    static func avoidingOverlay(rail: CGRect, overlay: CGRect) -> CGRect {
+        guard isValid(rail), isValid(overlay), rail.intersects(overlay) else { return rail }
+        let above = max(0, min(rail.maxY, overlay.minY - 6) - rail.minY)
+        let belowTop = max(rail.minY, overlay.maxY + 6)
+        let below = max(0, rail.maxY - belowTop)
+        let height = max(above, below)
+        guard height >= 44 else { return .zero }
+        return CGRect(x: rail.minX, y: above >= below ? rail.minY : belowTop, width: rail.width, height: height)
+    }
+
+    /// Consolidate side letterboxing without scaling or clipping the camera image.
+    static func leadingOffset(image: CGRect, bounds: CGRect) -> CGFloat {
+        guard isValid(image), isValid(bounds), bounds.contains(image) else { return 0 }
+        return bounds.minX - image.minX
+    }
+
+    static func sideRailFrame(bounds: CGRect, topInset: CGFloat, bottomInset: CGFloat) -> CGRect {
+        guard isValid(bounds), topInset.isFinite, bottomInset.isFinite else { return .zero }
+        let top = min(bounds.maxY, bounds.minY + max(0, topInset) + 6)
+        let bottom = max(top, bounds.maxY - max(0, bottomInset) - 6)
+        let width = min(52, max(0, bounds.width - 12))
+        guard bottom > top, width > 0 else { return .zero }
+        return CGRect(x: bounds.maxX - width - 6, y: top, width: width, height: bottom - top)
+    }
+
     /// Prefer letterbox space, then move onto the image, clear of global controls.
     static func controlFrame(image: CGRect, bounds: CGRect, topInset: CGFloat, bottomInset: CGFloat,
                              height: CGFloat, atTop: Bool) -> CGRect {
@@ -240,6 +296,18 @@ enum PreviewGeometry {
         let available = controlFrame(image: .zero, bounds: bounds, topInset: topInset,
                                      bottomInset: bottomInset, height: height, atTop: true)
         return isValid(available) && available.height + 0.5 >= height && available.width >= 220
+    }
+}
+
+enum CameraChromePolicy {
+    static func showsMessage(collapsed: Bool, brief: Bool, busy: Bool, pending: Bool) -> Bool {
+        !collapsed || !brief || busy || pending
+    }
+
+    static func collapsed(after translation: CGSize, current: Bool, canCollapse: Bool) -> Bool {
+        guard translation.width.isFinite, translation.height.isFinite,
+              abs(translation.height) >= 28, abs(translation.height) > abs(translation.width) * 1.3 else { return current }
+        return translation.height > 0 ? (canCollapse ? true : current) : false
     }
 }
 

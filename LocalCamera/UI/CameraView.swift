@@ -50,10 +50,11 @@ struct CameraView: View {
     @State private var showsRecent = false
     @State private var confirmDuplicateSave = false
     @State private var captureControlsHeight: CGFloat = 160
+    @State private var controlsCollapsed = false
     @State private var viewport = CGSize.zero
     @State private var dismissedSceneAdvice: String?
     @State private var dismissedStatus: String?
-    @State private var headerHeight: CGFloat = 52
+    @State private var measuredHeaderHeight: CGFloat = 52
     @State private var captureStatusHeight: CGFloat = 44
     @State private var brightnessEditorHeight: CGFloat = 112
     @State private var brightnessTarget: Int?
@@ -83,17 +84,29 @@ struct CameraView: View {
     private var overlayColor: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.85 : 0.72) }
     private var menuBackground: Color { .black.opacity(reduceTransparency ? 1 : contrast == .increased ? 0.92 : 0.78) }
     private var separateControlBands: Bool { textSize.isAccessibilitySize }
+    private var usesSideRail: Bool { viewport.height > viewport.width && !separateControlBands }
+    private var headerHeight: CGFloat { usesSideRail || controlsCollapsed ? 0 : measuredHeaderHeight }
+    private var chromeVisible: Bool { !panelOpen && !controlsCollapsed }
+    private var canCollapseControls: Bool { !panelOpen && !(model.panoramaRunning && model.panoramaMethod == .stitch) }
+    private var panoramaStatusVisible: Bool {
+        model.mode == .photo && model.panoramaSelected && (!controlsCollapsed || model.panoramaRunning)
+    }
+    private var visibleStatusMessage: String? {
+        guard let message = model.message, message != dismissedStatus, !panoramaStatusVisible,
+              CameraChromePolicy.showsMessage(collapsed: controlsCollapsed, brief: CameraViewModel.isBriefStatus(message), busy: model.busy, pending: model.hasPendingCapture) else { return nil }
+        return message
+    }
     private var previewTopInset: CGFloat { separateControlBands ? headerHeight : 0 }
     private var previewBottomInset: CGFloat { separateControlBands ? captureControlsHeight + 8 : 0 }
     private var chromeShade: Double { reduceTransparency ? 1 : contrast == .increased ? 0.90 : 0.72 }
     private let selection = CameraAppearance.selection
     private var dialHeight: CGFloat { textSize.isAccessibilitySize ? 176 : 140 }
     private var compactZoomPresentation: Bool {
-        editorNeedsSheet(height: dialHeight, target: model.camera.dualEnabled ? selectedDualIndex : nil)
+        usesSideRail || editorNeedsSheet(height: dialHeight, target: model.camera.dualEnabled ? selectedDualIndex : nil)
     }
     private var compactBrightnessPresentation: Bool {
         guard let target = brightnessTarget else { return false }
-        return textSize.isAccessibilitySize || editorNeedsSheet(height: brightnessEditorHeight, target: target == -1 ? nil : target)
+        return usesSideRail || textSize.isAccessibilitySize || editorNeedsSheet(height: brightnessEditorHeight, target: target == -1 ? nil : target)
     }
     private var inlineBrightnessHeight: CGFloat {
         brightnessTarget != nil && !compactBrightnessPresentation ? brightnessEditorHeight + 8 : 0
@@ -122,7 +135,11 @@ struct CameraView: View {
         return !PreviewGeometry.editorFits(bounds: bounds, topInset: top, bottomInset: bottom, height: required)
     }
     private var zoomControlsFrame: CGRect {
-        PreviewGeometry.controlFrame(image: imageFrame, bounds: CGRect(origin: .zero, size: viewport),
+        guard !controlsCollapsed else { return .zero }
+        if usesSideRail {
+            return PreviewGeometry.sideRailFrame(bounds: CGRect(origin: .zero, size: viewport), topInset: 0, bottomInset: captureControlsHeight + 8)
+        }
+        return PreviewGeometry.controlFrame(image: imageFrame, bounds: CGRect(origin: .zero, size: viewport),
             topInset: headerHeight + 8, bottomInset: captureControlsHeight + 8,
             height: showsZoom && !compactZoomPresentation ? dialHeight : 44, atTop: false)
     }
@@ -148,20 +165,23 @@ struct CameraView: View {
             if model.permission == .authorized {
                 if model.camera.dualEnabled {
                     GeometryReader { geometry in
+                        let insetFrame = PreviewGeometry.pictureInPictureFrame(bounds: CGRect(origin: .zero, size: geometry.size), corner: dualCorner,
+                            topInset: separateControlBands ? 8 : headerHeight + 8, bottomInset: separateControlBands ? 8 : captureControlsHeight + 8)
                         ZStack(alignment: .topLeading) {
                             ForEach(0..<2, id: \.self) { index in
                                 let inset = enlargedDualIndex != nil && enlargedDualIndex != index
-                                let width = inset ? geometry.size.width * 0.38 : enlargedDualIndex == nil && landscape ? (geometry.size.width - 4) / 2 : geometry.size.width
+                                let width = inset ? insetFrame.width : enlargedDualIndex == nil && landscape ? (geometry.size.width - 4) / 2 : geometry.size.width
                                 let height = enlargedDualIndex == nil ? (landscape ? geometry.size.height : (geometry.size.height - 4) / 2) :
-                                    inset ? geometry.size.height * 0.32 : geometry.size.height
+                                    inset ? insetFrame.height : geometry.size.height
                                 dualViewfinder(zoomText(zoomState(index).value), index: index,
                                                topInset: !separateControlBands && !inset && (landscape || index == 0 || enlargedDualIndex != nil) ? headerHeight + 8 : 8,
-                                               bottomInset: !separateControlBands && !inset && (landscape || index == 1 || enlargedDualIndex != nil) ? captureControlsHeight + 8 : 0)
+                                               bottomInset: !separateControlBands && !inset && (landscape || index == 1 || enlargedDualIndex != nil) ? captureControlsHeight + 8 : 0,
+                                               obscuredRect: !inset && enlargedDualIndex != nil ? insetFrame : .zero)
                                     .frame(width: width, height: height)
                                     .clipShape(RoundedRectangle(cornerRadius: inset ? 12 : 0))
                                     .overlay { RoundedRectangle(cornerRadius: inset ? 12 : 0).strokeBorder(.white.opacity(inset ? 0.25 : 0), lineWidth: 2).allowsHitTesting(false) }
-                                    .offset(x: inset ? (dualCorner % 2 == 0 ? 8 : geometry.size.width - width - 8) : enlargedDualIndex == nil && landscape ? CGFloat(index) * (width + 4) : 0,
-                                            y: enlargedDualIndex == nil ? (landscape ? 0 : CGFloat(index) * (height + 4)) : inset ? (dualCorner < 2 ? (separateControlBands ? 8 : headerHeight + 8) : max(8, geometry.size.height - height - (separateControlBands ? 8 : captureControlsHeight + 8))) : 0)
+                                    .offset(x: inset ? insetFrame.minX : enlargedDualIndex == nil && landscape ? CGFloat(index) * (width + 4) : 0,
+                                            y: enlargedDualIndex == nil ? (landscape ? 0 : CGFloat(index) * (height + 4)) : inset ? insetFrame.minY : 0)
                                     .zIndex(inset ? 1 : 0)
                             }
                         }
@@ -170,7 +190,7 @@ struct CameraView: View {
                     .allowsHitTesting(!panelOpen)
                     .accessibilityHidden(panelOpen)
                 } else {
-                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: false, allowsFocus: model.canConfigure && !panelOpen, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen, onImageFrame: { imageFrame = $0.offsetBy(dx: 0, dy: previewTopInset) }, controlStripHeight: separateControlBands ? 0 : captureControlsHeight + 8, topControlStripHeight: (separateControlBands ? 0 : headerHeight) + (brightnessTarget == -1 ? inlineBrightnessHeight : 0), focusExclusionRects: [zoomControlsFrame.offsetBy(dx: 0, dy: -previewTopInset)])
+                    GuidedCameraPreview(guides: model.guides, engine: model.engine, onFocus: model.focus, fillView: false, alignsImageLeading: usesSideRail, allowsFocus: model.canConfigure && !panelOpen, showsFocusFeedback: model.canConfigure && !panelOpen, focusState: model.camera.focusStates.first ?? "Auto focus", exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen, hidesGuides: panelOpen, onImageFrame: { imageFrame = $0.offsetBy(dx: 0, dy: previewTopInset) }, controlStripHeight: separateControlBands ? 0 : captureControlsHeight + 8, topControlStripHeight: (separateControlBands ? 0 : headerHeight) + (brightnessTarget == -1 ? inlineBrightnessHeight : 0), focusExclusionRects: [zoomControlsFrame.offsetBy(dx: 0, dy: -previewTopInset)])
                         .accessibilityLabel("Camera viewfinder")
                         .simultaneousGesture(zoomGesture(nil))
                         .allowsHitTesting(!panelOpen)
@@ -196,8 +216,19 @@ struct CameraView: View {
     private func cameraPresentation(landscape: Bool) -> some View {
         cameraPreviewContent(landscape: landscape)
         .overlay(alignment: .topLeading) {
-            if !panelOpen && !model.camera.dualEnabled && PreviewGeometry.isValid(zoomControlsFrame) {
-                viewfinderControls
+            if chromeVisible && !model.camera.dualEnabled && PreviewGeometry.isValid(zoomControlsFrame) {
+                Group {
+                    if usesSideRail {
+                        portraitControls {
+                            globalRailControls
+                            railDivider
+                            lensSelector(vertical: true)
+                            singleBrightnessControl
+                            railUtilityControls
+                        }
+                    }
+                    else { viewfinderControls }
+                }
                     .frame(width: zoomControlsFrame.width, height: zoomControlsFrame.height)
                     .offset(x: zoomControlsFrame.minX, y: zoomControlsFrame.minY)
                     .animation(controlAnimation, value: showsZoom)
@@ -233,9 +264,9 @@ struct CameraView: View {
         .overlay(alignment: .top) {
             if !panelOpen {
                 GeometryReader { geometry in
-                    let top = headerHeight + (model.camera.dualEnabled ? 60 : 8) +
+                    let top = headerHeight + (model.camera.dualEnabled && !usesSideRail && !controlsCollapsed ? 60 : 8) +
                         (inlineBrightnessHeight > 0 ? inlineBrightnessHeight : showsZoom && model.camera.dualEnabled && !compactZoomPresentation ? dialHeight + 8 : 0)
-                    let bottom = !model.camera.dualEnabled && PreviewGeometry.isValid(zoomControlsFrame)
+                    let bottom = !usesSideRail && !model.camera.dualEnabled && PreviewGeometry.isValid(zoomControlsFrame)
                         ? min(geometry.size.height - captureControlsHeight - 8, zoomControlsFrame.minY - 8)
                         : geometry.size.height - captureControlsHeight - 8
                     let available = max(0, bottom - top)
@@ -247,6 +278,7 @@ struct CameraView: View {
                     }
                     .frame(height: min(available, captureStatusHeight))
                     .padding(.top, top)
+                    .padding(.trailing, usesSideRail && chromeVisible ? 64 : 0)
                 }
             }
         }
@@ -256,7 +288,7 @@ struct CameraView: View {
             }
         }
         .overlay(alignment: .top) {
-            if !panelOpen {
+            if chromeVisible && !usesSideRail {
                 captureHUD
                     .background {
                         LinearGradient(colors: reduceTransparency || separateControlBands ? [.black, .black] : [.black.opacity(chromeShade), .clear], startPoint: .top, endPoint: .bottom)
@@ -281,7 +313,7 @@ struct CameraView: View {
             if height.isFinite && height > 0 { captureControlsHeight = height }
         }
         .onPreferenceChange(CameraHeaderHeightKey.self) { height in
-            if height.isFinite && height > 0 { headerHeight = height }
+            if height.isFinite && height > 0 { measuredHeaderHeight = height }
         }
         .onPreferenceChange(CaptureStatusHeightKey.self) { height in
             if height.isFinite && height >= 0 { captureStatusHeight = height }
@@ -293,6 +325,10 @@ struct CameraView: View {
         .onChange(of: model.camera.dualEnabled) { _, _ in showsZoom = false; zoomDismissTask?.cancel(); closeBrightness(); pinchStart = nil; pinchDeviceID = nil }
         .onChange(of: model.mode) { _, _ in closeBrightness(); showsZoom = false; zoomDismissTask?.cancel(); pinchStart = nil; pinchDeviceID = nil }
         .onChange(of: model.panoramaSelected) { _, _ in closeBrightness(); showsZoom = false; zoomDismissTask?.cancel(); pinchStart = nil; pinchDeviceID = nil }
+        .onChange(of: model.panoramaRunning) { _, running in
+            // Stitch needs its separate Finish and Undo actions within reach.
+            if running && model.panoramaMethod == .stitch { setControlsCollapsed(false) }
+        }
         .onChange(of: model.canConfigure) { _, ready in
             if !ready {
                 showsZoom = false; zoomDismissTask?.cancel(); closeBrightness()
@@ -336,7 +372,7 @@ struct CameraView: View {
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) { visibleTransition = label }
         }
         .onChange(of: panelOpen) { _, open in
-            if open { showsZoom = false; zoomDismissTask?.cancel(); closeBrightness() }
+            if open { setControlsCollapsed(false); showsZoom = false; zoomDismissTask?.cancel(); closeBrightness() }
         }
     }
 
@@ -397,20 +433,22 @@ struct CameraView: View {
         }
     }
 
-    private func dualViewfinder(_ title: String, index: Int, topInset: CGFloat, bottomInset: CGFloat) -> some View {
+    private func dualViewfinder(_ title: String, index: Int, topInset: CGFloat, bottomInset: CGFloat, obscuredRect: CGRect) -> some View {
         GeometryReader { geometry in
             let visibleImage = dualImageFrames[index]
             let bounds = CGRect(origin: .zero, size: geometry.size)
             let inlineBrightness = brightnessTarget == index && !compactBrightnessPresentation
             let editing = inlineBrightness || (showsZoom && selectedDualIndex == index && !compactZoomPresentation)
-            let controls = PreviewGeometry.controlFrame(image: visibleImage, bounds: bounds,
+            let controls = controlsCollapsed ? CGRect.zero : usesSideRail
+                ? PreviewGeometry.avoidingOverlay(rail: PreviewGeometry.sideRailFrame(bounds: bounds, topInset: topInset, bottomInset: bottomInset), overlay: obscuredRect)
+                : PreviewGeometry.controlFrame(image: visibleImage, bounds: bounds,
                 topInset: topInset, bottomInset: bottomInset,
                 height: 44 + (editing ? (showsZoom ? dialHeight : brightnessEditorHeight) + 6 : 0), atTop: true)
             CameraPreview(engine: model.engine, onFocus: { point, locked in
                 guard !panelOpen else { return }
                 selectedDualIndex = index
                 model.focusDual(at: point, index: index, locked: locked)
-            }, fillView: false, allowsFocus: !panelOpen && model.canConfigure, secondary: index == 1,
+            }, fillView: false, alignsImageLeading: usesSideRail, allowsFocus: !panelOpen && model.canConfigure, secondary: index == 1,
                 showsFocusFeedback: !panelOpen && model.canConfigure && (model.exposurePointOnly || (model.camera.dualFocusSupported.indices.contains(index) && model.camera.dualFocusSupported[index])),
                 focusState: model.camera.focusStates.indices.contains(index) ? model.camera.focusStates[index] : "Auto focus",
                 exposureOnly: model.exposurePointOnly, showsGrid: showsGrid && !panelOpen,
@@ -419,7 +457,7 @@ struct CameraView: View {
                 .background(.black)
                 .simultaneousGesture(zoomGesture(index))
                 .overlay(alignment: .topLeading) {
-                    if !panelOpen && selectedDualIndex == index && PreviewGeometry.isValid(visibleImage) {
+                    if chromeVisible && selectedDualIndex == index && PreviewGeometry.isValid(visibleImage) {
                         Rectangle().strokeBorder(selection.opacity(0.8), lineWidth: 1)
                             .frame(width: visibleImage.width, height: visibleImage.height)
                             .offset(x: visibleImage.minX, y: visibleImage.minY)
@@ -427,7 +465,16 @@ struct CameraView: View {
                     }
                 }
                 .overlay(alignment: .topLeading) {
-                    if !panelOpen && PreviewGeometry.isValid(controls) {
+                    if chromeVisible && PreviewGeometry.isValid(controls) {
+                        if usesSideRail {
+                            portraitControls {
+                                if enlargedDualIndex.map({ $0 == index }) ?? (index == 0) { globalRailControls; railDivider }
+                                dualRailControls(title, index: index)
+                                if enlargedDualIndex.map({ $0 == index }) ?? (index == 0) { railUtilityControls }
+                            }
+                            .frame(width: controls.width, height: controls.height)
+                            .offset(x: controls.minX, y: controls.minY)
+                        } else {
                         VStack(spacing: 6) {
                             HStack(spacing: 6) {
                                 HStack(spacing: 0) {
@@ -466,11 +513,13 @@ struct CameraView: View {
                         .animation(controlAnimation, value: editing)
                         .contentShape(Rectangle()).onTapGesture {}
                         .buttonStyle(.plain).disabled(!model.canConfigure)
+                        }
                     }
                 }
                 .overlay(alignment: .top) {
                     lensWarningBadge(index)
-                        .padding(.top, min(max(topInset, controls.maxY + 6), max(topInset, geometry.size.height - bottomInset - 44)))
+                        .padding(.top, usesSideRail ? topInset + 6 : min(max(topInset, controls.maxY + 6), max(topInset, geometry.size.height - bottomInset - 44)))
+                        .padding(.trailing, usesSideRail && chromeVisible ? 64 : 0)
                 }
                 .accessibilityLabel("Camera \(index + 1), \(title) live viewfinder. Tap to focus this camera.")
         }
@@ -485,6 +534,117 @@ struct CameraView: View {
             showsRecent = false
             showsCaptureInfo = true
         }
+    }
+
+    private func setControlsCollapsed(_ collapsed: Bool) {
+        guard !collapsed || canCollapseControls else { return }
+        closeBrightness()
+        showsZoom = false
+        zoomDismissTask?.cancel()
+        pinchStart = nil
+        pinchDeviceID = nil
+        withAnimation(controlAnimation) { controlsCollapsed = collapsed }
+    }
+
+    private func portraitControls<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 4, content: content).frame(width: 52)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .buttonStyle(.plain)
+        .contentShape(Rectangle()).onTapGesture {}
+    }
+
+    private var globalRailControls: some View {
+        Group {
+            Button { openTool() } label: {
+                Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44)
+                    .background(overlayColor, in: Circle())
+            }.accessibilityLabel("Camera controls")
+            if model.mode == .photo {
+                ForEach([false, true], id: \.self) { dual in
+                    let selected = model.camera.dualEnabled == dual
+                    Button { model.setDualEnabled(dual) } label: {
+                        Image(systemName: dual ? "rectangle.on.rectangle" : "rectangle")
+                            .frame(width: 44, height: 44)
+                            .foregroundStyle(selected ? selection : .white)
+                            .background(selected ? selection.opacity(0.25) : overlayColor, in: Circle())
+                    }.accessibilityLabel(dual ? "Dual cameras" : "Single camera")
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                        .disabled(!model.canConfigure || (dual && !model.camera.dualAvailable))
+                }
+            } else {
+                Button { openTool(.video) } label: {
+                    Image(systemName: "video").frame(width: 44, height: 44)
+                        .background(overlayColor, in: Circle())
+                }.accessibilityLabel("Video quality").accessibilityValue(model.camera.videoLabel)
+            }
+            if model.mode == .photo && model.panoramaSelected && !model.panoramaRunning {
+                railDivider
+                ForEach(PanoramaMethod.allCases, id: \.self) { method in
+                    let selected = model.panoramaMethod == method
+                    Button { model.panoramaMethod = method } label: {
+                        Image(systemName: method == .sweep ? "arrow.left.and.right" : "square.stack")
+                            .frame(width: 44, height: 44)
+                            .foregroundStyle(selected ? selection : .white)
+                            .background(selected ? selection.opacity(0.25) : overlayColor, in: Circle())
+                    }.accessibilityLabel(method.rawValue + " panorama")
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                }
+                Button { model.panoramaDirection = model.panoramaDirection == .right ? .left : .right } label: {
+                    Image(systemName: model.panoramaDirection == .right ? "arrow.right" : "arrow.left")
+                        .frame(width: 44, height: 44).background(overlayColor, in: Circle())
+                }.accessibilityLabel("Panorama direction: " + model.panoramaDirection.rawValue)
+                    .accessibilityHint("Tap to reverse direction before capturing")
+            }
+            if !model.camera.dualEnabled { headerLeadingControl }
+        }.disabled(!model.canConfigure)
+    }
+
+    private var railDivider: some View {
+        Rectangle().fill(.white.opacity(0.3)).frame(width: 24, height: 1).padding(.vertical, 3)
+            .accessibilityHidden(true)
+    }
+
+    private var railUtilityControls: some View {
+        Group { railDivider; libraryControl; flipCameraControl }
+    }
+
+    @ViewBuilder private var singleBrightnessControl: some View {
+        if model.mode == .photo && !model.panoramaSelected {
+            Button { openBrightness(nil) } label: {
+                Image(systemName: "sun.max").frame(width: 44, height: 44)
+                    .background(overlayColor, in: Circle())
+            }.accessibilityLabel("Brightness").disabled(!model.canConfigure)
+        }
+    }
+
+    private func dualRailControls(_ title: String, index: Int) -> some View {
+        Group {
+            Button {
+                selectedDualIndex = index
+                zoomDismissTask?.cancel()
+                showsZoom = true
+            } label: {
+                Text(title).font(.caption.weight(.semibold)).monospacedDigit()
+                    .lineLimit(1).minimumScaleFactor(0.7)
+                    .frame(width: 44, height: 44)
+                    .foregroundStyle(selectedDualIndex == index ? selection : .white)
+                    .background(overlayColor, in: Circle())
+            }.accessibilityLabel("Camera \(index + 1) zoom, \(title)")
+                .accessibilityHint("Opens the fine zoom dial for this lens only")
+                .accessibilityAddTraits(selectedDualIndex == index ? .isSelected : [])
+            Button { enlargedDualIndex = enlargedDualIndex == index ? nil : index } label: {
+                Image(systemName: enlargedDualIndex == index ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                    .frame(width: 44, height: 44).background(overlayColor, in: Circle())
+            }.accessibilityLabel(enlargedDualIndex == index ? "Show both cameras equally" : "Enlarge camera \(index + 1)")
+            if enlargedDualIndex == nil || enlargedDualIndex == index {
+                Button { selectedDualIndex = index; openBrightness(index) } label: {
+                    Image(systemName: "sun.max").frame(width: 44, height: 44)
+                        .background(overlayColor, in: Circle())
+                }.accessibilityLabel("Camera \(index + 1) brightness")
+            }
+        }.disabled(!model.canConfigure)
     }
 
     private func closeBrightness() {
@@ -566,13 +726,13 @@ struct CameraView: View {
                 } label: {
                     Image(systemName: model.controls.flash == .off ? "bolt.slash" : "bolt.fill")
                         .foregroundStyle(model.controls.flash == .off ? .white : selection)
-                        .frame(width: 44, height: 52).background(overlayColor, in: Capsule())
+                        .frame(width: 44, height: 44).background(overlayColor, in: Capsule())
                 }.accessibilityLabel("Flash")
                     .accessibilityValue(model.controls.flash == .off ? "Off" : model.controls.flash == .auto ? "Auto" : "On")
                     .disabled(!model.camera.flashAvailable || model.camera.dualEnabled)
             } else {
                 Button { openBrightness(nil) } label: {
-                    Image(systemName: "sun.max").frame(width: 44, height: 52)
+                    Image(systemName: "sun.max").frame(width: 44, height: 44)
                         .background(overlayColor, in: Capsule())
                 }.accessibilityLabel("Brightness")
                     .disabled(model.camera.dualEnabled)
@@ -640,7 +800,7 @@ struct CameraView: View {
                     .accessibilityElement(children: .combine)
                     .allowsHitTesting(false)
             }
-            if !showsCaptureInfo && !showsRecent && !model.reviewingBurst {
+            if chromeVisible {
                 if sceneHints, undismissedLensWarnings.isEmpty, brightnessTarget == nil, !showsZoom,
                    !model.lowStorage, !model.camera.cooling, model.canConfigure, !model.panoramaSelected,
                    model.mode == .photo, model.message == nil, let advice = model.sceneAdvice, advice != dismissedSceneAdvice {
@@ -667,9 +827,9 @@ struct CameraView: View {
                 }.padding(10).background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityElement(children: .combine)
             }
-            if model.mode == .photo && model.panoramaSelected {
+            if panoramaStatusVisible {
                 VStack(spacing: 4) {
-                    if !model.panoramaRunning {
+                    if !model.panoramaRunning && !usesSideRail {
                         HStack(spacing: 4) {
                             ForEach(PanoramaMethod.allCases, id: \.self) { method in
                                 Button { model.panoramaMethod = method } label: {
@@ -695,6 +855,8 @@ struct CameraView: View {
                             if model.panoramaDirection == .right { Image(systemName: "arrow.right") }
                         }.frame(maxWidth: 280, minHeight: 44).contentShape(Rectangle())
                     }.buttonStyle(.plain).disabled(model.panoramaRunning || !model.canConfigure)
+                        .allowsHitTesting(!usesSideRail)
+                        .accessibilityHidden(usesSideRail)
                         .accessibilityLabel("Panorama direction: " + model.panoramaDirection.rawValue)
                         .accessibilityHint("Tap to reverse direction before capturing")
                     Text(model.message ?? (model.panoramaRunning ? "Keep level · follow the arrow" : model.panoramaMethod == .sweep ? "Press shutter, then sweep · tap arrow to reverse" : "Capture overlapping photos · tap arrow to reverse"))
@@ -723,11 +885,11 @@ struct CameraView: View {
                 Text("\(model.countdown)").font(.system(size: 64, weight: .bold))
                     .accessibilityLabel("Shutter in \(model.countdown) seconds")
             }
-            if model.lowStorage || model.camera.cooling || (!model.panoramaSelected && model.message != nil && model.message != dismissedStatus) || (model.hasPendingCapture && model.canUseRecovery) {
+            if model.lowStorage || model.camera.cooling || visibleStatusMessage != nil || (model.hasPendingCapture && model.canUseRecovery) {
                 VStack(spacing: 6) {
                     if model.lowStorage { Text("Low storage · free space before recording").font(.caption) }
                     if model.camera.cooling { Text("iPhone is warm · processing reduced").font(.caption) }
-                    if let message = model.message, !model.panoramaSelected, message != dismissedStatus {
+                    if let message = visibleStatusMessage {
                         HStack(spacing: 4) {
                             Label(model.busy ? model.captureActivity.rawValue : message, systemImage: model.busy ? "hourglass" : model.hasPendingCapture ? "exclamationmark.triangle" : "info.circle")
                                 .font(.caption).accessibilityLabel(message)
@@ -843,12 +1005,16 @@ struct CameraView: View {
         }
     }
 
-    private var lensSelector: some View {
+    private func lensSelector(vertical: Bool = false) -> some View {
         Group {
             if model.selectedLens?.isFront == false && selectedZoomChoiceID != nil {
+                if vertical {
+                    VStack(spacing: 4) { zoomChoices }
+                } else {
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) { zoomChoices }.fixedSize(horizontal: true, vertical: false)
                     ScrollView(.horizontal, showsIndicators: false) { HStack(spacing: 8) { zoomChoices } }
+                }
                 }
             } else {
                 Button { zoomDismissTask?.cancel(); showsZoom = true } label: {
@@ -885,135 +1051,175 @@ struct CameraView: View {
     private var viewfinderControls: some View {
         Group {
             if showsZoom && !compactZoomPresentation { zoomDial.transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .bottom))) }
-            else { lensSelector.transition(.opacity) }
+            else { lensSelector().transition(.opacity) }
         }.disabled(panelOpen).foregroundStyle(.white)
             .padding(.horizontal, 4).contentShape(Rectangle()).onTapGesture {}
     }
 
-    private func captureControls(landscape: Bool) -> some View {
-        let layout = landscape ? AnyLayout(HStackLayout(spacing: 12)) : AnyLayout(VStackLayout(spacing: 6))
-        let modeLayout = landscape ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 12))
-        let stitching = model.panoramaRunning && model.panoramaMethod == .stitch
-        return layout {
+    private var chromeHandle: some View {
+        Button { setControlsCollapsed(!controlsCollapsed) } label: {
+            Image(systemName: controlsCollapsed ? "chevron.up" : "chevron.down")
+                .font(.caption.weight(.bold)).frame(width: 30, height: 20)
+                .background(overlayColor, in: Capsule())
+                .frame(width: 44, height: 44).contentShape(Rectangle())
+        }.buttonStyle(.plain)
+            .accessibilityLabel(controlsCollapsed ? "Show camera controls" : "Hide camera controls")
+            .accessibilityHint(canCollapseControls ? "Swipe down to hide controls; swipe up or tap to restore" : "Finish or stop Stitch before hiding its controls")
+            .disabled(!controlsCollapsed && !canCollapseControls)
+    }
+
+    private var chromeSwipe: some Gesture {
+        DragGesture(minimumDistance: 16).onEnded { gesture in
+            let collapsed = CameraChromePolicy.collapsed(after: gesture.translation, current: controlsCollapsed, canCollapse: canCollapseControls)
+            if collapsed != controlsCollapsed { setControlsCollapsed(collapsed) }
+        }
+    }
+
+    private func captureModePicker(landscape: Bool) -> some View {
+        let modeLayout = landscape || textSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 4))
+        return HStack(spacing: 0) {
             modeLayout {
                 ForEach(0..<3) { index in
                     let selected = model.mode == .video ? index == 2 : index == (model.panoramaSelected ? 1 : 0)
                     Button { showsCaptureInfo = false; showsRecent = false; model.chooseCaptureMode(index) } label: {
-                        Text(["PHOTO", "PANORAMA", "VIDEO"][index])
-                            .font(.caption.weight(.semibold)).lineLimit(textSize.isAccessibilitySize ? 2 : 1).minimumScaleFactor(0.8)
-                            .frame(minWidth: 60, maxWidth: .infinity, minHeight: 44)
+                        Label(["Photo", "Pano", "Video"][index], systemImage: ["camera", "pano", "video"][index])
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption.weight(.semibold)).lineLimit(textSize.isAccessibilitySize ? 2 : 1)
+                            .minimumScaleFactor(textSize.isAccessibilitySize ? 1 : 0.8)
+                            .frame(maxWidth: .infinity, minHeight: 44)
                             .foregroundStyle(selected ? selection : .white)
                     }.buttonStyle(.plain)
+                        .accessibilityLabel(["Photo", "Panorama", "Video"][index])
                         .accessibilityAddTraits(selected ? .isSelected : [])
                         .disabled(!model.canConfigure)
                 }
             }
-            .padding(.horizontal, 8)
+            chromeHandle
+        }
+        .padding(.horizontal, 4)
+        .simultaneousGesture(chromeSwipe)
+    }
 
-            HStack {
-                if stitching {
-                    Button { model.undoPanorama() } label: {
-                        Label("Undo", systemImage: "arrow.uturn.backward")
-                            .font(.caption.weight(.semibold)).frame(minWidth: 60, minHeight: 48)
-                    }.disabled(!model.canUndoPanorama)
-                        .accessibilityLabel("Remove last panorama photo")
-                        .frame(maxWidth: .infinity)
-                } else {
-                    Button {
-                        if model.recent != nil { showsCaptureInfo = false; showsRecent = true }
-                        else { openPhotos() }
-                    } label: {
-                        VStack(spacing: 3) {
-                            ZStack(alignment: .bottomTrailing) {
-                                Group {
-                                    if let thumbnail = model.lastSavedThumbnail {
-                                        Image(uiImage: thumbnail).resizable().scaledToFill()
-                                    } else {
-                                        Image(systemName: "photo.on.rectangle").font(.title3)
-                                            .foregroundStyle(.white)
-                                    }
-                                }
-                                .frame(width: 48, height: 48).clipped()
-                                .background(.white.opacity(0.1))
-                                .clipShape(RoundedRectangle(cornerRadius: 9))
-                                if model.lastSavedPhotoCount > 1 {
-                                    Text("\(model.lastSavedPhotoCount)").font(.caption2.bold()).padding(3)
-                                        .foregroundStyle(.black).background(.white, in: RoundedRectangle(cornerRadius: 8))
-                                }
-                                if model.lastSavedThumbnail != nil {
-                                    // Keep the library affordance visible even for a dark thumbnail.
-                                    Image(systemName: "photo.on.rectangle")
-                                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
-                                        .padding(4).background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
-                                        .frame(width: 48, height: 48, alignment: .bottomLeading)
-                                        .accessibilityHidden(true)
-                                }
-                            }
+    private var libraryControl: some View {
+        Button {
+            if model.recent != nil { showsCaptureInfo = false; showsRecent = true }
+            else { openPhotos() }
+        } label: {
+            VStack(spacing: 3) {
+                ZStack(alignment: .bottomTrailing) {
+                    Group {
+                        if let thumbnail = model.lastSavedThumbnail {
+                            Image(uiImage: thumbnail).resizable().scaledToFill()
+                        } else {
+                            Image(systemName: "photo.on.rectangle").font(.title3)
+                                .foregroundStyle(.white)
                         }
                     }
-                    .accessibilityLabel(model.lastSavedThumbnail == nil ? "Open Photos" : "Review last saved capture")
-                    .disabled(!model.canConfigure)
-                    .frame(maxWidth: .infinity)
-                }
-
-                Button { showsCaptureInfo = false; showsRecent = false; model.shutter() } label: {
-                    VStack(spacing: 4) {
-                    ZStack {
-                        Circle().fill(model.mode == .video ? Color.red : Color.white)
-                        Circle().strokeBorder(Color.black.opacity(0.65), lineWidth: 2).padding(5)
-                        if model.panoramaRunning && model.panoramaMethod == .sweep { RoundedRectangle(cornerRadius: 4).fill(.black).frame(width: 28, height: 28) }
-                        else if model.camera.recording { RoundedRectangle(cornerRadius: 4).fill(.white).frame(width: 28, height: 28) }
-                        else if model.panoramaTakingPhoto || (model.busy && !model.panoramaRunning) || model.configuring { ProgressView().tint(.black) }
+                    .frame(width: 48, height: 48).clipped()
+                    .background(.white.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                    if model.lastSavedPhotoCount > 1 {
+                        Text("\(model.lastSavedPhotoCount)").font(.caption2.bold()).padding(3)
+                            .foregroundStyle(.black).background(.white, in: RoundedRectangle(cornerRadius: 8))
                     }
-                    .frame(width: 76, height: 76)
-                    .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
-                    Text(model.panoramaRunning ? (model.panoramaMethod == .sweep ? "Finish" : "Add photo") : model.mode == .video ? model.videoButtonTitle : " ")
+                    if model.lastSavedThumbnail != nil {
+                        // Keep the library affordance visible even for a dark thumbnail.
+                        Image(systemName: "photo.on.rectangle")
+                            .font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                            .padding(4).background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
+                            .frame(width: 48, height: 48, alignment: .bottomLeading)
+                            .accessibilityHidden(true)
+                    }
+                }
+            }
+        }
+        .accessibilityLabel(model.lastSavedThumbnail == nil ? "Open Photos" : "Review last saved capture")
+        .disabled(!model.canConfigure)
+    }
+
+    private var flipCameraControl: some View {
+        Button(action: model.flip) {
+            Image(systemName: "arrow.triangle.2.circlepath.camera")
+                .font(.title3).frame(width: 44, height: 44)
+                .background(overlayColor, in: Circle())
+        }
+        .accessibilityLabel("Switch front and rear camera")
+        .disabled(panelOpen || !model.canSwitch || !model.camera.lenses.contains { $0.isFront != model.selectedLens?.isFront })
+    }
+
+    private var shutterControl: some View {
+        Button { showsCaptureInfo = false; showsRecent = false; model.shutter() } label: {
+            VStack(spacing: 4) {
+                ZStack {
+                    Circle().fill(model.mode == .video ? Color.red : Color.white)
+                    Circle().strokeBorder(Color.black.opacity(0.65), lineWidth: 2).padding(5)
+                    if model.panoramaRunning && model.panoramaMethod == .sweep { RoundedRectangle(cornerRadius: 4).fill(.black).frame(width: 28, height: 28) }
+                    else if model.camera.recording { RoundedRectangle(cornerRadius: 4).fill(.white).frame(width: 28, height: 28) }
+                    else if model.panoramaTakingPhoto || (model.busy && !model.panoramaRunning) || model.configuring { ProgressView().tint(.black) }
+                }
+                .frame(width: 76, height: 76)
+                .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
+                if !controlsCollapsed && (model.panoramaRunning || (model.mode == .video && (model.camera.recording || model.busy))) {
+                    Text(model.panoramaRunning ? (model.panoramaMethod == .sweep ? "Finish" : "Add photo") : model.videoButtonTitle)
                         .font(.caption.weight(.semibold)).lineLimit(1)
                         .accessibilityHidden(model.mode != .video && !model.panoramaRunning)
-                    }
                 }
-                .accessibilityLabel(model.panoramaRunning ? (model.panoramaMethod == .sweep ? "Finish panorama" : "Add panorama photo") : model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
-                .accessibilityValue(model.shutterStatus)
-                .disabled(!model.canShutter)
-                .opacity(model.canShutter ? 1 : 0.4)
+            }
+        }
+        .accessibilityLabel(model.panoramaRunning ? (model.panoramaMethod == .sweep ? "Finish panorama" : "Add panorama photo") : model.mode == .photo ? "Take photo" : model.camera.recording ? "Stop recording" : "Start recording")
+        .accessibilityValue(model.shutterStatus)
+        .disabled(!model.canShutter)
+        .opacity(model.canShutter ? 1 : 0.4)
+    }
 
-                if stitching {
+    @ViewBuilder private var stitchFinishControl: some View {
+        if model.panoramaFrames < PanoramaPolicy.minimumFrames {
+            Button("Stop") { model.finishPanorama(automatic: true) }
+                .accessibilityLabel("Stop panorama and keep captured photos")
+        } else {
+            Button("Finish") { model.finishPanorama() }.disabled(!model.canFinishPanorama)
+        }
+    }
+
+    private func captureControls(landscape: Bool) -> some View {
+        let layout = landscape ? AnyLayout(HStackLayout(spacing: 8)) : AnyLayout(VStackLayout(spacing: 2))
+        let stitching = model.panoramaRunning && model.panoramaMethod == .stitch
+        return layout {
+            if !controlsCollapsed { captureModePicker(landscape: landscape) }
+            HStack {
+                if !controlsCollapsed && (!usesSideRail || stitching) {
                     Group {
-                        if model.panoramaFrames < PanoramaPolicy.minimumFrames {
-                            Button("Stop") { model.finishPanorama(automatic: true) }
-                                .accessibilityLabel("Stop panorama and keep captured photos")
-                        } else {
-                            Button("Finish") { model.finishPanorama() }.disabled(!model.canFinishPanorama)
-                        }
-                    }.font(.caption.weight(.semibold)).frame(minWidth: 60, minHeight: 48)
-                        .frame(maxWidth: .infinity)
-                } else {
-                    Button(action: model.flip) {
-                        VStack(spacing: 3) {
-                        Image(systemName: "arrow.triangle.2.circlepath.camera")
-                            .font(.title3)
-                            .frame(width: 48, height: 48)
-
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
-                    .accessibilityLabel("Switch front and rear camera")
-                    .disabled(panelOpen || !model.canSwitch || !model.camera.lenses.contains { $0.isFront != model.selectedLens?.isFront })
+                        if stitching {
+                            Button { model.undoPanorama() } label: {
+                                Label("Undo", systemImage: "arrow.uturn.backward")
+                                    .font(.caption.weight(.semibold)).frame(minWidth: 60, minHeight: 48)
+                            }.disabled(!model.canUndoPanorama)
+                                .accessibilityLabel("Remove last panorama photo")
+                        } else { libraryControl }
+                    }.frame(maxWidth: .infinity)
+                }
+                shutterControl
+                if !controlsCollapsed && (!usesSideRail || stitching) {
+                    Group {
+                        if stitching { stitchFinishControl.font(.caption.weight(.semibold)).frame(minWidth: 60, minHeight: 48) }
+                        else { flipCameraControl }
+                    }.frame(maxWidth: .infinity)
                 }
             }
             .frame(minWidth: landscape ? 200 : nil)
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 18).padding(.top, 10).padding(.bottom, 8)
+        .padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 8)
         .frame(maxWidth: .infinity)
+        .overlay(alignment: .trailing) {
+            if controlsCollapsed { chromeHandle.padding(.trailing, 12).simultaneousGesture(chromeSwipe) }
+        }
         .background {
-            LinearGradient(colors: reduceTransparency || separateControlBands ? [.black, .black] : [.black.opacity(chromeShade), .black.opacity(chromeShade)], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: controlsCollapsed ? [.clear, .clear] : reduceTransparency || separateControlBands ? [.black, .black] : [.black.opacity(chromeShade), .black.opacity(chromeShade)], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea(edges: .bottom).allowsHitTesting(false)
         }
-        .contentShape(Rectangle())
-        .onTapGesture {}
+        .contentShape(Rectangle()).onTapGesture {}
     }
-
 
     @ViewBuilder private var saveRecovery: some View {
         Button(model.saveNeedsConfirmation ? "Check save status" : model.panoramaRecovery?.saved == true ? "Finish cleanup" : model.panoramaRecovery?.readyToSave == false ? "Finish panorama" : "Retry save") {
@@ -1753,7 +1959,7 @@ private struct CameraDesignGallery: View {
             } else if showsCompleteReference {
                 ScrollView {
                     Image("DesignReference").resizable().scaledToFit()
-                        .accessibilityLabel("Original Camera XT mockup sheet with ten proposed screens")
+                        .accessibilityLabel("Original camera mockup sheet with ten proposed screens")
                     Text("Design reference only · not a screenshot of the current app").font(.footnote).padding()
                 }
             } else {
@@ -2285,6 +2491,7 @@ private struct GuidedCameraPreview: View {
     let engine: CaptureSessionManager
     var onFocus: (CGPoint, Bool) -> Void
     var fillView: Bool
+    var alignsImageLeading = false
     var allowsFocus: Bool
     var showsFocusFeedback: Bool
     var focusState: String
@@ -2296,7 +2503,7 @@ private struct GuidedCameraPreview: View {
     var topControlStripHeight: CGFloat = 0
     var focusExclusionRects: [CGRect] = []
     var body: some View {
-        CameraPreview(engine: engine, onFocus: onFocus, fillView: fillView, allowsFocus: allowsFocus, showsFocusFeedback: showsFocusFeedback,
+        CameraPreview(engine: engine, onFocus: onFocus, fillView: fillView, alignsImageLeading: alignsImageLeading, allowsFocus: allowsFocus, showsFocusFeedback: showsFocusFeedback,
                       focusState: focusState, exposureOnly: exposureOnly, showsGrid: showsGrid,
                       guideImage: hidesGuides ? nil : guides.image, onImageFrame: onImageFrame, controlStripHeight: controlStripHeight, topControlStripHeight: topControlStripHeight, focusExclusionRects: focusExclusionRects)
     }
