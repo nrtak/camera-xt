@@ -4,6 +4,37 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testRailSideAndImageAlignmentPreserveTheWholeFrame() {
+        let bounds = CGRect(x: 0, y: 0, width: 430, height: 466)
+        let original = CGRect(x: 40.25, y: 0, width: 349.5, height: 466)
+        let rightAligned = original.offsetBy(dx: PreviewGeometry.trailingOffset(image: original, bounds: bounds), dy: 0)
+        XCTAssertEqual(rightAligned.maxX, bounds.maxX)
+        XCTAssertEqual(rightAligned.size, original.size)
+        XCTAssertTrue(bounds.contains(rightAligned))
+        let leftRail = PreviewGeometry.sideRailFrame(bounds: bounds, topInset: 8, bottomInset: 88, onLeft: true)
+        let rightRail = PreviewGeometry.sideRailFrame(bounds: bounds, topInset: 8, bottomInset: 88)
+        XCTAssertEqual(leftRail.minX, 6)
+        XCTAssertEqual(leftRail.size, rightRail.size)
+        XCTAssertEqual(leftRail.minY, rightRail.minY)
+        XCTAssertEqual(PreviewGeometry.trailingOffset(image: .zero, bounds: bounds), 0)
+    }
+
+    func testEssentialRailControlsPinOnlyWhenTheOtherControlsStayReachable() {
+        XCTAssertTrue(CameraChromePolicy.pinsEssentials(height: 160, count: 2))
+        XCTAssertFalse(CameraChromePolicy.pinsEssentials(height: 159, count: 2))
+        XCTAssertTrue(CameraChromePolicy.pinsEssentials(height: 208, count: 3))
+        XCTAssertFalse(CameraChromePolicy.pinsEssentials(height: 200, count: 3))
+        XCTAssertFalse(CameraChromePolicy.pinsEssentials(height: .nan, count: 2))
+        XCTAssertFalse(CameraChromePolicy.pinsEssentials(height: 500, count: 0))
+    }
+
+    func testFixedFocusLensesNeverDisplayAnUnlockFocusBadge() {
+        XCTAssertEqual(CameraFocusStatus.label(automaticAvailable: false, adjusting: false, locked: true), "Fixed focus")
+        XCTAssertEqual(CameraFocusStatus.label(automaticAvailable: true, adjusting: false, locked: true), "Focus locked")
+        XCTAssertEqual(CameraFocusStatus.label(automaticAvailable: true, adjusting: true, locked: true), "Focusing…")
+        XCTAssertEqual(CameraFocusStatus.label(automaticAvailable: true, adjusting: false, locked: false), "Auto focus")
+    }
+
     func testInsetCameraNeverCoversMainRailInAnyPortraitCorner() {
         for size in [CGSize(width: 320, height: 568), CGSize(width: 390, height: 760), CGSize(width: 430, height: 932)] {
             let bounds = CGRect(origin: .zero, size: size)
