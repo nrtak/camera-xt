@@ -68,7 +68,8 @@ struct CameraPreview: UIViewRepresentable {
             }
         }
         func updateOverlays() {
-            // Move only the letterbox margin. Keep the layer's size and aspect-fit gravity.
+            // Balance the side margin without pushing the full image against an edge.
+            // Keep the layer's size and aspect-fit gravity; focus uses this same layer.
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             let localBounds = CGRect(origin: .zero, size: bounds.size)
@@ -230,15 +231,20 @@ enum PreviewGeometry {
         return CGRect(x: rail.minX, y: above >= below ? rail.minY : belowTop, width: rail.width, height: height)
     }
 
-    /// Consolidate side letterboxing without scaling or clipping the camera image.
+    /// Favor space for the controls while retaining at least a quarter of the
+    /// horizontal letterboxing on each side. Never shift more than 32 points.
     static func leadingOffset(image: CGRect, bounds: CGRect) -> CGFloat {
         guard isValid(image), isValid(bounds), bounds.contains(image) else { return 0 }
-        return bounds.minX - image.minX
+        let centerOffset = bounds.midX - image.midX
+        let shift = min(32, max(0, bounds.width - image.width) / 4)
+        return centerOffset - shift
     }
 
     static func trailingOffset(image: CGRect, bounds: CGRect) -> CGFloat {
         guard isValid(image), isValid(bounds), bounds.contains(image) else { return 0 }
-        return bounds.maxX - image.maxX
+        let centerOffset = bounds.midX - image.midX
+        let shift = min(32, max(0, bounds.width - image.width) / 4)
+        return centerOffset + shift
     }
 
     static func sideRailFrame(bounds: CGRect, topInset: CGFloat, bottomInset: CGFloat, onLeft: Bool = false) -> CGRect {

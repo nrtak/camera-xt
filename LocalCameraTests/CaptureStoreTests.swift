@@ -8,7 +8,7 @@ final class CaptureStoreTests: XCTestCase {
         let bounds = CGRect(x: 0, y: 0, width: 430, height: 466)
         let original = CGRect(x: 40.25, y: 0, width: 349.5, height: 466)
         let rightAligned = original.offsetBy(dx: PreviewGeometry.trailingOffset(image: original, bounds: bounds), dy: 0)
-        XCTAssertEqual(rightAligned.maxX, bounds.maxX)
+        XCTAssertEqual(rightAligned.maxX, bounds.maxX - 20.125)
         XCTAssertEqual(rightAligned.size, original.size)
         XCTAssertTrue(bounds.contains(rightAligned))
         let leftRail = PreviewGeometry.sideRailFrame(bounds: bounds, topInset: 8, bottomInset: 88, onLeft: true)
@@ -84,12 +84,38 @@ final class CaptureStoreTests: XCTestCase {
         let bounds = CGRect(x: 0, y: 0, width: 430, height: 466)
         let original = CGRect(x: 40.25, y: 0, width: 349.5, height: 466)
         let shifted = original.offsetBy(dx: PreviewGeometry.leadingOffset(image: original, bounds: bounds), dy: 0)
-        XCTAssertEqual(shifted.minX, 0)
+        XCTAssertEqual(shifted.minX, 20.125)
         XCTAssertEqual(shifted.size, original.size)
         XCTAssertTrue(bounds.contains(shifted))
         XCTAssertEqual(PreviewGeometry.leadingOffset(image: bounds, bounds: bounds), 0)
         XCTAssertEqual(PreviewGeometry.leadingOffset(image: .zero, bounds: bounds), 0)
         XCTAssertEqual(PreviewGeometry.leadingOffset(image: bounds.insetBy(dx: -10, dy: 0), bounds: bounds), 0)
+    }
+
+    func testBalancedPreviewPreservesBothEdgesInSingleDualAndInsetSizes() {
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 390, height: 760),
+                     CGSize(width: 430, height: 466), CGSize(width: 160, height: 220),
+                     CGSize(width: 844, height: 390)] {
+            let bounds = CGRect(origin: CGPoint(x: 12, y: 18), size: size)
+            for aspect in [CGFloat(3.0 / 4), CGFloat(9.0 / 16), CGFloat(4.0 / 3), CGFloat(16.0 / 9)] {
+                let width = min(bounds.width, bounds.height * aspect)
+                let height = width / aspect
+                let image = CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2,
+                                   width: width, height: height)
+                let margin = bounds.width - width
+                let offsets = [PreviewGeometry.leadingOffset(image: image, bounds: bounds),
+                               PreviewGeometry.trailingOffset(image: image, bounds: bounds)]
+                for offset in offsets {
+                    let shifted = image.offsetBy(dx: offset, dy: 0)
+                    XCTAssertEqual(shifted.size, image.size)
+                    XCTAssertGreaterThanOrEqual(shifted.minX - bounds.minX, margin / 4 - 0.001)
+                    XCTAssertGreaterThanOrEqual(bounds.maxX - shifted.maxX, margin / 4 - 0.001)
+                    XCTAssertLessThanOrEqual(abs(shifted.midX - bounds.midX), 32.001)
+                    XCTAssertEqual(shifted.minY, image.minY)
+                }
+                XCTAssertEqual(offsets[0], -offsets[1], accuracy: 0.001)
+            }
+        }
     }
 
     @MainActor func testShiftedPreviewRetainsCorrectLayerCoordinatesForFocus() {

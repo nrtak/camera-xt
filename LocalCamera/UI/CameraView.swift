@@ -1758,7 +1758,7 @@ struct CameraView: View {
         }
     }
     private let deviceChecks = [
-        "Controls: choose Left, then Right in App settings. Verify zoom and brightness remain reachable in Single and both Dual panes, with the complete image aligned opposite the rail. Enlarge each camera and test all four inset corners. Tiny inset controls should scroll instead of clipping.",
+        "Controls: choose Left, then Right in App settings. Verify zoom and brightness remain reachable in Single and both Dual panes, with balanced side margins and the complete image visible. Enlarge each camera and test all four inset corners. Tiny inset controls should scroll instead of clipping.",
         "Control explanations: hold each rail icon. An explanation should appear without changing its setting, lens or capture mode. Tap normally afterwards. Repeat with VoiceOver using Explain control, and verify the shutter still captures with a normal tap.",
         "Focus lock: hold to lock focus separately on each supported Dual lens. Rotate the phone: the lock indicator must remain accurate. Tap one lock to resume autofocus on that lens only, leaving the other lens and brightness unchanged. Fixed-focus lenses must not offer Unlock.",
         "Overlays: aim at bright white and dark scenes. Check that controls and messages remain readable without broad black panels covering either preview. Trigger both lens warnings and a panorama hint together. Collapse and restore controls; capture failures and recording state must remain visible.",
