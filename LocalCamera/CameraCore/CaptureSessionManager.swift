@@ -61,7 +61,7 @@ final class CameraDiagnostics {
                 self.load()
                 let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
                 let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
-                let header = "Camera XT \(version) (\(build)) · iOS \(ProcessInfo.processInfo.operatingSystemVersionString)\nLocal event history; not a crash report. Sampled memory may miss peaks.\ntransitionFinished and saved values: milliseconds. Error values: numeric codes. Thermal: 0 normal, 1 warm, 2 hot, 3 critical. Session events include temporary pauses for processing.\n"
+                let header = "Mikalens \(version) (\(build)) · iOS \(ProcessInfo.processInfo.operatingSystemVersionString)\nLocal event history; not a crash report. Sampled memory may miss peaks.\ntransitionFinished and saved values: milliseconds. Error values: numeric codes. Thermal: 0 normal, 1 warm, 2 hot, 3 critical. Session events include temporary pauses for processing.\n"
                 let warning = self.storageAvailable ? "" : "History could not be saved to disk; current events may be lost on exit.\n"
                 continuation.resume(returning: header + warning + self.history.entries.joined(separator: "\n"))
             }
