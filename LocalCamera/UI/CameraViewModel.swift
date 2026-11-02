@@ -549,6 +549,23 @@ final class CameraViewModel: ObservableObject {
         engine.focus(at: point, locked: locked, dualIndex: index, exposureOnly: exposurePointOnly)
     }
 
+    func unlockFocus(_ index: Int? = nil) {
+        guard camera.running, canConfigure, camera.dualEnabled == (index != nil) else { return }
+        if index == nil && controlsNeedApply {
+            flushPendingControls { [weak self] applied in
+                guard applied, let self, self.active else { return }
+                self.unlockFocus()
+            }
+            return
+        }
+        let target = index ?? 0
+        guard camera.focusStates.indices.contains(target), camera.focusStates[target] == "Focus locked",
+              camera.zooms.indices.contains(target) else { return }
+        let id = camera.zooms[target].deviceID
+        if index == nil { controls.automaticFocus = true; controls.facePriority = false }
+        engine.resumeAutoFocus(deviceID: id, dualIndex: index)
+    }
+
     func flushPendingControls(completion: ((Bool) -> Void)? = nil) {
         guard controlsNeedApply else { completion?(true); return }
         controlsTask?.cancel(); controlsTask = nil

@@ -8,6 +8,7 @@ struct CameraPreview: UIViewRepresentable {
     var onFocus: (CGPoint, Bool) -> Void
     var fillView = false
     var alignsImageLeading = false
+    var alignsImageTrailing = false
     var allowsFocus = true
     var secondary = false
     var showsFocusFeedback = true
@@ -23,6 +24,7 @@ struct CameraPreview: UIViewRepresentable {
     final class PreviewView: UIView {
         let previewLayer = AVCaptureVideoPreviewLayer()
         var alignsImageLeading = false
+        var alignsImageTrailing = false
         override init(frame: CGRect) {
             super.init(frame: frame)
             layer.addSublayer(previewLayer)
@@ -72,7 +74,8 @@ struct CameraPreview: UIViewRepresentable {
             let localBounds = CGRect(origin: .zero, size: bounds.size)
             if previewLayer.bounds != localBounds { previewLayer.bounds = localBounds }
             let fitted = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-            let offset = alignsImageLeading ? PreviewGeometry.leadingOffset(image: fitted, bounds: localBounds) : 0
+            let offset = alignsImageLeading ? PreviewGeometry.leadingOffset(image: fitted, bounds: localBounds) :
+                alignsImageTrailing ? PreviewGeometry.trailingOffset(image: fitted, bounds: localBounds) : 0
             let layerFrame = bounds.offsetBy(dx: offset, dy: 0)
             if previewLayer.frame != layerFrame { previewLayer.frame = layerFrame }
             CATransaction.commit()
@@ -170,6 +173,7 @@ struct CameraPreview: UIViewRepresentable {
         }
         view.clipsToBounds = true
         view.alignsImageLeading = alignsImageLeading
+        view.alignsImageTrailing = alignsImageTrailing
         view.imageFrameChanged = onImageFrame
         view.previewLayer.videoGravity = fillView ? .resizeAspectFill : .resizeAspect
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:)))
@@ -181,6 +185,7 @@ struct CameraPreview: UIViewRepresentable {
     }
     func updateUIView(_ view: PreviewView, context: Context) {
         view.alignsImageLeading = alignsImageLeading
+        view.alignsImageTrailing = alignsImageTrailing
         let gravity: AVLayerVideoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if view.previewLayer.videoGravity != gravity { view.previewLayer.videoGravity = gravity }
         context.coordinator.onFocus = onFocus
@@ -194,7 +199,7 @@ struct CameraPreview: UIViewRepresentable {
         context.coordinator.focusExclusionRects = focusExclusionRects
         context.coordinator.marker?.isHidden = !showsFocusFeedback
         if focusState == "Focus locked" { context.coordinator.marker?.text = "Locked" }
-        else if focusState == "Auto focus", context.coordinator.marker?.text == "Locked" { context.coordinator.marker?.removeFromSuperview() }
+        else if focusState == "Auto focus" || focusState == "Fixed focus", context.coordinator.marker?.text == "Locked" { view.clearFocusMarker() }
         if view.guide.image !== guideImage { view.guide.image = guideImage }
         view.grid.isHidden = !showsGrid
         view.updateOverlays()
@@ -231,13 +236,18 @@ enum PreviewGeometry {
         return bounds.minX - image.minX
     }
 
-    static func sideRailFrame(bounds: CGRect, topInset: CGFloat, bottomInset: CGFloat) -> CGRect {
+    static func trailingOffset(image: CGRect, bounds: CGRect) -> CGFloat {
+        guard isValid(image), isValid(bounds), bounds.contains(image) else { return 0 }
+        return bounds.maxX - image.maxX
+    }
+
+    static func sideRailFrame(bounds: CGRect, topInset: CGFloat, bottomInset: CGFloat, onLeft: Bool = false) -> CGRect {
         guard isValid(bounds), topInset.isFinite, bottomInset.isFinite else { return .zero }
         let top = min(bounds.maxY, bounds.minY + max(0, topInset) + 6)
         let bottom = max(top, bounds.maxY - max(0, bottomInset) - 6)
         let width = min(52, max(0, bounds.width - 12))
         guard bottom > top, width > 0 else { return .zero }
-        return CGRect(x: bounds.maxX - width - 6, y: top, width: width, height: bottom - top)
+        return CGRect(x: onLeft ? bounds.minX + 6 : bounds.maxX - width - 6, y: top, width: width, height: bottom - top)
     }
 
     /// Prefer letterbox space, then move onto the image, clear of global controls.
@@ -300,6 +310,12 @@ enum PreviewGeometry {
 }
 
 enum CameraChromePolicy {
+    static func pinsEssentials(height: CGFloat, count: Int) -> Bool {
+        guard height.isFinite, count > 0 else { return false }
+        let pinnedHeight = CGFloat(count) * 44 + CGFloat(count - 1) * 4
+        return height >= pinnedHeight + 68
+    }
+
     static func showsMessage(collapsed: Bool, brief: Bool, busy: Bool, pending: Bool) -> Bool {
         !collapsed || !brief || busy || pending
     }
