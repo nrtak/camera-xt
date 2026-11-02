@@ -15,7 +15,7 @@ class TestFlightUploadTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
 
-    def make_ipa(self, name="Mikalens.ipa", content=b"exported app"):
+    def make_ipa(self, name="Pixda.ipa", content=b"exported app"):
         path = self.directory / name
         path.write_bytes(content)
         return path
@@ -28,7 +28,7 @@ class TestFlightUploadTests(unittest.TestCase):
         return run.call_args.args[0]
 
     def test_renamed_app_with_spaces_is_uploaded_as_one_argument(self):
-        ipa = self.make_ipa("Mikalens Camera.ipa")
+        ipa = self.make_ipa("Pixda Camera.ipa")
         command = self.run_upload("UPLOAD SUCCEEDED with no errors\n")
         self.assertEqual(command[command.index("--file") + 1], str(ipa))
 
@@ -70,7 +70,7 @@ class TestFlightUploadTests(unittest.TestCase):
 
     def test_archive_receipt_is_accepted(self):
         self.make_ipa()
-        self.run_upload("No errors uploading archive at 'Mikalens.ipa'.\n")
+        self.run_upload("No errors uploading archive at 'Pixda.ipa'.\n")
 
 
 if __name__ == "__main__":
