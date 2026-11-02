@@ -1061,6 +1061,35 @@ final class CaptureSessionManager {
         }
     }
 
+    func resumeAutoFocus(deviceID: String, dualIndex: Int? = nil) {
+        queue.async {
+            guard self.wantsRunning, !self.burstRunning, self.processor == nil,
+                  self.movieProcessor == nil, !self.dual.busy else { return }
+            let device: AVCaptureDevice?
+            if self.snapshot.dualEnabled {
+                guard let index = dualIndex, self.dual.inputs.indices.contains(index) else { return }
+                device = self.dual.inputs[index].device
+            } else {
+                guard dualIndex == nil else { return }
+                device = self.input?.device
+            }
+            guard let device, device.uniqueID == deviceID,
+                  device.isFocusModeSupported(.continuousAutoFocus) || device.isFocusModeSupported(.autoFocus) else { return }
+            do {
+                try device.lockForConfiguration()
+                // Invalidate a pending delayed lock before restoring autofocus on this lens only.
+                self.focusRequests[device.uniqueID] = UUID()
+                device.focusMode = device.isFocusModeSupported(.continuousAutoFocus) ? .continuousAutoFocus : .autoFocus
+                device.unlockForConfiguration()
+                if !self.snapshot.dualEnabled {
+                    self.controls.automaticFocus = true
+                    self.controls.facePriority = false
+                }
+                self.publish()
+            } catch { self.publish(message: error.localizedDescription) }
+        }
+    }
+
     private func finishFocusLock(_ device: AVCaptureDevice, request: UUID, attempts: Int) {
         queue.asyncAfter(deadline: .now() + 0.15) {
             guard self.focusRequests[device.uniqueID] == request, self.wantsRunning,
@@ -1371,8 +1400,11 @@ final class CaptureSessionManager {
         let thermal = ProcessInfo.processInfo.thermalState
         snapshot.cooling = thermal == .serious || thermal == .critical
         let activeDevices = snapshot.dualEnabled ? dual.inputs.map(\.device) : [input?.device].compactMap { $0 }
-        snapshot.focusStates = activeDevices.map { $0.isAdjustingFocus ? "Focusing…" : $0.focusMode == .locked ? "Focus locked" : "Auto focus" }
-        snapshot.focusLocked = activeDevices.contains { $0.focusMode == .locked }
+        snapshot.focusStates = activeDevices.map {
+            CameraFocusStatus.label(automaticAvailable: $0.isFocusModeSupported(.continuousAutoFocus) || $0.isFocusModeSupported(.autoFocus),
+                                    adjusting: $0.isAdjustingFocus, locked: $0.focusMode == .locked)
+        }
+        snapshot.focusLocked = snapshot.focusStates.contains("Focus locked")
         guard let device = snapshot.dualEnabled ? dual.inputs.first?.device : input?.device else { return }
         let seconds = CMTimeGetSeconds(device.exposureDuration)
         let shutter = seconds > 0 && seconds < 1 ? "1/\(Int((1 / seconds).rounded()))" : String(format: "%.1f s", seconds)
@@ -1928,6 +1960,14 @@ struct FocusSettlingWindow {
         if let idleSince, now - idleSince >= 0.1 { return .ready }
         if now - startedAt >= 1 { return .timedOut }
         return .wait
+    }
+}
+
+enum CameraFocusStatus {
+    static func label(automaticAvailable: Bool, adjusting: Bool, locked: Bool) -> String {
+        if !automaticAvailable { return "Fixed focus" }
+        if adjusting { return "Focusing…" }
+        return locked ? "Focus locked" : "Auto focus"
     }
 }
 
