@@ -4,6 +4,83 @@ import UIKit
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testInsetCameraNeverCoversMainRailInAnyPortraitCorner() {
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 390, height: 760), CGSize(width: 430, height: 932)] {
+            let bounds = CGRect(origin: .zero, size: size)
+            let originalRail = PreviewGeometry.sideRailFrame(bounds: bounds, topInset: 8, bottomInset: 142)
+            for corner in 0..<4 {
+                let inset = PreviewGeometry.pictureInPictureFrame(bounds: bounds, corner: corner, topInset: 8, bottomInset: 142)
+                let rail = PreviewGeometry.avoidingOverlay(rail: originalRail, overlay: inset)
+                XCTAssertTrue(bounds.contains(inset))
+                XCTAssertTrue(bounds.contains(rail))
+                XCTAssertGreaterThanOrEqual(rail.height, 44)
+                XCTAssertFalse(rail.intersects(inset))
+                if corner % 2 == 0 { XCTAssertEqual(rail, originalRail) }
+            }
+        }
+        XCTAssertEqual(PreviewGeometry.pictureInPictureFrame(bounds: .zero, corner: 0, topInset: 8, bottomInset: 8), .zero)
+        let rail = CGRect(x: 100, y: 10, width: 52, height: 44)
+        XCTAssertEqual(PreviewGeometry.avoidingOverlay(rail: rail, overlay: rail), .zero)
+    }
+
+    func testCollapsedControlsStillShowCaptureFailuresAndRecoveryMessages() {
+        XCTAssertTrue(CameraChromePolicy.showsMessage(collapsed: true, brief: false, busy: false, pending: false))
+        XCTAssertTrue(CameraChromePolicy.showsMessage(collapsed: true, brief: true, busy: true, pending: false))
+        XCTAssertTrue(CameraChromePolicy.showsMessage(collapsed: true, brief: true, busy: false, pending: true))
+        XCTAssertFalse(CameraChromePolicy.showsMessage(collapsed: true, brief: true, busy: false, pending: false))
+        XCTAssertTrue(CameraChromePolicy.showsMessage(collapsed: false, brief: true, busy: false, pending: false))
+        XCTAssertFalse(CameraViewModel.isBriefStatus("No burst photos were returned. Try again."))
+    }
+
+    func testSideRailUsesOneMarginAndNeverExtendsBeyondItsPane() {
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 430, height: 466), CGSize(width: 160, height: 220)] {
+            let bounds = CGRect(origin: .zero, size: size)
+            let rail = PreviewGeometry.sideRailFrame(bounds: bounds, topInset: 8, bottomInset: 88)
+            XCTAssertTrue(bounds.contains(rail))
+            XCTAssertEqual(rail.maxX, bounds.maxX - 6)
+            XCTAssertEqual(rail.width, 52)
+            XCTAssertLessThanOrEqual(rail.maxY, bounds.maxY - 88)
+            XCTAssertFalse(PreviewGeometry.acceptsFocus(at: CGPoint(x: rail.midX, y: rail.midY), bounds: bounds,
+                controlStripHeight: 88, exclusionRects: [rail]))
+            XCTAssertTrue(PreviewGeometry.acceptsFocus(at: CGPoint(x: 30, y: rail.midY), bounds: bounds,
+                controlStripHeight: 88, exclusionRects: [rail]))
+        }
+        XCTAssertEqual(PreviewGeometry.sideRailFrame(bounds: .zero, topInset: 0, bottomInset: 0), .zero)
+        XCTAssertEqual(PreviewGeometry.sideRailFrame(bounds: CGRect(x: 0, y: 0, width: 320, height: 100), topInset: 20, bottomInset: 88), .zero)
+    }
+
+    func testLeadingAlignmentPreservesImageSizeAndFullFrame() {
+        let bounds = CGRect(x: 0, y: 0, width: 430, height: 466)
+        let original = CGRect(x: 40.25, y: 0, width: 349.5, height: 466)
+        let shifted = original.offsetBy(dx: PreviewGeometry.leadingOffset(image: original, bounds: bounds), dy: 0)
+        XCTAssertEqual(shifted.minX, 0)
+        XCTAssertEqual(shifted.size, original.size)
+        XCTAssertTrue(bounds.contains(shifted))
+        XCTAssertEqual(PreviewGeometry.leadingOffset(image: bounds, bounds: bounds), 0)
+        XCTAssertEqual(PreviewGeometry.leadingOffset(image: .zero, bounds: bounds), 0)
+        XCTAssertEqual(PreviewGeometry.leadingOffset(image: bounds.insetBy(dx: -10, dy: 0), bounds: bounds), 0)
+    }
+
+    @MainActor func testShiftedPreviewRetainsCorrectLayerCoordinatesForFocus() {
+        let view = CameraPreview.PreviewView(frame: CGRect(x: 0, y: 0, width: 430, height: 466))
+        view.previewLayer.frame = view.bounds.offsetBy(dx: -40, dy: 0)
+        let tappedPoint = CGPoint(x: 50, y: 100)
+        let layerPoint = view.previewLayer.convert(tappedPoint, from: view.layer)
+        XCTAssertEqual(layerPoint.x, 90, accuracy: 0.01)
+        XCTAssertEqual(layerPoint.y, 100, accuracy: 0.01)
+        XCTAssertEqual(view.previewLayer.convert(layerPoint, to: view.layer), tappedPoint)
+    }
+
+    func testChromeSwipeRequiresDeliberateVerticalMovementAndKeepsStitchActionsReachable() {
+        XCTAssertTrue(CameraChromePolicy.collapsed(after: CGSize(width: 5, height: 45), current: false, canCollapse: true))
+        XCTAssertFalse(CameraChromePolicy.collapsed(after: CGSize(width: 5, height: -45), current: true, canCollapse: true))
+        XCTAssertFalse(CameraChromePolicy.collapsed(after: CGSize(width: 60, height: 40), current: false, canCollapse: true))
+        XCTAssertFalse(CameraChromePolicy.collapsed(after: CGSize(width: 0, height: 27), current: false, canCollapse: true))
+        XCTAssertFalse(CameraChromePolicy.collapsed(after: CGSize(width: 0, height: 45), current: false, canCollapse: false))
+        XCTAssertFalse(CameraChromePolicy.collapsed(after: CGSize(width: CGFloat.nan, height: 45), current: false, canCollapse: true))
+        XCTAssertTrue(CameraChromePolicy.collapsed(after: CGSize(width: 50, height: 5), current: true, canCollapse: true))
+    }
+
     func testEditorsFallBackWhenLandscapeSpaceOrPanelWidthIsInsufficient() {
         let landscapePanel = CGRect(x: 0, y: 0, width: 420, height: 300)
         // The per-lens row plus brightness editor cannot fit in the 82pt gap.
