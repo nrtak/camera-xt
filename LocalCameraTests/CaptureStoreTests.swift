@@ -25,7 +25,7 @@ final class CaptureStoreTests: XCTestCase {
             }
         }
         XCTAssertEqual(PhotoAspectRatio.wide.cropRect(in: .zero), .zero)
-        XCTAssertEqual(PhotoAspectRatio.square.cropRect(in: CGRect(x: 0, y: 0, width: .infinity, height: 1)), .zero)
+        XCTAssertEqual(PhotoAspectRatio.square.cropRect(in: CGRect(x: 0, y: 0, width: CGFloat.infinity, height: 1)), .zero)
         XCTAssertNil(PhotoAspectRatio.wide.pixelCropRect(width: 0, height: 300))
         XCTAssertNil(PhotoAspectRatio.wide.pixelCropRect(width: 1, height: 1))
     }
