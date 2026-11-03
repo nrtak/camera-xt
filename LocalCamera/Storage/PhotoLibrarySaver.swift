@@ -47,13 +47,16 @@ actor CaptureStore {
         let height: Int32
         let label: String
         let details: CaptureDetails?
+        let aspectRatio: String?
         init(_ photo: CapturedPhoto, index: Int) {
             data = photo.data; width = photo.dimensions.width; height = photo.dimensions.height
             details = photo.details
+            aspectRatio = photo.aspectRatio.rawValue
             label = photo.lensLabel ?? "Photo \(index + 1)"
         }
         var captured: CapturedPhoto {
-            CapturedPhoto(data: data, dimensions: CMVideoDimensions(width: width, height: height), lensLabel: label, details: details)
+            CapturedPhoto(data: data, dimensions: CMVideoDimensions(width: width, height: height), lensLabel: label, details: details,
+                          aspectRatio: PhotoAspectRatio(rawValue: aspectRatio ?? "") ?? .full)
         }
     }
     struct Record: Codable {

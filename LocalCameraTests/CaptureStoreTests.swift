@@ -1,9 +1,156 @@
 import XCTest
 import AVFoundation
 import UIKit
+import ImageIO
+import UniformTypeIdentifiers
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testAspectCropsFitBothOrientationsWithoutUpscaling() throws {
+        for size in [CGSize(width: 4032, height: 3024), CGSize(width: 3024, height: 4032), CGSize(width: 301, height: 403)] {
+            let bounds = CGRect(origin: CGPoint(x: 13, y: 27), size: size)
+            XCTAssertEqual(PhotoAspectRatio.full.cropRect(in: bounds), bounds)
+            for aspect in [PhotoAspectRatio.square, .wide] {
+                let crop = aspect.cropRect(in: bounds)
+                XCTAssertTrue(bounds.contains(crop))
+                XCTAssertEqual(crop.midX, bounds.midX, accuracy: 0.0001)
+                XCTAssertEqual(crop.midY, bounds.midY, accuracy: 0.0001)
+                let pixels = try XCTUnwrap(aspect.pixelCropRect(width: Int(size.width), height: Int(size.height)))
+                XCTAssertTrue(CGRect(origin: .zero, size: size).contains(pixels))
+                let ratio: CGFloat = aspect == .square ? 1 : size.width < size.height ? 9.0 / 16 : 16.0 / 9
+                XCTAssertEqual(crop.width / crop.height, ratio, accuracy: 0.00001)
+                XCTAssertEqual(pixels.width / pixels.height, ratio, accuracy: 0.00001)
+                XCTAssertEqual(pixels.minX.rounded(.down), pixels.minX)
+                XCTAssertEqual(pixels.minY.rounded(.down), pixels.minY)
+            }
+        }
+        XCTAssertEqual(PhotoAspectRatio.wide.cropRect(in: .zero), .zero)
+        XCTAssertEqual(PhotoAspectRatio.square.cropRect(in: CGRect(x: 0, y: 0, width: .infinity, height: 1)), .zero)
+        XCTAssertNil(PhotoAspectRatio.wide.pixelCropRect(width: 0, height: 300))
+        XCTAssertNil(PhotoAspectRatio.wide.pixelCropRect(width: 1, height: 1))
+    }
+
+    func testCenteredAspectFitUsesTheMaximumAvailableArea() {
+        for bounds in [CGRect(x: 0, y: 0, width: 430, height: 932), CGRect(x: 8, y: 10, width: 844, height: 390)] {
+            for size in [CGSize(width: 3, height: 4), CGSize(width: 9, height: 16), CGSize(width: 1, height: 1)] {
+                let fitted = PreviewGeometry.fittedFrame(size: size, bounds: bounds)
+                XCTAssertEqual(fitted.midX, bounds.midX, accuracy: 0.0001)
+                XCTAssertEqual(fitted.midY, bounds.midY, accuracy: 0.0001)
+                XCTAssertLessThanOrEqual(fitted.width, bounds.width + 0.0001)
+                XCTAssertLessThanOrEqual(fitted.height, bounds.height + 0.0001)
+                XCTAssertTrue(abs(fitted.width - bounds.width) < 0.0001 || abs(fitted.height - bounds.height) < 0.0001)
+                XCTAssertEqual(fitted.width / fitted.height, size.width / size.height, accuracy: 0.0001)
+            }
+        }
+        XCTAssertEqual(PreviewGeometry.fittedFrame(size: .zero, bounds: CGRect(x: 0, y: 0, width: 430, height: 932)), .zero)
+    }
+
+    func testLensControlsStayInTheirOwnImageColumnAndAvoidInsetCamera() {
+        let bounds = CGRect(x: 0, y: 0, width: 430, height: 932)
+        let image = CGRect(x: 40, y: 0, width: 350, height: 932)
+        let bottom = PreviewGeometry.lensControlFrame(image: image, bounds: bounds, topInset: 60, bottomInset: 150)
+        XCTAssertGreaterThanOrEqual(bottom.minX, image.minX)
+        XCTAssertLessThanOrEqual(bottom.maxX, image.maxX)
+        XCTAssertEqual(bottom.height, 44)
+        let alternate = PreviewGeometry.lensControlFrame(image: image, bounds: bounds, topInset: 60, bottomInset: 150, obscured: bottom)
+        XCTAssertFalse(alternate.intersects(bottom))
+        XCTAssertGreaterThanOrEqual(alternate.minY, 60)
+        XCTAssertEqual(PreviewGeometry.lensControlFrame(image: image, bounds: bounds, topInset: 60, bottomInset: 150, obscured: bounds), .zero)
+        XCTAssertEqual(PreviewGeometry.lensControlFrame(image: image, bounds: bounds, topInset: 900, bottomInset: 0), .zero)
+    }
+
+    func testDualEditorFallsBackToSheetWhenInsetOrShortPaneBlocksIt() {
+        let bounds = CGRect(x: 0, y: 0, width: 430, height: 700)
+        let inset = CGRect(x: 240, y: 290, width: 180, height: 310)
+        XCTAssertTrue(PreviewGeometry.editorFits(bounds: bounds, topInset: 140, bottomInset: 100, height: 300))
+        let occluded = PreviewGeometry.lensControlFrame(image: bounds, bounds: bounds, topInset: 140, bottomInset: 100, height: 300, obscured: inset)
+        XCTAssertEqual(occluded, .zero)
+        XCTAssertFalse(PreviewGeometry.editorFits(frame: occluded, height: 300))
+        let clipped = PreviewGeometry.lensControlFrame(image: bounds, bounds: bounds, topInset: 400, bottomInset: 150, height: 190)
+        XCTAssertEqual(clipped, .zero, "An editor must not be placed in a shorter frame")
+        XCTAssertFalse(PreviewGeometry.editorFits(frame: CGRect(x: 0, y: 0, width: 210, height: 300), height: 190))
+        XCTAssertTrue(PreviewGeometry.editorFits(frame: CGRect(x: 0, y: 0, width: 300, height: 190), height: 190))
+    }
+
+    func testCropStopsBeforeDecodingUnderMemoryPressureAndFullStillPassesThrough() async throws {
+        let work = NightWorkCancellation(); work.cancel()
+        let original = photo()
+        do {
+            _ = try await PhotoAspectRenderer.render(original.framed(aspect: .wide), cancellation: work)
+            XCTFail("Cancelled crop must not decode the image")
+        } catch PhotoAspectRenderer.CropError.memoryPressure { }
+        let full = try await PhotoAspectRenderer.render(original, cancellation: work)
+        XCTAssertEqual(full.data, original.data)
+    }
+
+    func testFullAspectPreservesOriginalAndPairedBytesWithoutDecoding() async throws {
+        var original = photo(bytes: [0, 1, 2, 3]) // Deliberately not an encoded image.
+        original.companions = [photo("Second", bytes: [4, 5, 6])]
+        let result = try await PhotoAspectRenderer.render(original)
+        XCTAssertEqual(result.data, original.data)
+        XCTAssertEqual(result.companions.first?.data, original.companions.first?.data)
+        XCTAssertEqual(result.dimensions.width, original.dimensions.width)
+        XCTAssertEqual(result.companions.first?.aspectRatio, .full)
+    }
+
+    private func aspectFixture(width: Int, height: Int, orientation: Int = 1) throws -> CapturedPhoto {
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: CGFloat(width), height: CGFloat(height)), format: format).image { context in
+            UIColor.green.setFill(); context.fill(CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+        }
+        let data = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(image.cgImage), [
+            kCGImagePropertyOrientation: orientation,
+            kCGImagePropertyExifDictionary: [kCGImagePropertyExifISOSpeedRatings: [125]]
+        ] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return CapturedPhoto(data: data as Data, dimensions: CMVideoDimensions(width: Int32(width), height: Int32(height)))
+    }
+
+    func testWidePairedExportKeepsOrientationMetadataAndIsRetrySafe() async throws {
+        var original = try aspectFixture(width: 403, height: 301, orientation: 6)
+        original.companions = [try aspectFixture(width: 301, height: 403)]
+        let rendered = try await PhotoAspectRenderer.render(original.framed(aspect: .wide))
+        XCTAssertEqual(rendered.dimensions.width, 400)
+        XCTAssertEqual(rendered.dimensions.height, 225)
+        XCTAssertEqual(rendered.companions.first?.dimensions.width, 225)
+        XCTAssertEqual(rendered.companions.first?.dimensions.height, 400)
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(rendered.data as CFData, nil))
+        let metadata = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any])
+        XCTAssertEqual((metadata[kCGImagePropertyOrientation as String] as? NSNumber)?.intValue, 6)
+        let exif = try XCTUnwrap(metadata[kCGImagePropertyExifDictionary as String] as? [String: Any])
+        XCTAssertEqual((exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber])?.first?.intValue, 125)
+        let preview = await CapturePreviewDecoder.image(rendered.data, maxSize: 1000)
+        XCTAssertEqual(preview?.cgImage?.width, 225)
+        XCTAssertEqual(preview?.cgImage?.height, 400)
+        let retried = try await PhotoAspectRenderer.render(rendered)
+        XCTAssertEqual(retried.data, rendered.data, "Retry must not re-encode an already prepared crop")
+        XCTAssertEqual(retried.companions.first?.data, rendered.companions.first?.data)
+        let square = try await PhotoAspectRenderer.render(original.framed(aspect: .square))
+        XCTAssertEqual(square.dimensions.width, 301)
+        XCTAssertEqual(square.dimensions.height, 301)
+    }
+
+    func testCropRecoverySurvivesRelaunchAndOlderJournalsDefaultToFull() async throws {
+        let original = photo().framed(aspect: .wide)
+        try await CaptureStore(root: root).stage(original)
+        let restored = try await CaptureStore(root: root).load("pending.plist")
+        XCTAssertEqual(restored?.captured?.aspectRatio, .wide)
+        do { _ = try await PhotoAspectRenderer.render(original); XCTFail("Invalid encoded pixels must fail safely") }
+        catch { }
+        let protected = try await CaptureStore(root: root).load("pending.plist")
+        XCTAssertEqual(protected?.captured?.data, original.data)
+        XCTAssertEqual(protected?.captured?.aspectRatio, .wide)
+        let encoded = try PropertyListEncoder().encode(CaptureStore.Photo(original, index: 0))
+        var legacy = try XCTUnwrap(PropertyListSerialization.propertyList(from: encoded, format: nil) as? [String: Any])
+        legacy.removeValue(forKey: "aspectRatio")
+        let data = try PropertyListSerialization.data(fromPropertyList: legacy, format: .binary, options: 0)
+        let decoded = try PropertyListDecoder().decode(CaptureStore.Photo.self, from: data)
+        XCTAssertEqual(decoded.captured.aspectRatio, .full)
+        XCTAssertEqual(decoded.data, original.data)
+    }
+
     func testRailSideAndImageAlignmentPreserveTheWholeFrame() {
         let bounds = CGRect(x: 0, y: 0, width: 430, height: 466)
         let original = CGRect(x: 40.25, y: 0, width: 349.5, height: 466)
@@ -605,8 +752,11 @@ final class CaptureStoreTests: XCTestCase {
         }
         XCTAssertFalse(model.restoring, "Recovery loading must complete before testing mode changes")
         XCTAssertTrue(model.canConfigure)
+        model.selectPhotoAspect(.wide)
         model.enablePanorama()
         XCTAssertTrue(model.panoramaSelected)
+        XCTAssertEqual(model.photoAspect, .wide, "Temporary mode changes must retain the photo framing choice")
+        XCTAssertEqual(model.effectivePhotoAspect, .full, "Pano must not use the photo crop")
         model.exposureBias = 1
         model.chooseCaptureMode(1)
         XCTAssertEqual(model.exposureBias, 1, "Selecting the current mode must not reset adjustments")
@@ -616,10 +766,14 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertEqual(model.captureStyle, "Auto")
         model.chooseCaptureMode(0)
         XCTAssertFalse(model.panoramaSelected)
+        XCTAssertEqual(model.effectivePhotoAspect, .wide)
         model.enableLongExposure()
         XCTAssertEqual(model.captureStyle, "Long Exposure")
         model.setDualEnabled(true)
         XCTAssertEqual(model.captureStyle, "Auto")
+        XCTAssertEqual(model.photoAspect, .wide, "Dropping a Single-only style must not reset framing")
+        model.resetControls()
+        XCTAssertEqual(model.photoAspect, .full, "An explicit reset restores the original framing")
         model.setActive(false)
     }
 
@@ -784,6 +938,7 @@ final class CaptureStoreTests: XCTestCase {
             depth: false, eye: false, analysis: "Off", exposurePointOnly: false)
         setup.panorama = true; setup.panoramaMethod = "Stitch"; setup.panoramaDirection = "Left"
         setup.longExposureStyle = LongExposureStyle.trails.rawValue; setup.longExposureSeconds = 120
+        setup.photoAspect = PhotoAspectRatio.wide.rawValue
         let data = try JSONEncoder().encode(setup)
         let restored = try JSONDecoder().decode(SavedCameraSetup.self, from: data)
         XCTAssertEqual(restored.panorama, true)
@@ -791,18 +946,20 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertEqual(restored.panoramaDirection, "Left")
         XCTAssertEqual(restored.longExposureStyle, LongExposureStyle.trails.rawValue)
         XCTAssertEqual(restored.longExposureSeconds, 120)
+        XCTAssertEqual(restored.photoAspect, PhotoAspectRatio.wide.rawValue)
         XCTAssertEqual(restored, setup)
         var changed = restored; changed.longExposureSeconds = 300
         XCTAssertNotEqual(changed, setup, "Preference comparisons must notice duration edits")
         changed = restored; changed.controls.iso += 1
         XCTAssertNotEqual(changed, setup, "Preference comparisons must notice manual control edits")
         var old = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        for key in ["panorama", "panoramaMethod", "panoramaDirection", "longExposureStyle", "longExposureSeconds"] { old.removeValue(forKey: key) }
+        for key in ["panorama", "panoramaMethod", "panoramaDirection", "longExposureStyle", "longExposureSeconds", "photoAspect"] { old.removeValue(forKey: key) }
         old["style"] = "Panorama"
         let legacy = try JSONDecoder().decode(SavedCameraSetup.self, from: JSONSerialization.data(withJSONObject: old))
         XCTAssertNil(legacy.panorama)
         XCTAssertNil(legacy.longExposureStyle)
         XCTAssertNil(legacy.longExposureSeconds)
+        XCTAssertNil(legacy.photoAspect)
         XCTAssertEqual(legacy.style, "Panorama")
     }
 

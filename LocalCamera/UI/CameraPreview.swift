@@ -7,6 +7,7 @@ struct CameraPreview: UIViewRepresentable {
     let engine: CaptureSessionManager
     var onFocus: (CGPoint, Bool) -> Void
     var fillView = false
+    var aspectRatio: PhotoAspectRatio = .full
     var alignsImageLeading = false
     var alignsImageTrailing = false
     var allowsFocus = true
@@ -25,6 +26,8 @@ struct CameraPreview: UIViewRepresentable {
         let previewLayer = AVCaptureVideoPreviewLayer()
         var alignsImageLeading = false
         var alignsImageTrailing = false
+        var aspectRatio: PhotoAspectRatio = .full
+        private let imageMask = CAShapeLayer()
         override init(frame: CGRect) {
             super.init(frame: frame)
             layer.addSublayer(previewLayer)
@@ -33,7 +36,7 @@ struct CameraPreview: UIViewRepresentable {
         let grid = CAShapeLayer()
         let guide = UIImageView()
         private var gridFrame = CGRect.null
-        private var visibleImageFrame = CGRect.zero
+        private(set) var visibleImageFrame = CGRect.zero
         weak var focusMarker: UILabel?
         private var markerBounds = CGRect.null
         var imageFrameChanged: ((CGRect) -> Void)?
@@ -68,21 +71,43 @@ struct CameraPreview: UIViewRepresentable {
             }
         }
         func updateOverlays() {
-            // Balance the side margin without pushing the full image against an edge.
-            // Keep the layer's size and aspect-fit gravity; focus uses this same layer.
+            // Fit the selected composition, rather than cropping an already-small
+            // full-frame preview. This lets 16:9 use the tall display honestly.
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             let localBounds = CGRect(origin: .zero, size: bounds.size)
+            previewLayer.setAffineTransform(.identity)
             if previewLayer.bounds != localBounds { previewLayer.bounds = localBounds }
             let fitted = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-            let offset = alignsImageLeading ? PreviewGeometry.leadingOffset(image: fitted, bounds: localBounds) :
-                alignsImageTrailing ? PreviewGeometry.trailingOffset(image: fitted, bounds: localBounds) : 0
-            let layerFrame = bounds.offsetBy(dx: offset, dy: 0)
-            if previewLayer.frame != layerFrame { previewLayer.frame = layerFrame }
+            let crop = aspectRatio.cropRect(in: fitted)
+            var displayed = PreviewGeometry.fittedFrame(size: crop.size, bounds: bounds)
+            guard PreviewGeometry.isValid(crop), PreviewGeometry.isValid(displayed) else {
+                previewLayer.isHidden = true
+                CATransaction.commit()
+                grid.path = nil; guide.frame = .zero; gridFrame = .null
+                clearFocusMarker(); publishImageFrame(.zero)
+                return
+            }
+            previewLayer.isHidden = false
+            if aspectRatio == .full {
+                let offset = alignsImageLeading ? PreviewGeometry.leadingOffset(image: displayed, bounds: bounds) :
+                    alignsImageTrailing ? PreviewGeometry.trailingOffset(image: displayed, bounds: bounds) : 0
+                displayed = displayed.offsetBy(dx: offset, dy: 0)
+            }
+            let scale = displayed.width / crop.width
+            previewLayer.position = CGPoint(x: displayed.minX + (localBounds.midX - crop.minX) * scale,
+                                            y: displayed.minY + (localBounds.midY - crop.minY) * scale)
+            previewLayer.setAffineTransform(CGAffineTransform(scaleX: scale, y: scale))
+            if aspectRatio == .full { previewLayer.mask = nil }
+            else {
+                imageMask.frame = localBounds
+                imageMask.path = UIBezierPath(rect: crop).cgPath
+                previewLayer.mask = imageMask
+            }
             CATransaction.commit()
             if grid.superlayer == nil { layer.addSublayer(grid) }
             if guide.superview == nil { guide.isUserInteractionEnabled = false; guide.contentMode = .scaleAspectFit; addSubview(guide) }
-            let frame = previewLayer.convert(previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1)), to: layer)
+            let frame = previewLayer.convert(crop, to: layer)
             guard PreviewGeometry.isValid(frame) else {
                 clearFocusMarker()
                 grid.path = nil; guide.frame = .zero; gridFrame = .null
@@ -94,6 +119,8 @@ struct CameraPreview: UIViewRepresentable {
             clearFocusMarker()
             gridFrame = frame
             guide.frame = frame
+            guide.clipsToBounds = true
+            guide.contentMode = .scaleAspectFill
             let path = UIBezierPath()
             for fraction in [CGFloat(1.0 / 3), CGFloat(2.0 / 3)] {
                 let x = frame.minX + frame.width * fraction, y = frame.minY + frame.height * fraction
@@ -131,7 +158,7 @@ struct CameraPreview: UIViewRepresentable {
             // Overlay controls own this strip, including gaps and disabled buttons.
             guard PreviewGeometry.acceptsFocus(at: point, bounds: view.bounds, controlStripHeight: controlStripHeight,
                 topControlStripHeight: topControlStripHeight, exclusionRects: focusExclusionRects) else { return }
-            let videoRect = view.previewLayer.convert(view.previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1)), to: view.layer)
+            let videoRect = view.visibleImageFrame
             guard PreviewGeometry.isValid(videoRect), point.x.isFinite, point.y.isFinite, videoRect.contains(point) else { return }
             let layerPoint = view.previewLayer.convert(point, from: view.layer)
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: layerPoint)
@@ -175,6 +202,7 @@ struct CameraPreview: UIViewRepresentable {
         view.clipsToBounds = true
         view.alignsImageLeading = alignsImageLeading
         view.alignsImageTrailing = alignsImageTrailing
+        view.aspectRatio = aspectRatio
         view.imageFrameChanged = onImageFrame
         view.previewLayer.videoGravity = fillView ? .resizeAspectFill : .resizeAspect
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap(_:)))
@@ -187,6 +215,7 @@ struct CameraPreview: UIViewRepresentable {
     func updateUIView(_ view: PreviewView, context: Context) {
         view.alignsImageLeading = alignsImageLeading
         view.alignsImageTrailing = alignsImageTrailing
+        view.aspectRatio = aspectRatio
         let gravity: AVLayerVideoGravity = fillView ? .resizeAspectFill : .resizeAspect
         if view.previewLayer.videoGravity != gravity { view.previewLayer.videoGravity = gravity }
         context.coordinator.onFocus = onFocus
@@ -209,6 +238,25 @@ struct CameraPreview: UIViewRepresentable {
 
 /// Reject transient invalid camera geometry before assigning CALayer/UIView frames.
 enum PreviewGeometry {
+    static func fittedFrame(size: CGSize, bounds: CGRect) -> CGRect {
+        guard isValid(bounds), size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return .zero }
+        let scale = min(bounds.width / size.width, bounds.height / size.height)
+        let width = size.width * scale, height = size.height * scale
+        return CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
+    }
+
+    static func lensControlFrame(image: CGRect, bounds: CGRect, topInset: CGFloat, bottomInset: CGFloat,
+                                 height: CGFloat = 44, obscured: CGRect = .zero) -> CGRect {
+        let visible = image.intersection(bounds)
+        guard isValid(visible), visible.width >= 56 else { return .zero }
+        let column = CGRect(x: visible.minX, y: bounds.minY, width: visible.width, height: bounds.height)
+        let preferred = controlFrame(image: visible, bounds: column, topInset: topInset, bottomInset: bottomInset, height: height, atTop: false)
+        guard isValid(preferred), preferred.height + 0.5 >= height else { return .zero }
+        if !preferred.intersects(obscured) { return preferred }
+        let alternate = controlFrame(image: visible, bounds: column, topInset: topInset, bottomInset: bottomInset, height: height, atTop: true)
+        return isValid(alternate) && alternate.height + 0.5 >= height && !alternate.intersects(obscured) ? alternate : .zero
+    }
+
     static func pictureInPictureFrame(bounds: CGRect, corner: Int, topInset: CGFloat, bottomInset: CGFloat) -> CGRect {
         guard isValid(bounds), topInset.isFinite, bottomInset.isFinite, corner >= 0, corner < 4 else { return .zero }
         let top = min(bounds.maxY, bounds.minY + max(8, topInset))
@@ -312,6 +360,10 @@ enum PreviewGeometry {
         let available = controlFrame(image: .zero, bounds: bounds, topInset: topInset,
                                      bottomInset: bottomInset, height: height, atTop: true)
         return isValid(available) && available.height + 0.5 >= height && available.width >= 220
+    }
+
+    static func editorFits(frame: CGRect, height: CGFloat) -> Bool {
+        isValid(frame) && height.isFinite && height > 0 && frame.height + 0.5 >= height && frame.width >= 220
     }
 }
 

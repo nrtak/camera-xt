@@ -63,6 +63,7 @@ struct SavedCameraSetup: Codable, Equatable {
     var panoramaDirection: String? = nil
     var longExposureStyle: String? = nil
     var longExposureSeconds: Double? = nil
+    var photoAspect: String? = nil
 }
 
 @MainActor
@@ -146,7 +147,7 @@ final class ViewfinderGuideState: ObservableObject {
 enum CapturePreviewDecoder {
     private static let queue = DispatchQueue(label: "camera.preview.decode", qos: .userInitiated)
 
-    static func image(_ data: Data, maxSize: Int) async -> UIImage? {
+    static func image(_ data: Data, maxSize: Int, aspect: PhotoAspectRatio = .full) async -> UIImage? {
         await withCheckedContinuation { continuation in
             queue.async {
                 let image: UIImage? = autoreleasepool {
@@ -158,7 +159,10 @@ enum CapturePreviewDecoder {
                             kCGImageSourceShouldCacheImmediately: true,
                             kCGImageSourceThumbnailMaxPixelSize: maxSize
                           ] as CFDictionary) else { return nil }
-                    return UIImage(cgImage: cg)
+                    guard aspect != .full else { return UIImage(cgImage: cg) }
+                    guard let crop = aspect.pixelCropRect(width: cg.width, height: cg.height),
+                          let framed = cg.cropping(to: crop) else { return nil }
+                    return UIImage(cgImage: framed)
                 }
                 continuation.resume(returning: image)
             }
@@ -203,7 +207,8 @@ final class CameraViewModel: ObservableObject {
             stabilization: stabilization, depth: camera.depthEnabled, eye: camera.eyeFocusEnabled,
             analysis: camera.analysisMode, exposurePointOnly: exposurePointOnly,
             panorama: panoramaSelected, panoramaMethod: panoramaMethod.rawValue, panoramaDirection: panoramaDirection.rawValue,
-            longExposureStyle: longExposureStyle.rawValue, longExposureSeconds: LongExposureLimits.duration(longExposureSeconds))
+            longExposureStyle: longExposureStyle.rawValue, longExposureSeconds: LongExposureLimits.duration(longExposureSeconds),
+            photoAspect: photoAspect.rawValue)
         guard setup != lastObservedSetup else { return }
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
         if let data = try? encoder.encode(setup), data != lastSavedSetup {
@@ -236,6 +241,7 @@ final class CameraViewModel: ObservableObject {
             }
         }
         launchSetup = nil
+        photoAspect = saved.depth ? .full : PhotoAspectRatio(rawValue: saved.photoAspect ?? "") ?? .full
         controls = saved.controls; exposureBias = saved.bias
         exposurePointOnly = saved.exposurePointOnly
         panoramaSelected = !saved.video && (saved.panorama ?? (saved.style == "Panorama"))
@@ -328,6 +334,16 @@ final class CameraViewModel: ObservableObject {
     }
 
     @Published private(set) var mode: CaptureMode = .photo
+    @Published private(set) var photoAspect: PhotoAspectRatio = .full
+    private var captureAspect: PhotoAspectRatio = .full
+    var effectivePhotoAspect: PhotoAspectRatio {
+        mode == .photo && !panoramaSelected && !camera.depthEnabled ? photoAspect : .full
+    }
+    func selectPhotoAspect(_ aspect: PhotoAspectRatio) {
+        guard canConfigure, mode == .photo, !panoramaSelected,
+              !camera.depthEnabled || aspect == .full else { return }
+        photoAspect = aspect
+    }
     @Published private(set) var preparingMode: CaptureMode?
     @Published private(set) var pendingVideo: URL?
     @Published var videoWidth: Int32 = 0
@@ -605,6 +621,10 @@ final class CameraViewModel: ObservableObject {
         }
     }
     func resetControls() {
+        photoAspect = .full
+        resetCameraAdjustments()
+    }
+    private func resetCameraAdjustments() {
         captureStyle = "Auto"
         engine.setAnalysis("Off")
         engine.setEyeFocus(false)
@@ -702,7 +722,11 @@ final class CameraViewModel: ObservableObject {
             if camera.dualAvailable { setDualEnabled(true) }
             else { message = "Dual Shot is unavailable on this device." }
         case .depth:
-            if camera.depthAvailable { engine.setDepthEnabled(true); message = "Depth capture ready" }
+            if camera.depthAvailable {
+                // Keep depth's auxiliary image and the saved photo in identical geometry.
+                photoAspect = .full
+                engine.setDepthEnabled(true); message = "Depth capture ready"
+            }
             else { message = "Depth is unavailable with this camera format." }
         case .eye:
             if camera.eyeFocusAvailable { setEyeFocus(true); message = "Eye focus ready" }
@@ -718,7 +742,8 @@ final class CameraViewModel: ObservableObject {
         timerSeconds = 0
         burstEnabled = false
         captureStyle = "Auto"
-        resetControls()
+        // Framing is a persistent composition choice, rather than a temporary style.
+        resetCameraAdjustments()
         engine.setDepthEnabled(false)
     }
 
@@ -957,6 +982,7 @@ final class CameraViewModel: ObservableObject {
 
     func capture() {
         guard canCapture else { return }
+        captureAspect = effectivePhotoAspect
         captureActivity = .taking
         busy = true
         if panoramaSelected { capturePanorama(); return }
@@ -968,9 +994,10 @@ final class CameraViewModel: ObservableObject {
                 switch result {
                 case .failure(let error):
                     Task { @MainActor [weak self] in self?.busy = false; self?.message = error.localizedDescription }
-                case .success(let photos):
+                case .success(let rawPhotos):
                     Task { @MainActor [weak self] in
                         guard let self else { return }
+                        let photos = rawPhotos.map { $0.framed(aspect: self.captureAspect) }
                         guard var recovery = photos.first else {
                             self.busy = false; self.message = "No burst photos were returned. Try again."; return
                         }
@@ -985,7 +1012,7 @@ final class CameraViewModel: ObservableObject {
                             self.burstPhotos = photos
                             var previews: [UIImage] = []
                             for photo in photos {
-                                previews.append(await CapturePreviewDecoder.image(photo.data, maxSize: 1200) ?? UIImage())
+                                previews.append(await CapturePreviewDecoder.image(photo.data, maxSize: 1200, aspect: photo.aspectRatio) ?? UIImage())
                             }
                             self.burstPreviews = previews
                             self.selectedBurstIndex = max(0, index)
@@ -1010,7 +1037,7 @@ final class CameraViewModel: ObservableObject {
                 case .success(let photo):
                     self.expectingCaptureProgress = false
                     self.lastCaptureMilliseconds = Int((ProcessInfo.processInfo.systemUptime - captureStarted) * 1000)
-                    self.pendingPhoto = photo
+                    self.pendingPhoto = photo.framed(aspect: self.captureAspect)
                     await self.savePending()
                 case .failure(let error):
                     self.expectingCaptureProgress = false
@@ -1282,7 +1309,7 @@ final class CameraViewModel: ObservableObject {
                         self.engine.capture(night: true) { continuation.resume(with: $0) }
                     }
                     if reference == nil {
-                        var original = photo; original.lensLabel = "\(photo.lensLabel ?? "Camera") · Reference"
+                        var original = photo.framed(aspect: self.captureAspect); original.lensLabel = "\(photo.lensLabel ?? "Camera") · Reference"
                         reference = original; self.pendingPhoto = original
                         try await self.store.stage(original); self.recoveryProtected = true
                     }
@@ -1307,7 +1334,7 @@ final class CameraViewModel: ObservableObject {
                 self.message = "Combining \(files.count) frames on this iPhone…"
                 var output = try await LongExposureRenderer.process(files, style: style, cancellation: work)
                 if let reference { output.companions = [reference] }
-                self.pendingPhoto = output
+                self.pendingPhoto = output.framed(aspect: self.captureAspect)
                 await self.savePending()
             } catch {
                 self.longExposureRunning = false
@@ -1337,7 +1364,7 @@ final class CameraViewModel: ObservableObject {
                     self.busy = false
                     self.message = error.localizedDescription
                 case .success(let frames):
-                    let references = NightPhotoProcessor.references(frames)
+                    let references = NightPhotoProcessor.references(frames).map { $0.framed(aspect: self.captureAspect) }
                     guard var protected = references.first else {
                         self.busy = false; self.message = "Night did not return a photo."; return
                     }
@@ -1358,7 +1385,7 @@ final class CameraViewModel: ObservableObject {
                     self.message = "Night · checking alignment and preserving detail…"
                     self.captureActivity = .processing
                     if let photo = await NightPhotoProcessor.process(frames, cancellation: work) {
-                        self.pendingPhoto = photo
+                        self.pendingPhoto = photo.framed(aspect: self.captureAspect)
                     }
                     self.lastCaptureMilliseconds = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
                     await self.savePending()
@@ -1473,10 +1500,15 @@ final class CameraViewModel: ObservableObject {
                 try await saver.saveVideo(video)
                 savedMessage = "Video saved"
             } else if let photo = pendingPhoto {
-                thumbnail = await CapturePreviewDecoder.thumbnail(photo.data)
+                let rendered = try await PhotoAspectRenderer.render(photo)
+                if rendered.data != photo.data || zip(rendered.companions, photo.companions).contains(where: { $0.0.data != $0.1.data }) {
+                    pendingPhoto = rendered
+                    try await store.stage(rendered)
+                }
+                thumbnail = await CapturePreviewDecoder.thumbnail(rendered.data)
                 try await store.beginSave()
-                try await saver.save(photo)
-                savedMessage = photo.warning ?? (photo.companions.isEmpty ? "Saved" : "Saved \(1 + photo.companions.count) photos")
+                try await saver.save(rendered)
+                savedMessage = rendered.warning ?? (rendered.companions.isEmpty ? "Saved" : "Saved \(1 + rendered.companions.count) photos")
             } else { return }
             lastSaveMilliseconds = Int((ProcessInfo.processInfo.systemUptime - saveStarted) * 1000)
             CameraDiagnostics.shared.record(.saved, value: lastSaveMilliseconds)

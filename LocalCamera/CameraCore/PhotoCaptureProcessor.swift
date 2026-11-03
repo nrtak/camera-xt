@@ -81,6 +81,33 @@ enum PhotoRescueProcessor {
     }
 }
 
+/// The same centered rectangle drives the live composition and the saved photo.
+/// Full never decodes or rewrites the camera's original file.
+enum PhotoAspectRatio: String, CaseIterable, Codable {
+    case full = "Full", square = "1:1", wide = "16:9"
+
+    func cropRect(in bounds: CGRect) -> CGRect {
+        guard bounds.origin.x.isFinite, bounds.origin.y.isFinite, bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0 else { return .zero }
+        guard self != .full else { return bounds }
+        let ratio: CGFloat = self == .square ? 1 : bounds.width < bounds.height ? 9.0 / 16 : 16.0 / 9
+        let width = min(bounds.width, bounds.height * ratio)
+        let height = min(bounds.height, bounds.width / ratio)
+        return CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
+    }
+
+    func pixelCropRect(width: Int, height: Int) -> CGRect? {
+        guard width > 0, height > 0 else { return nil }
+        if self == .full { return CGRect(x: 0, y: 0, width: width, height: height) }
+        let horizontal = self == .square ? 1 : width < height ? 9 : 16
+        let vertical = self == .square ? 1 : width < height ? 16 : 9
+        let units = min(width / horizontal, height / vertical)
+        guard units > 0 else { return nil }
+        let w = horizontal * units, h = vertical * units
+        return CGRect(x: (width - w) / 2, y: (height - h) / 2, width: w, height: h)
+    }
+}
+
 struct CapturedPhoto {
     let data: Data
     let dimensions: CMVideoDimensions
@@ -88,6 +115,82 @@ struct CapturedPhoto {
     var warning: String?
     var lensLabel: String?
     var details: CaptureDetails?
+    var aspectRatio: PhotoAspectRatio = .full
+
+    func framed(aspect: PhotoAspectRatio) -> CapturedPhoto {
+        var result = self
+        result.aspectRatio = aspect
+        result.companions = companions.map { $0.framed(aspect: aspect) }
+        return result
+    }
+}
+
+enum PhotoAspectRenderer {
+    enum CropError: LocalizedError {
+        case unavailable, memoryPressure
+        var errorDescription: String? {
+            switch self {
+            case .unavailable: return "The selected crop could not be prepared. The original capture is kept for retry."
+            case .memoryPressure: return "Cropping stopped because this iPhone is low on memory. The original capture is kept for retry."
+            }
+        }
+    }
+
+    static func render(_ photo: CapturedPhoto, cancellation: NightWorkCancellation = NightWorkCancellation()) async throws -> CapturedPhoto {
+        try await withCheckedThrowingContinuation { continuation in
+            PhotoProcessingScheduler.queue.async {
+                do {
+                    // Process each lens on the existing serial lane, releasing decoded
+                    // pixels before the next lens. Never upscale a selected crop.
+                    var result = try autoreleasepool { try renderOne(photo, cancellation: cancellation) }
+                    var companions: [CapturedPhoto] = []
+                    for companion in photo.companions {
+                        companions.append(try autoreleasepool { try renderOne(companion, cancellation: cancellation) })
+                    }
+                    result.companions = companions
+                    continuation.resume(returning: result)
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    private static func renderOne(_ photo: CapturedPhoto, cancellation: NightWorkCancellation) throws -> CapturedPhoto {
+        guard photo.aspectRatio != .full else { return photo }
+        guard !cancellation.cancelled else { throw CropError.memoryPressure }
+        guard let source = CGImageSourceCreateWithData(photo.data as CFData,
+                [kCGImageSourceShouldCache: false] as CFDictionary),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+              let width = (properties[kCGImagePropertyPixelWidth as String] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight as String] as? NSNumber)?.intValue,
+              let crop = photo.aspectRatio.pixelCropRect(width: width, height: height) else { throw CropError.unavailable }
+        if Int(crop.width) == width && Int(crop.height) == height { return photo }
+        guard !cancellation.cancelled else { throw CropError.memoryPressure }
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0,
+                [kCGImageSourceShouldCache: false] as CFDictionary),
+              let cropped = image.cropping(to: crop) else { throw CropError.unavailable }
+        guard !cancellation.cancelled else { throw CropError.memoryPressure }
+        let supported = CGImageDestinationCopyTypeIdentifiers() as? [String] ?? []
+        let sourceType = CGImageSourceGetType(source).map { $0 as String } ?? UTType.jpeg.identifier
+        let type = supported.contains(sourceType) ? sourceType : UTType.jpeg.identifier
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, type as CFString, 1, nil) else { throw CropError.unavailable }
+        var metadata = properties
+        metadata[kCGImagePropertyPixelWidth as String] = cropped.width
+        metadata[kCGImagePropertyPixelHeight as String] = cropped.height
+        metadata[kCGImageDestinationLossyCompressionQuality as String] = 1.0
+        var exif = metadata[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
+        exif[kCGImagePropertyExifPixelXDimension as String] = cropped.width
+        exif[kCGImagePropertyExifPixelYDimension as String] = cropped.height
+        metadata[kCGImagePropertyExifDictionary as String] = exif
+        // Preserve EXIF orientation and color metadata; crop in source-pixel axes.
+        CGImageDestinationAddImage(destination, cropped, metadata as CFDictionary)
+        guard !cancellation.cancelled else { throw CropError.memoryPressure }
+        guard CGImageDestinationFinalize(destination) else { throw CropError.unavailable }
+        guard !cancellation.cancelled else { throw CropError.memoryPressure }
+        return CapturedPhoto(data: data as Data,
+            dimensions: CMVideoDimensions(width: Int32(cropped.width), height: Int32(cropped.height)),
+            warning: photo.warning, lensLabel: photo.lensLabel, details: photo.details, aspectRatio: photo.aspectRatio)
+    }
 }
 
 /// Compares a small burst on-device. Originals remain available for the user's choice.
@@ -107,7 +210,9 @@ enum PhotoRanker {
         }
     }
     private static func score(_ photo: CapturedPhoto, context: CIContext) -> Double {
-        guard let original = CIImage(data: photo.data, options: [.applyOrientationProperty: true]) else { return 0 }
+        guard var original = CIImage(data: photo.data, options: [.applyOrientationProperty: true]) else { return 0 }
+        original = original.cropped(to: photo.aspectRatio.cropRect(in: original.extent))
+        original = original.transformed(by: CGAffineTransform(translationX: -original.extent.minX, y: -original.extent.minY))
         let longest: CGFloat = max(original.extent.width, original.extent.height)
         guard longest > 0 else { return 0 }
         let scale: CGFloat = min(1, 512 / longest)
