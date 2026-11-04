@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   release:
-    runs-on: macos-15-intel
+    runs-on: macos-26-intel
     timeout-minutes: 30
     environment: testflight
     env:
