@@ -64,6 +64,5 @@ if [[ "${UPLOAD_TO_TESTFLIGHT:-false}" == true ]]; then
   mkdir -p "$(dirname "$API_KEY_PATH")"
   printf '%s' "$APP_STORE_CONNECT_PRIVATE_KEY" > "$API_KEY_PATH"
   chmod 600 "$API_KEY_PATH"
-  xcrun altool --upload-app --type ios --file build/export/LocalCamera.ipa \
-    --apiKey "$APP_STORE_CONNECT_KEY_ID" --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+  python3 scripts/upload_testflight.py
 fi
