@@ -338,8 +338,11 @@ enum PreviewGeometry {
         let visible = isValid(intersection) ? intersection : bounds
         let inset = visible.insetBy(dx: min(10, visible.width / 4), dy: min(10, visible.height / 4))
         let height = min(inset.height, max(0, preferredHeight))
-        let width = sidePanel ? min(340, inset.width * 0.48) : inset.width
-        return CGRect(x: sidePanel ? inset.maxX - width : inset.minX, y: inset.maxY - height, width: width, height: height)
+        let sideWidth = min(340, inset.width * 0.48)
+        // Leave room for Back, title, Help and Close; Square must not create a tiny side panel.
+        let useSidePanel = sidePanel && sideWidth >= 320
+        let width = useSidePanel ? sideWidth : inset.width
+        return CGRect(x: useSidePanel ? inset.maxX - width : inset.minX, y: inset.maxY - height, width: width, height: height)
     }
 
     static func focusRect(at point: CGPoint, in frame: CGRect) -> CGRect? {
@@ -368,6 +371,17 @@ enum PreviewGeometry {
 }
 
 enum CameraChromePolicy {
+    static func headerNeedsSecondRow(width: CGFloat, photo: Bool, panorama: Bool, smoothingWidth: CGFloat = 56) -> Bool {
+        guard width.isFinite, width > 0, smoothingWidth.isFinite, smoothingWidth >= 44 else { return true }
+        let center: CGFloat = photo ? 160 : 200
+        let flash: CGFloat = photo && !panorama ? 44 : 0
+        let framing: CGFloat = photo ? (panorama ? 60 : 52) : 0
+        // Two spacers keep the center group balanced; fixed buttons retain 44-point targets.
+        let gaps: CGFloat = photo && !panorama ? 36 : photo ? 30 : 24
+        let required = 24 + center + flash + framing + smoothingWidth + 44 + gaps
+        return width < required
+    }
+
     static func pinsEssentials(height: CGFloat, count: Int) -> Bool {
         guard height.isFinite, count > 0 else { return false }
         let pinnedHeight = CGFloat(count) * 44 + CGFloat(count - 1) * 4

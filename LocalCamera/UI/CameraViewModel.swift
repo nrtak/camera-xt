@@ -64,6 +64,7 @@ struct SavedCameraSetup: Codable, Equatable {
     var longExposureStyle: String? = nil
     var longExposureSeconds: Double? = nil
     var photoAspect: String? = nil
+    var videoStabilization: String? = nil
 }
 
 @MainActor
@@ -208,7 +209,7 @@ final class CameraViewModel: ObservableObject {
             analysis: camera.analysisMode, exposurePointOnly: exposurePointOnly,
             panorama: panoramaSelected, panoramaMethod: panoramaMethod.rawValue, panoramaDirection: panoramaDirection.rawValue,
             longExposureStyle: longExposureStyle.rawValue, longExposureSeconds: LongExposureLimits.duration(longExposureSeconds),
-            photoAspect: photoAspect.rawValue)
+            photoAspect: photoAspect.rawValue, videoStabilization: videoStabilization.rawValue)
         guard setup != lastObservedSetup else { return }
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
         if let data = try? encoder.encode(setup), data != lastSavedSetup {
@@ -229,14 +230,15 @@ final class CameraViewModel: ObservableObject {
         if launchStage == 1 {
             launchStage = 2
             // Each launch starts at the best supported recording preset.
-            videoWidth = 0; videoFPS = 0; stabilization = saved.stabilization
+            videoWidth = 0; videoFPS = 0
+            videoStabilization = VideoStabilizationSetting.restored(saved.videoStabilization, legacyEnabled: saved.stabilization)
             if saved.dual && camera.dualAvailable {
                 configuring = true
                 engine.setDualEnabled(true, mode: .detail)
                 return
             } else if saved.video {
                 configuring = true
-                engine.setVideoMode(true, width: videoWidth, fps: videoFPS, stabilized: stabilization)
+                engine.setVideoMode(true, width: videoWidth, fps: videoFPS, stabilization: videoStabilization)
                 return
             }
         }
@@ -315,6 +317,13 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var lastSavedPhotoCount = 0
     private var messageTask: Task<Void, Never>?
     private var nightWork: NightWorkCancellation?
+    // Mode instructions have a shorter lifetime than capture/recovery errors.
+    @Published private(set) var modeAdvice: String?
+    private func clearModeAdvice() {
+        modeAdvice = nil
+        // Clear only known idle Pano instructions; keep unrelated warnings and errors.
+        if message == panoramaMethod.instructions { message = nil }
+    }
     @Published var message: String? {
         didSet {
             messageTask?.cancel()
@@ -348,7 +357,8 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var pendingVideo: URL?
     @Published var videoWidth: Int32 = 0
     @Published var videoFPS: Int32 = 0
-    @Published var stabilization = true
+    @Published var videoStabilization: VideoStabilizationSetting = .automatic
+    var stabilization: Bool { videoStabilization != .off }
     @Published var timerSeconds = 0
     @Published private(set) var countdown = 0
     private var timerTask: Task<Void, Never>?
@@ -425,7 +435,7 @@ final class CameraViewModel: ObservableObject {
         preparingMode = selected
         if selected != mode { resetTemporarySettings() }
         configuring = true
-        engine.setVideoMode(selected == .video, width: videoWidth, fps: videoFPS, stabilized: stabilization) { [weak self] snapshot in
+        engine.setVideoMode(selected == .video, width: videoWidth, fps: videoFPS, stabilization: videoStabilization) { [weak self] snapshot in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.camera = snapshot
@@ -433,7 +443,7 @@ final class CameraViewModel: ObservableObject {
                 if snapshot.videoMode, let quality = snapshot.videoQuality {
                     self.videoWidth = quality.width
                     self.videoFPS = quality.fps
-                    self.stabilization = snapshot.stabilized
+                    self.videoStabilization = snapshot.stabilizationSetting
                 }
                 self.preparingMode = nil
                 self.configuring = false
@@ -444,6 +454,11 @@ final class CameraViewModel: ObservableObject {
                 if let failure = snapshot.message { self.message = failure }
             }
         }
+    }
+    func cycleVideoStabilization() {
+        guard canConfigure, mode == .video else { return }
+        videoStabilization = videoStabilization.next
+        applyVideoSettings()
     }
     func applyVideoSettings() { selectMode(.video) }
     func selectVideoQuality(_ quality: VideoQuality) {
@@ -525,7 +540,9 @@ final class CameraViewModel: ObservableObject {
     private var expectingCaptureProgress = false
     private var modeAfterDual: CaptureMode?
     @Published private(set) var panoramaSelected = false
-    @Published private(set) var captureStyle = "Auto"
+    @Published private(set) var captureStyle = "Auto" {
+        didSet { if captureStyle != oldValue { modeAdvice = nil } }
+    }
     @Published private(set) var configuring = false
     @Published var exposureBias: Float = 0 {
         didSet { engine.setExposureBias(exposureBias) }
@@ -620,11 +637,35 @@ final class CameraViewModel: ObservableObject {
             self?.controlsTask = nil
         }
     }
+    func resetFocusAndMetering() {
+        guard canConfigure else { return }
+        // Retain manual shutter/ISO, white balance, flash, framing and the selected style.
+        var adjusted = controls
+        adjusted.automaticFocus = true
+        adjusted.lensPosition = CameraControls().lensPosition
+        adjusted.facePriority = false
+        controls = adjusted
+        exposurePointOnly = false
+        exposureBias = 0
+        if camera.eyeFocusEnabled { engine.setEyeFocus(false) }
+        if camera.dualEnabled { dualBrightness = [0, 0] }
+        else { applyControls(preserveStyle: true) }
+        let center = CGPoint(x: 0.5, y: 0.5)
+        let targets: [Int?] = camera.dualEnabled ? [0, 1] : [nil]
+        for index in targets {
+            engine.focus(at: center, locked: false, dualIndex: index)
+            if camera.dualEnabled || controls.automaticExposure {
+                engine.focus(at: center, locked: false, dualIndex: index, exposureOnly: true)
+            }
+        }
+    }
+
     func resetControls() {
         photoAspect = .full
         resetCameraAdjustments()
     }
     private func resetCameraAdjustments() {
+        clearModeAdvice()
         captureStyle = "Auto"
         engine.setAnalysis("Off")
         engine.setEyeFocus(false)
@@ -649,13 +690,13 @@ final class CameraViewModel: ObservableObject {
         timerSeconds = 0
         applyControls()
         captureStyle = "Action"
-        message = "Action · 3 shots at 1/500 s. Dim light may look noisy or dark."
+        modeAdvice = "Action · 3 shots at 1/500 s. Dim light may look noisy or dark."
     }
 
     func nightPreset() { setNightEnabled(true) }
 
     func setNightEnabled(_ enabled: Bool) {
-        guard !panoramaSelected else { message = "Night is available in Photo mode."; return }
+        guard !panoramaSelected else { modeAdvice = "Night is available in Photo mode."; return }
         guard canConfigure, mode == .photo else { return }
         timerSeconds = 0
         burstEnabled = false
@@ -669,14 +710,14 @@ final class CameraViewModel: ObservableObject {
         }
         if enabled && camera.dualEnabled { setDualMode(.detail) }
         captureStyle = enabled ? "Night" : "Auto"
-        message = enabled ? "Night · Beta. Hold still. Matching frames are combined; a reference original is retained." : nil
+        modeAdvice = enabled ? "Night · Beta. Hold still. Matching frames are combined; a reference original is retained." : nil
     }
 
     var canConfigure: Bool { !busy && !configuring && !hasPendingCapture && !camera.recording }
 
     func activate(_ tool: QuickCaptureTool) {
         guard canConfigure else { return }
-        guard !panoramaSelected else { message = "Photo styles are available in Photo mode. Switch to Photo to use this feature."; return }
+        guard !panoramaSelected else { modeAdvice = "Photo styles are available in Photo mode. Switch to Photo to use this feature."; return }
         if tool == .night && camera.dualEnabled { setNightEnabled(true); return }
         if camera.dualEnabled && tool != .dual { message = "Switching from Dual Shot to single-camera Photo for this feature." }
         else if camera.videoMode { message = "Switching from Video to Photo for this feature." }
@@ -731,13 +772,14 @@ final class CameraViewModel: ObservableObject {
         case .eye:
             if camera.eyeFocusAvailable { setEyeFocus(true); message = "Eye focus ready" }
             else { message = "Eye focus is unavailable with this camera." }
-        case .burst: burstEnabled = true; message = "Three photos, then choose your favorite."
+        case .burst: burstEnabled = true; modeAdvice = "Three photos, then choose your favorite."
         case .automatic: message = "Ready to aim and shoot"
         }
     }
 
     func resetTemporarySettings() {
-        if panoramaSelected { message = nil; panoramaReference = nil }
+        if panoramaSelected { panoramaReference = nil }
+        clearModeAdvice()
         panoramaSelected = false
         timerSeconds = 0
         burstEnabled = false
@@ -797,10 +839,17 @@ final class CameraViewModel: ObservableObject {
                 updated.focusLocked = meter.focusLocked
                 updated.focusStates = meter.focusStates
                 updated.cooling = meter.cooling
+                updated.stabilized = meter.stabilized
+                updated.stabilizationLabel = meter.stabilizationLabel
+                updated.stabilizationAvailable = meter.stabilizationAvailable
+                updated.previewStabilized = meter.previewStabilized
+                updated.previewSmoothingAvailable = meter.previewSmoothingAvailable
                 if self.camera.exposureLabel != updated.exposureLabel || self.camera.focusLabel != updated.focusLabel ||
                     self.camera.currentISO != updated.currentISO || self.camera.currentShutter != updated.currentShutter ||
                     self.camera.focusLocked != updated.focusLocked || self.camera.focusStates != updated.focusStates ||
-                    self.camera.cooling != updated.cooling {
+                    self.camera.cooling != updated.cooling || self.camera.stabilized != updated.stabilized ||
+                    self.camera.stabilizationLabel != updated.stabilizationLabel || self.camera.stabilizationAvailable != updated.stabilizationAvailable ||
+                    self.camera.previewStabilized != updated.previewStabilized || self.camera.previewSmoothingAvailable != updated.previewSmoothingAvailable {
                     self.camera = updated
                 }
                 let advice = self.mode == .photo && self.camera.running
@@ -841,7 +890,7 @@ final class CameraViewModel: ObservableObject {
                 if snapshot.videoMode, let quality = snapshot.videoQuality {
                     self?.videoWidth = quality.width
                     self?.videoFPS = quality.fps
-                    self?.stabilization = snapshot.stabilized
+                    self?.videoStabilization = snapshot.stabilizationSetting
                 }
                 if self?.preparingMode == nil { self?.configuring = false }
                 self?.mode = snapshot.videoMode ? .video : .photo
@@ -1085,9 +1134,13 @@ final class CameraViewModel: ObservableObject {
         controlsTask?.cancel(); controlsTask = nil
         resetTemporarySettings()
         panoramaSelected = true
-        message = nil
     }
-    func disablePanorama() { if canConfigure { panoramaSelected = false; panoramaReference = nil; message = nil } }
+    func disablePanorama() {
+        guard canConfigure else { return }
+        clearModeAdvice()
+        panoramaSelected = false
+        panoramaReference = nil
+    }
     private func capturePanorama() {
         let token = NightWorkCancellation(); nightWork = token
         let paired = camera.dualEnabled, direction = panoramaDirection
@@ -1276,7 +1329,7 @@ final class CameraViewModel: ObservableObject {
         engine.setAnalysis("Off"); engine.setEyeFocus(false)
         applyControls(preserveStyle: true)
         captureStyle = "Long Exposure"
-        message = "Use a tripod. Set focus and exposure before starting."
+        modeAdvice = "Use a tripod. Set focus and exposure before starting."
     }
     private func captureLongExposure() {
         let work = NightWorkCancellation(); nightWork = work

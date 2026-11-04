@@ -203,11 +203,76 @@ enum ShutterOptions {
     }
 }
 
+enum VideoStabilizationSetting: String, CaseIterable, Codable {
+    case off = "Off", automatic = "Auto", smooth = "Smooth"
+
+    var next: VideoStabilizationSetting {
+        switch self {
+        case .off: return .automatic
+        case .automatic: return .smooth
+        case .smooth: return .off
+        }
+    }
+
+    static func restored(_ value: String?, legacyEnabled: Bool) -> VideoStabilizationSetting {
+        VideoStabilizationSetting(rawValue: value ?? "") ?? (legacyEnabled ? .automatic : .off)
+    }
+}
+
+enum CameraStabilizationPolicy {
+    static func pausesSpatialGuides(mode: String, smoothingRequested: Bool, previewStabilized: [Bool]) -> Bool {
+        // Guides come from a separate, unstabilized output. Keep them off until the full frame returns.
+        (mode == "Peaking" || mode == "Highlights") && (smoothingRequested || previewStabilized.contains(true))
+    }
+
+    static func candidates(_ setting: VideoStabilizationSetting, constrained: Bool = false) -> [AVCaptureVideoStabilizationMode] {
+        switch setting {
+        case .off: return []
+        case .automatic: return [.auto]
+        case .smooth:
+            if constrained { return [.standard] }
+            var modes: [AVCaptureVideoStabilizationMode] = [.cinematicExtended, .cinematic, .standard]
+            if #available(iOS 18.0, *) { modes.insert(.cinematicExtendedEnhanced, at: 0) }
+            return modes
+        }
+    }
+
+    static func preferred(_ setting: VideoStabilizationSetting, connectionSupported: Bool,
+                          constrained: Bool = false, supports: (AVCaptureVideoStabilizationMode) -> Bool) -> AVCaptureVideoStabilizationMode {
+        guard connectionSupported else { return .off }
+        return candidates(setting, constrained: constrained).first { $0 == .auto || supports($0) } ?? .off
+    }
+
+    /// All entries must already match the requested resolution, frame rate and pixel format.
+    /// Keep the current format when equally capable, avoiding an unnecessary preview restart.
+    static func preferredFormatIndex(_ setting: VideoStabilizationSetting, count: Int, current: Int?,
+                                     constrained: Bool = false, supports: (Int, AVCaptureVideoStabilizationMode) -> Bool) -> Int? {
+        guard count > 0 else { return nil }
+        var order = Array(0..<count)
+        if let current, order.contains(current) { order.removeAll { $0 == current }; order.insert(current, at: 0) }
+        let modes = setting == .automatic ? Array(candidates(.smooth, constrained: constrained).reversed()) : candidates(setting, constrained: constrained)
+        for mode in modes {
+            if let index = order.first(where: { supports($0, mode) }) { return index }
+        }
+        return order.first
+    }
+
+    static func label(_ mode: AVCaptureVideoStabilizationMode) -> String {
+        if mode == .off { return "Off" }
+        if mode == .standard { return "Standard" }
+        if mode == .previewOptimized { return "Preview smoothing" }
+        if #available(iOS 18.0, *), mode == .cinematicExtendedEnhanced { return "Smooth · enhanced" }
+        if mode == .cinematicExtended || mode == .cinematic { return "Smooth" }
+        return "Stabilized"
+    }
+}
+
 struct CameraSnapshot {
     var zooms: [CameraZoom] = []
 
     var lenses: [CameraLens] = []
     var selectedID: String?
+    var nativePhotoDimensions: [CMVideoDimensions] = []
     var resolution = "—"
     var running = false
     var message: String?
@@ -226,6 +291,11 @@ struct CameraSnapshot {
     var videoQualities: [VideoQuality] = []
     var videoQuality: VideoQuality?
     var stabilized = false
+    var stabilizationSetting: VideoStabilizationSetting = .automatic
+    var stabilizationAvailable = false
+    var stabilizationLabel = "Off"
+    var previewStabilized: [Bool] = []
+    var previewSmoothingAvailable: [Bool] = []
     var exposureLabel = ""
     var focusLabel = "Auto focus"
     var minISO: Float = 25
@@ -261,6 +331,10 @@ final class CaptureSessionManager {
     private lazy var dual = DualPhotoCamera(queue: queue)
     private weak var preview: AVCaptureVideoPreviewLayer?
     private weak var secondaryPreview: AVCaptureVideoPreviewLayer?
+    private var smoothPhotoPreview = false
+    private var previewStabilizationPending = false
+    private var movieStabilizationObservation: NSKeyValueObservation?
+    private var previewStabilizationObservations: [NSKeyValueObservation] = []
     private var interfaceOrientation: AVCaptureVideoOrientation = .portrait
     private var sequenceOrientation: AVCaptureVideoOrientation = .portrait
     private final class PreviewReference {
@@ -321,6 +395,7 @@ final class CaptureSessionManager {
     }
     private let analysisOutput = AVCaptureVideoDataOutput()
     private var analyzer: ViewfinderAnalyzer?
+    private var analysisPausedForSmoothing = false
     private let eyeOutput = AVCaptureVideoDataOutput()
     private var eyeTracker: EyeFocusTracker?
     private var eyeGeneration = UUID()
@@ -645,7 +720,9 @@ final class CaptureSessionManager {
         let sizes = device.activeFormat.supportedMaxPhotoDimensions.sorted {
             Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height)
         }
+        snapshot.nativePhotoDimensions = []
         if let size = sizes.last {
+            snapshot.nativePhotoDimensions = [size]
             output.maxPhotoDimensions = size
             snapshot.resolution = "Up to \(size.width) × \(size.height)"
         }
@@ -765,7 +842,7 @@ final class CaptureSessionManager {
             }
             let analyzer = ViewfinderAnalyzer(mode: mode) { [weak self] image, bins in
                 self?.queue.async { [weak self] in
-                    guard let self, self.wantsRunning, self.session.isRunning, self.snapshot.analysisMode == mode else { return }
+                    guard let self, self.wantsRunning, self.session.isRunning, self.snapshot.analysisMode == mode, !self.analysisPausedForSmoothing else { return }
                     self.onAnalysis?(image, bins)
                 }
             }
@@ -773,6 +850,7 @@ final class CaptureSessionManager {
             self.analysisOutput.setSampleBufferDelegate(analyzer, queue: analyzer.queue)
             self.session.commitConfiguration()
             self.snapshot.analysisMode = mode
+            self.updateAnalysisForPreviewStabilization()
             self.publish()
         }
     }
@@ -782,7 +860,24 @@ final class CaptureSessionManager {
         if session.outputs.contains(analysisOutput) {
             session.beginConfiguration(); session.removeOutput(analysisOutput); session.commitConfiguration()
         }
-        analyzer = nil; snapshot.analysisMode = "Off"; onAnalysis?(nil, [])
+        analyzer = nil; analysisPausedForSmoothing = false
+        snapshot.analysisMode = "Off"; onAnalysis?(nil, [])
+    }
+
+    private func updateAnalysisForPreviewStabilization() {
+        let layers = snapshot.dualEnabled ? [preview, secondaryPreview] : [preview]
+        // Read connections directly: a rapid toggle can arrive before their observation updates the snapshot.
+        let stabilized = layers.map { ($0?.connection?.activeVideoStabilizationMode ?? .off) != .off }
+        let paused = CameraStabilizationPolicy.pausesSpatialGuides(mode: snapshot.analysisMode,
+            smoothingRequested: smoothPhotoPreview, previewStabilized: stabilized)
+        guard paused != analysisPausedForSmoothing else { return }
+        analysisPausedForSmoothing = paused
+        if let analyzer {
+            // Detach the delegate to avoid processing frames that cannot be displayed accurately.
+            if paused { analysisOutput.setSampleBufferDelegate(nil, queue: nil) }
+            else { analysisOutput.setSampleBufferDelegate(analyzer, queue: analyzer.queue) }
+        }
+        onAnalysis?(nil, [])
     }
 
     func setEyeFocus(_ enabled: Bool) {
@@ -885,6 +980,7 @@ final class CaptureSessionManager {
     }
 
     private func disconnectPreviews() {
+        previewStabilizationObservations.removeAll()
         lensMonitor.stop()
         for layer in [preview, secondaryPreview].compactMap({ $0 }) {
             if let connection = layer.connection { layer.session?.removeConnection(connection) }
@@ -918,6 +1014,90 @@ final class CaptureSessionManager {
                 connection.isVideoMirrored = false
             }
         }
+        configurePreviewStabilization()
+    }
+
+    func setSmoothPhotoPreview(_ enabled: Bool) {
+        queue.async {
+            self.smoothPhotoPreview = enabled
+            self.previewStabilizationPending = true
+            guard !self.burstRunning, self.processor == nil, self.movieProcessor == nil, !self.dual.busy else { return }
+            self.configurePreviewStabilization()
+            if self.refreshStabilizationStatus() { self.onMeter?(self.snapshot) }
+        }
+    }
+
+    private var stabilizationConstrained: Bool {
+        let thermal = ProcessInfo.processInfo.thermalState
+        return ProcessInfo.processInfo.isLowPowerModeEnabled || thermal == .serious || thermal == .critical
+    }
+
+    private func watchStabilization(_ connection: AVCaptureConnection) -> NSKeyValueObservation {
+        connection.observe(\.activeVideoStabilizationMode, options: [.new]) { [weak self] _, _ in
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                // Read current connections, so a late callback from an old lens cannot win.
+                if self.refreshStabilizationStatus() { self.onMeter?(self.snapshot) }
+            }
+        }
+    }
+
+    private func configureMovieStabilization(_ setting: VideoStabilizationSetting, device: AVCaptureDevice) {
+        snapshot.stabilizationSetting = setting
+        movieStabilizationObservation = nil
+        guard let connection = movie.connection(with: .video) else { return }
+        if connection.isVideoStabilizationSupported {
+            connection.preferredVideoStabilizationMode = CameraStabilizationPolicy.preferred(setting,
+                connectionSupported: true, constrained: stabilizationConstrained,
+                supports: device.activeFormat.isVideoStabilizationModeSupported)
+        }
+        movieStabilizationObservation = watchStabilization(connection)
+    }
+
+    private func configurePreviewStabilization() {
+        previewStabilizationPending = false
+        previewStabilizationObservations.removeAll()
+        // Pause spatial overlays before requesting a potentially cropped preview.
+        updateAnalysisForPreviewStabilization()
+        let sources: [(AVCaptureVideoPreviewLayer?, AVCaptureDeviceInput?)] = [
+            (preview, snapshot.dualEnabled ? dual.inputs.first : input),
+            (secondaryPreview, snapshot.dualEnabled && dual.inputs.count > 1 ? dual.inputs[1] : nil)
+        ]
+        let enabled = snapshot.videoMode ? snapshot.stabilizationSetting != .off : smoothPhotoPreview
+        for (layer, source) in sources {
+            guard let layer, let device = source?.device, layer.session === activeSession,
+                  let connection = layer.connection else { continue }
+            if connection.isVideoStabilizationSupported {
+                // Preview uses only the low-latency, preview-specific algorithm.
+                // Never put a cinematic recording look-ahead buffer on a viewfinder.
+                connection.preferredVideoStabilizationMode = enabled && device.activeFormat.isVideoStabilizationModeSupported(.previewOptimized)
+                    ? .previewOptimized : .off
+            }
+            previewStabilizationObservations.append(watchStabilization(connection))
+        }
+    }
+
+    @discardableResult
+    private func refreshStabilizationStatus() -> Bool {
+        let before = snapshot
+        let connection = snapshot.videoMode ? movie.connection(with: .video) : nil
+        let active = connection?.activeVideoStabilizationMode ?? .off
+        snapshot.stabilized = active != .off
+        snapshot.stabilizationAvailable = connection?.isVideoStabilizationSupported == true
+        snapshot.stabilizationLabel = snapshot.videoMode && !snapshot.stabilizationAvailable
+            ? "Unavailable at this format" : CameraStabilizationPolicy.label(active)
+        let layers = snapshot.dualEnabled ? [preview, secondaryPreview] : [preview]
+        let devices = snapshot.dualEnabled ? dual.inputs.map(\.device) : [input?.device].compactMap { $0 }
+        snapshot.previewStabilized = layers.map { ($0?.connection?.activeVideoStabilizationMode ?? .off) != .off }
+        // Off can take effect after the request; resume guides only once the actual mode is off too.
+        updateAnalysisForPreviewStabilization()
+        snapshot.previewSmoothingAvailable = layers.enumerated().map { index, layer in
+            layer?.connection?.isVideoStabilizationSupported == true && devices.indices.contains(index) &&
+                devices[index].activeFormat.isVideoStabilizationModeSupported(.previewOptimized)
+        }
+        return before.stabilized != snapshot.stabilized || before.stabilizationLabel != snapshot.stabilizationLabel ||
+            before.stabilizationAvailable != snapshot.stabilizationAvailable || before.previewStabilized != snapshot.previewStabilized ||
+            before.previewSmoothingAvailable != snapshot.previewSmoothingAvailable
     }
 
     func setInterfaceOrientation(_ orientation: AVCaptureVideoOrientation, completion: @escaping () -> Void) {
@@ -986,6 +1166,7 @@ final class CaptureSessionManager {
                     self.snapshot.dualEnabled = true
                     self.snapshot.selectedID = self.dual.inputs.first?.device.uniqueID
                     self.snapshot.resolution = self.dual.resolution
+                    self.snapshot.nativePhotoDimensions = self.dual.photoDimensions
                 } else {
                     self.dual.reset()
                     self.snapshot.dualEnabled = false
@@ -1138,7 +1319,21 @@ final class CaptureSessionManager {
         })
     }
 
-    func setVideoMode(_ enabled: Bool, width: Int32 = 0, fps: Int32 = 0, stabilized: Bool = true,
+    private func videoFormat(for device: AVCaptureDevice, width: Int32, fps: Int32,
+                             stabilization: VideoStabilizationSetting) -> AVCaptureDevice.Format? {
+        let matching = device.formats.filter {
+            let size = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+            return size.width == width && size.height == width * 9 / 16 &&
+                CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+                $0.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= Double(fps) && $0.maxFrameRate >= Double(fps) }
+        }
+        let current = matching.firstIndex(where: { $0 === device.activeFormat })
+        guard let index = CameraStabilizationPolicy.preferredFormatIndex(stabilization, count: matching.count, current: current,
+            constrained: stabilizationConstrained, supports: { matching[$0].isVideoStabilizationModeSupported($1) }) else { return nil }
+        return matching[index]
+    }
+
+    func setVideoMode(_ enabled: Bool, width: Int32 = 0, fps: Int32 = 0, stabilization: VideoStabilizationSetting = .automatic,
                       completion: ((CameraSnapshot) -> Void)? = nil) {
         queue.async {
             defer { completion?(self.snapshot) }
@@ -1153,11 +1348,10 @@ final class CaptureSessionManager {
             if enabled && self.snapshot.videoMode,
                let quality = self.snapshot.videoQuality,
                quality.width == width && quality.fps == fps,
-               let connection = self.movie.connection(with: .video) {
-                if connection.isVideoStabilizationSupported {
-                    connection.preferredVideoStabilizationMode = stabilized ? .auto : .off
-                    self.snapshot.stabilized = stabilized
-                } else { self.snapshot.stabilized = false }
+               let preferredFormat = self.videoFormat(for: device, width: width, fps: fps, stabilization: stabilization),
+               preferredFormat === device.activeFormat, self.movie.connection(with: .video) != nil {
+                self.configureMovieStabilization(stabilization, device: device)
+                self.configurePreviewStabilization()
                 self.publish()
                 return
             }
@@ -1177,13 +1371,7 @@ final class CaptureSessionManager {
                     let qualities = self.videoQualities(for: device)
                     guard let quality = VideoQuality.resolve(width: width, fps: fps, from: qualities) else { throw VideoFailure.unsupported }
                     let width = quality.width, fps = quality.fps
-                    let height = width * 9 / 16
-                    guard let format = device.formats.first(where: {
-                        let size = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
-                        return size.width == width && size.height == height &&
-                            CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
-                            $0.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= Double(fps) && $0.maxFrameRate >= Double(fps) }
-                    }) else { throw VideoFailure.unsupported }
+                    guard let format = self.videoFormat(for: device, width: width, fps: fps, stabilization: stabilization) else { throw VideoFailure.unsupported }
                     if !self.session.outputs.contains(self.movie) {
                         self.session.sessionPreset = .high
                         guard self.session.canAddOutput(self.movie) else { throw VideoFailure.unsupported }
@@ -1208,10 +1396,7 @@ final class CaptureSessionManager {
                     self.snapshot.stabilized = false
                     if let connection = self.movie.connection(with: .video) {
                         if connection.isVideoOrientationSupported { connection.videoOrientation = self.interfaceOrientation }
-                        if connection.isVideoStabilizationSupported {
-                            connection.preferredVideoStabilizationMode = stabilized ? .auto : .off
-                            self.snapshot.stabilized = stabilized
-                        }
+                        self.configureMovieStabilization(stabilization, device: device)
                         if self.movie.availableVideoCodecTypes.contains(.hevc) {
                             self.movie.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: connection)
                         }
@@ -1223,6 +1408,7 @@ final class CaptureSessionManager {
                     self.configureDimensions(device)
                     self.snapshot.videoMode = false
                     self.snapshot.stabilized = false
+                    self.movieStabilizationObservation = nil
                 }
             } catch {
                 failure = error
@@ -1397,6 +1583,10 @@ final class CaptureSessionManager {
     }
 
     private func updateMeter() {
+        if previewStabilizationPending && !burstRunning && processor == nil && movieProcessor == nil && !dual.busy {
+            configurePreviewStabilization()
+        }
+        refreshStabilizationStatus()
         let thermal = ProcessInfo.processInfo.thermalState
         snapshot.cooling = thermal == .serious || thermal == .critical
         let activeDevices = snapshot.dualEnabled ? dual.inputs.map(\.device) : [input?.device].compactMap { $0 }
@@ -1636,6 +1826,7 @@ private final class DualPhotoCamera {
     private var captureMode: DualShotMode { panoramaCapture ? .fast : nightCapture ? .detail : mode }
     var onProgress: ((String) -> Void)?
     private var cancelRemaining = false
+    var photoDimensions: [CMVideoDimensions] { outputs.map(\.maxPhotoDimensions) }
     private(set) var resolution = "—"
 
     init(queue: DispatchQueue) { self.queue = queue }

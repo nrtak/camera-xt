@@ -86,6 +86,24 @@ enum PhotoRescueProcessor {
 enum PhotoAspectRatio: String, CaseIterable, Codable {
     case full = "Full", square = "1:1", wide = "16:9"
 
+    /// Keep the persisted "Full" value compatible with existing setups and recovery files.
+    /// The interface names the actual native ratio, independent of device orientation.
+    func label(nativeDimensions: [CMVideoDimensions]) -> String {
+        guard self == .full else { return rawValue }
+        guard !nativeDimensions.isEmpty else { return "Original" }
+        var labels: [String] = []
+        for size in nativeDimensions {
+            guard size.width > 0, size.height > 0 else { return "Original" }
+            let width = Int(max(size.width, size.height)), height = Int(min(size.width, size.height))
+            var a = width, b = height
+            while b != 0 { let remainder = a % b; a = b; b = remainder }
+            let horizontal = width / a, vertical = height / a
+            guard horizontal <= 32, vertical <= 32 else { return "Original" }
+            labels.append("\(horizontal):\(vertical)")
+        }
+        return Set(labels).count == 1 ? labels[0] : "Original"
+    }
+
     func cropRect(in bounds: CGRect) -> CGRect {
         guard bounds.origin.x.isFinite, bounds.origin.y.isFinite, bounds.width.isFinite, bounds.height.isFinite,
               bounds.width > 0, bounds.height > 0 else { return .zero }

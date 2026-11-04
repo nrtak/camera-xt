@@ -6,6 +6,21 @@ import UniformTypeIdentifiers
 @testable import LocalCamera
 
 final class CaptureStoreTests: XCTestCase {
+    func testPhotoRatioLabelsDescribeBothNativeCamerasAndPreserveSavedSetups() throws {
+        let main = CMVideoDimensions(width: 8064, height: 6048)
+        let ultra = CMVideoDimensions(width: 3024, height: 4032)
+        XCTAssertEqual(PhotoAspectRatio.full.label(nativeDimensions: [main, ultra]), "4:3")
+        let wide = CMVideoDimensions(width: 3840, height: 2160)
+        XCTAssertEqual(PhotoAspectRatio.full.label(nativeDimensions: [wide]), "16:9")
+        XCTAssertEqual(PhotoAspectRatio.full.label(nativeDimensions: [main, wide]), "Original")
+        XCTAssertEqual(PhotoAspectRatio.full.label(nativeDimensions: []), "Original")
+        XCTAssertEqual(PhotoAspectRatio.full.label(nativeDimensions: [CMVideoDimensions(width: 0, height: 300)]), "Original")
+        XCTAssertEqual(PhotoAspectRatio.full.label(nativeDimensions: [CMVideoDimensions(width: 403, height: 301)]), "Original")
+        XCTAssertEqual(PhotoAspectRatio.square.label(nativeDimensions: [main]), "1:1")
+        XCTAssertEqual(PhotoAspectRatio.wide.label(nativeDimensions: [main]), "16:9")
+        XCTAssertEqual(try JSONDecoder().decode(PhotoAspectRatio.self, from: Data("\"Full\"".utf8)), .full)
+    }
+
     func testAspectCropsFitBothOrientationsWithoutUpscaling() throws {
         for size in [CGSize(width: 4032, height: 3024), CGSize(width: 3024, height: 4032), CGSize(width: 301, height: 403)] {
             let bounds = CGRect(origin: CGPoint(x: 13, y: 27), size: size)
@@ -659,6 +674,94 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertEqual(portrait.height, 120)
     }
 
+    func testSquareLandscapeSettingsUseReadableFullWidthPanel() {
+        for size in [CGSize(width: 844, height: 390), CGSize(width: 932, height: 430), CGSize(width: 667, height: 375)] {
+            let bounds = CGRect(x: 0, y: 0, width: size.width, height: size.height - 152)
+            let image = CGRect(x: (size.width - size.height) / 2, y: 0, width: size.height, height: size.height)
+            let visible = image.intersection(bounds).insetBy(dx: 10, dy: 10)
+            let panel = PreviewGeometry.panelRect(image: image, bounds: bounds, preferredHeight: .infinity, sidePanel: true)
+            XCTAssertTrue(bounds.contains(panel))
+            XCTAssertEqual(panel.width, visible.width, accuracy: 0.001)
+            XCTAssertGreaterThanOrEqual(panel.width, 320, "Header controls need room for their title too")
+            XCTAssertEqual(panel.minX, visible.minX, accuracy: 0.001)
+        }
+        let tiny = CGRect(x: 0, y: 0, width: 240, height: 180)
+        XCTAssertTrue(tiny.contains(PreviewGeometry.panelRect(image: tiny, bounds: tiny, preferredHeight: .infinity, sidePanel: true)))
+    }
+
+    func testQuickSmoothingHeaderKeepsButtonsReadableOnNarrowPhones() {
+        for width in [CGFloat(320), 375, 390] {
+            XCTAssertTrue(CameraChromePolicy.headerNeedsSecondRow(width: width, photo: true, panorama: false))
+        }
+        XCTAssertFalse(CameraChromePolicy.headerNeedsSecondRow(width: 430, photo: true, panorama: false))
+        XCTAssertTrue(CameraChromePolicy.headerNeedsSecondRow(width: 320, photo: true, panorama: true))
+        XCTAssertFalse(CameraChromePolicy.headerNeedsSecondRow(width: 390, photo: true, panorama: true))
+        XCTAssertTrue(CameraChromePolicy.headerNeedsSecondRow(width: 320, photo: false, panorama: false))
+        XCTAssertFalse(CameraChromePolicy.headerNeedsSecondRow(width: 390, photo: false, panorama: false))
+        XCTAssertTrue(CameraChromePolicy.headerNeedsSecondRow(width: 0, photo: true, panorama: false))
+        XCTAssertTrue(CameraChromePolicy.headerNeedsSecondRow(width: CGFloat.nan, photo: true, panorama: false))
+        XCTAssertEqual(VideoStabilizationSetting.off.next, .automatic)
+        XCTAssertEqual(VideoStabilizationSetting.automatic.next, .smooth)
+        XCTAssertEqual(VideoStabilizationSetting.smooth.next, .off)
+    }
+
+    func testQuickSmoothingHeaderReservesSpaceForScaledLabels() {
+        XCTAssertFalse(CameraChromePolicy.headerNeedsSecondRow(width: 430, photo: true, panorama: false, smoothingWidth: 56))
+        XCTAssertTrue(CameraChromePolicy.headerNeedsSecondRow(width: 430, photo: true, panorama: false, smoothingWidth: 80))
+        XCTAssertTrue(CameraChromePolicy.headerNeedsSecondRow(width: 390, photo: false, panorama: false, smoothingWidth: 120))
+        XCTAssertTrue(CameraChromePolicy.headerNeedsSecondRow(width: 430, photo: true, panorama: false, smoothingWidth: .nan))
+    }
+
+    func testSpatialGuidesPauseUntilTheUnstabilizedPreviewReturns() {
+        for mode in ["Peaking", "Highlights"] {
+            XCTAssertFalse(CameraStabilizationPolicy.pausesSpatialGuides(mode: mode, smoothingRequested: false, previewStabilized: []))
+            XCTAssertTrue(CameraStabilizationPolicy.pausesSpatialGuides(mode: mode, smoothingRequested: true, previewStabilized: [false]))
+            XCTAssertTrue(CameraStabilizationPolicy.pausesSpatialGuides(mode: mode, smoothingRequested: false, previewStabilized: [true]))
+            XCTAssertTrue(CameraStabilizationPolicy.pausesSpatialGuides(mode: mode, smoothingRequested: true, previewStabilized: [true]))
+            XCTAssertFalse(CameraStabilizationPolicy.pausesSpatialGuides(mode: mode, smoothingRequested: false, previewStabilized: [false]))
+        }
+        for mode in ["Histogram", "Off"] {
+            XCTAssertFalse(CameraStabilizationPolicy.pausesSpatialGuides(mode: mode, smoothingRequested: true, previewStabilized: [true]))
+        }
+    }
+
+    func testStabilizationSelectionFallsBackWithoutInventingSupport() {
+        let choose: (VideoStabilizationSetting, Bool, Bool, [AVCaptureVideoStabilizationMode]) -> AVCaptureVideoStabilizationMode = { setting, supported, constrained, modes in
+            CameraStabilizationPolicy.preferred(setting, connectionSupported: supported, constrained: constrained, supports: modes.contains)
+        }
+        XCTAssertEqual(choose(.off, true, false, [.standard, .cinematic]), .off)
+        XCTAssertEqual(choose(.automatic, true, false, []), .auto)
+        XCTAssertEqual(choose(.smooth, false, false, [.cinematicExtended]), .off)
+        XCTAssertEqual(choose(.smooth, true, false, []), .off)
+        XCTAssertEqual(choose(.smooth, true, false, [.standard]), .standard)
+        XCTAssertEqual(choose(.smooth, true, false, [.standard, .cinematic]), .cinematic)
+        XCTAssertEqual(choose(.smooth, true, false, [.standard, .cinematicExtended]), .cinematicExtended)
+        XCTAssertEqual(choose(.smooth, true, true, [.standard, .cinematicExtended]), .standard)
+        XCTAssertEqual(choose(.smooth, true, true, [.cinematicExtended]), .off)
+        if #available(iOS 18.0, *) {
+            XCTAssertEqual(choose(.smooth, true, false, [.cinematicExtendedEnhanced, .cinematicExtended]), .cinematicExtendedEnhanced)
+        }
+        XCTAssertEqual(VideoStabilizationSetting.restored(nil, legacyEnabled: true), .automatic)
+        XCTAssertEqual(VideoStabilizationSetting.restored(nil, legacyEnabled: false), .off)
+        XCTAssertEqual(VideoStabilizationSetting.restored("Smooth", legacyEnabled: false), .smooth)
+        XCTAssertEqual(VideoStabilizationSetting.restored("Unknown", legacyEnabled: true), .automatic)
+    }
+
+    func testStabilizationFormatSelectionKeepsTheCurrentFormatWhenEquallyCapable() {
+        let modes: [[AVCaptureVideoStabilizationMode]] = [[.standard], [.standard, .cinematicExtended], [.standard, .cinematicExtended]]
+        let choose: (VideoStabilizationSetting, Int?, Bool) -> Int? = { setting, current, constrained in
+            CameraStabilizationPolicy.preferredFormatIndex(setting, count: modes.count, current: current,
+                constrained: constrained, supports: { modes[$0].contains($1) })
+        }
+        XCTAssertEqual(choose(.smooth, 0, false), 1, "Use a more capable format at the same recording preset")
+        XCTAssertEqual(choose(.smooth, 2, false), 2, "Do not restart when the current format is equally capable")
+        XCTAssertEqual(choose(.automatic, 0, false), 0)
+        XCTAssertEqual(choose(.off, 2, false), 2)
+        XCTAssertEqual(choose(.smooth, 0, true), 0, "Warm / Low Power starts prefer Standard")
+        XCTAssertEqual(choose(.smooth, 99, false), 1)
+        XCTAssertNil(CameraStabilizationPolicy.preferredFormatIndex(.smooth, count: 0, current: nil, supports: { _, _ in true }))
+    }
+
     func testVideoQualityPrefersResolutionThenFrameRate() {
         let options = [VideoQuality(width: 1920, fps: 240), VideoQuality(width: 3840, fps: 30),
                        VideoQuality(width: 3840, fps: 120), VideoQuality(width: 3840, fps: 120)]
@@ -774,6 +877,76 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertEqual(model.photoAspect, .wide, "Dropping a Single-only style must not reset framing")
         model.resetControls()
         XCTAssertEqual(model.photoAspect, .full, "An explicit reset restores the original framing")
+        model.setActive(false)
+    }
+
+    @MainActor
+    func testFocusMeteringResetPreservesFramingColorAndManualCaptureStyle() async throws {
+        let model = CameraViewModel()
+        for _ in 0..<200 {
+            if !model.restoring { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(model.canConfigure)
+        model.selectPhotoAspect(.wide)
+        model.enableLongExposure()
+        var custom = model.controls
+        custom.automaticWhiteBalance = false; custom.temperature = 6400; custom.tint = 12
+        custom.automaticExposure = false; custom.iso = 320; custom.shutterSeconds = 0.5
+        custom.automaticFocus = false; custom.lensPosition = 0.8
+        model.controls = custom
+        model.exposureBias = 1
+        model.exposurePointOnly = true
+        model.resetFocusAndMetering()
+        XCTAssertEqual(model.photoAspect, .wide)
+        XCTAssertEqual(model.captureStyle, "Long Exposure")
+        XCTAssertEqual(model.controls.automaticWhiteBalance, custom.automaticWhiteBalance)
+        XCTAssertEqual(model.controls.temperature, custom.temperature)
+        XCTAssertEqual(model.controls.tint, custom.tint)
+        XCTAssertEqual(model.controls.automaticExposure, custom.automaticExposure)
+        XCTAssertEqual(model.controls.iso, custom.iso)
+        XCTAssertEqual(model.controls.shutterSeconds, custom.shutterSeconds)
+        XCTAssertEqual(model.controls.flash, custom.flash)
+        XCTAssertTrue(model.controls.automaticFocus)
+        XCTAssertFalse(model.controls.facePriority)
+        XCTAssertFalse(model.exposurePointOnly)
+        XCTAssertEqual(model.exposureBias, 0)
+        model.setActive(false)
+    }
+
+    @MainActor
+    func testModeAdviceClearsWithoutDiscardingCaptureWarnings() async throws {
+        let model = CameraViewModel()
+        for _ in 0..<200 {
+            if !model.restoring { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(model.canConfigure)
+        let warning = "Not saved to Photos. A recovery copy is on this iPhone."
+        model.message = warning
+        model.setNightEnabled(true)
+        XCTAssertNotNil(model.modeAdvice)
+        XCTAssertEqual(model.message, warning)
+        // Photo-to-Video invokes this reset before reconfiguring the camera.
+        model.resetTemporarySettings()
+        XCTAssertNil(model.modeAdvice)
+        XCTAssertEqual(model.message, warning)
+        model.enableLongExposure()
+        XCTAssertNotNil(model.modeAdvice)
+        model.resetTemporarySettings()
+        XCTAssertNil(model.modeAdvice)
+        XCTAssertEqual(model.message, warning)
+        model.activate(.burst)
+        XCTAssertNotNil(model.modeAdvice)
+        model.resetTemporarySettings()
+        XCTAssertNil(model.modeAdvice)
+        XCTAssertEqual(model.message, warning)
+        model.enablePanorama()
+        model.activate(.night)
+        XCTAssertNotNil(model.modeAdvice)
+        model.disablePanorama()
+        XCTAssertNil(model.modeAdvice)
+        XCTAssertEqual(model.message, warning)
         model.setActive(false)
     }
 
@@ -939,6 +1112,7 @@ final class CaptureStoreTests: XCTestCase {
         setup.panorama = true; setup.panoramaMethod = "Stitch"; setup.panoramaDirection = "Left"
         setup.longExposureStyle = LongExposureStyle.trails.rawValue; setup.longExposureSeconds = 120
         setup.photoAspect = PhotoAspectRatio.wide.rawValue
+        setup.videoStabilization = VideoStabilizationSetting.smooth.rawValue
         let data = try JSONEncoder().encode(setup)
         let restored = try JSONDecoder().decode(SavedCameraSetup.self, from: data)
         XCTAssertEqual(restored.panorama, true)
@@ -947,19 +1121,21 @@ final class CaptureStoreTests: XCTestCase {
         XCTAssertEqual(restored.longExposureStyle, LongExposureStyle.trails.rawValue)
         XCTAssertEqual(restored.longExposureSeconds, 120)
         XCTAssertEqual(restored.photoAspect, PhotoAspectRatio.wide.rawValue)
+        XCTAssertEqual(restored.videoStabilization, VideoStabilizationSetting.smooth.rawValue)
         XCTAssertEqual(restored, setup)
         var changed = restored; changed.longExposureSeconds = 300
         XCTAssertNotEqual(changed, setup, "Preference comparisons must notice duration edits")
         changed = restored; changed.controls.iso += 1
         XCTAssertNotEqual(changed, setup, "Preference comparisons must notice manual control edits")
         var old = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        for key in ["panorama", "panoramaMethod", "panoramaDirection", "longExposureStyle", "longExposureSeconds", "photoAspect"] { old.removeValue(forKey: key) }
+        for key in ["panorama", "panoramaMethod", "panoramaDirection", "longExposureStyle", "longExposureSeconds", "photoAspect", "videoStabilization"] { old.removeValue(forKey: key) }
         old["style"] = "Panorama"
         let legacy = try JSONDecoder().decode(SavedCameraSetup.self, from: JSONSerialization.data(withJSONObject: old))
         XCTAssertNil(legacy.panorama)
         XCTAssertNil(legacy.longExposureStyle)
         XCTAssertNil(legacy.longExposureSeconds)
         XCTAssertNil(legacy.photoAspect)
+        XCTAssertNil(legacy.videoStabilization)
         XCTAssertEqual(legacy.style, "Panorama")
     }
 
